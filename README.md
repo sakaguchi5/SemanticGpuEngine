@@ -28,6 +28,8 @@ D3D12のRoot Signature、PSO、Resource Barrier、Command List、Fenceへ
 
 表示内容:
 
+- `1`キー: Classical Mesh Frontendへ切り替え
+- `2`キー: SDF Frontendへ切り替え
 - 回転する色付き立方体
 - XY / YZ / ZXの半透明平面
 - 三平面のグリッド
@@ -36,6 +38,8 @@ D3D12のRoot Signature、PSO、Resource Barrier、Command List、Fenceへ
 - アルファ合成
 - ウィンドウリサイズ
 - 3 frames in flight
+
+コマンドラインへ `--sdf` を渡すと、SDF Frontendから起動します。
 
 Escキーで終了します。
 
@@ -47,6 +51,8 @@ Escキーで終了します。
   - Workの実行順
   - Resource依存関係
   - Resource寿命
+  - 物理Resource instance数とselector
+  - Temporal dependency
   - 抽象状態遷移
   - 正規化されたExecutable
 - `work_graph.dot`
@@ -71,9 +77,9 @@ Escキーで終了します。
 - `07_D3D12Backend`
   - Device、Swap Chain、Resource、Root Signature、PSO、Barrier、Fence
 - `08_ClassicalRasterFrontend`
-  - 古典的なfloatベクトル、4x4行列、頂点・三角形表現
+  - 古典的なScene、頂点・三角形表現、Logical GPU IRへのLowering
 - `09_ExperimentalGeometry`
-  - PGA境界平面によるBox、SDF Box
+  - PGA境界平面によるBox、SDF Scene、独立したRay March Lowering
 - `10_Diagnostics`
   - ExecutionPlanと依存グラフの出力
 - `11_Tests`
@@ -85,7 +91,7 @@ Escキーで終了します。
 
 ## 実装された垂直経路
 
-1. CubeLabがSemanticModuleを生成
+1. ClassicalまたはSDF FrontendがSemanticModuleを生成
 2. SemanticValidatorがID、参照、Resourceデータ、Device能力を検証
 3. DependencyAnalyzerがRAW / WAR / WAW hazardから依存DAGを作成
 4. 安定トポロジカルソートがWork順序を決定
@@ -99,8 +105,12 @@ Escキーで終了します。
 12. Static BufferをDefault HeapへUpload
 13. Dynamic ConstantsをFrame Upload Arenaへ配置
 14. AbstractStateからD3D12 Resource Barrierを生成
-15. 3つのFrameContextとFenceでCPU/GPUを並行化
-16. Swap ChainへPresent
+15. Logical ResourceをPersistent / FrameLocal / Temporal / Externalへ分類
+16. FrameLocal ResourceとTransient Heapをframe slotごとに実体化
+17. Direct / Compute / Copy Queueを論理依存からFence Timelineへ変換
+18. Queue別FrameContextと3つのframe slotでCPU/GPUを並行化
+19. Temporal Resourceを過去frameの物理instanceへ解決
+20. Swap ChainへPresent
 
 ## 境界規則
 
@@ -120,18 +130,26 @@ Escキーで終了します。
 
 ## 現在の完成範囲
 
-Cube受け入れテストに必要な垂直経路は実装されています。
+Classical MeshとSDFという独立した二つのFrontendから、共通Compiler、
+Runtime、D3D12 Backendへ至る垂直経路が実装されています。通常frameでは
+全GPUの`WaitIdle`を行わず、再利用するframe slotのQueue完了だけを待ちます。
 
-将来追加できるが、この受け入れテストには未使用の機能:
+実装済み:
 
-- Compute WorkのD3D12実行
+- Compute / Copy / Raster / Present WorkのD3D12実行
+- Direct / Compute / Copy Queue間同期
+- FrameLocal Resourceの3重化
+- frame slot内のPlaced Resource Aliasing
+- 明示的なTemporal Resourceとframe-lag read
+- SDF Pixel Shader Ray Marching Frontend
+- Classical / SDF Loweringの明示切り替え
+
+将来追加できるが、現在の完成条件には含めない機能:
+
 - Ray Work
-- SRV / UAV / Samplerの一般Binding
 - Descriptor Table / Bindless
-- Placed Resourceによる実メモリエイリアス
-- Async Compute Queue
 - Shader Model 6 / DXC
 - PGA / CGAをGPU上で直接評価するFrontend
-- SDF Ray Marching Frontend
+- Raster / Compute / Ray実装方式の自動選択
 
 これらはSemanticModuleとExecutionPlanの国境を壊さずに追加できます。

@@ -86,7 +86,10 @@ namespace sge::ir
     {
         gpu::ResourceId id;
         std::string name;
-        gpu::MemoryClass memoryClass = gpu::MemoryClass::Static;
+        gpu::ResourceLifetimeClass lifetime =
+            gpu::ResourceLifetimeClass::Persistent;
+        gpu::ResourceUpdateClass update =
+            gpu::ResourceUpdateClass::Immutable;
         ResourceDescription description = BufferDescription{};
 
         std::vector<std::byte> data;
@@ -128,6 +131,7 @@ namespace sge::ir
     {
         std::uint32_t parameterIndex = 0;
         gpu::ResourceId resource;
+        std::uint32_t frameLag = 0;
     };
 
     struct AttachmentSet
@@ -164,6 +168,8 @@ namespace sge::ir
         std::uint64_t sourceOffset = 0;
         std::uint64_t destinationOffset = 0;
         std::uint64_t sizeBytes = 0;
+        std::uint32_t sourceFrameLag = 0;
+        std::uint32_t destinationFrameLag = 0;
     };
 
     struct PresentWork

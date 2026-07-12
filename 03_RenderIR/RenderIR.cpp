@@ -112,7 +112,8 @@ namespace sge::ir
         {
             HashCombine(seed, resource.id.Value());
             HashCombine(seed, HashString(resource.name));
-            HashEnum(seed, resource.memoryClass);
+            HashEnum(seed, resource.lifetime);
+            HashEnum(seed, resource.update);
             HashEnum(seed, resource.Kind());
             HashEnum(seed, resource.Format());
 
@@ -141,7 +142,7 @@ namespace sge::ir
                 }
             }, resource.description);
 
-            if (resource.memoryClass == gpu::MemoryClass::Static
+            if (resource.update == gpu::ResourceUpdateClass::Immutable
                 && !resource.data.empty())
             {
                 HashCombine(
@@ -191,6 +192,7 @@ namespace sge::ir
                     {
                         HashCombine(seed, binding.parameterIndex);
                         HashCombine(seed, binding.resource.Value());
+                        HashCombine(seed, binding.frameLag);
                     }
                     for (const auto color : payload.attachments.colors)
                     {
@@ -208,6 +210,7 @@ namespace sge::ir
                     {
                         HashCombine(seed, binding.parameterIndex);
                         HashCombine(seed, binding.resource.Value());
+                        HashCombine(seed, binding.frameLag);
                     }
                 }
                 else if constexpr (std::is_same_v<T, CopyWork>)
@@ -217,6 +220,8 @@ namespace sge::ir
                     HashCombine(seed, static_cast<std::size_t>(payload.sourceOffset));
                     HashCombine(seed, static_cast<std::size_t>(payload.destinationOffset));
                     HashCombine(seed, static_cast<std::size_t>(payload.sizeBytes));
+                    HashCombine(seed, payload.sourceFrameLag);
+                    HashCombine(seed, payload.destinationFrameLag);
                 }
                 else
                 {
@@ -229,6 +234,7 @@ namespace sge::ir
                 HashCombine(seed, access.resource.Value());
                 HashEnum(seed, access.access);
                 HashEnum(seed, access.role);
+                HashCombine(seed, access.frameLag);
             }
         }
 

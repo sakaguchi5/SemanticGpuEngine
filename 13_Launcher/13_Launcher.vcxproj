@@ -124,6 +124,8 @@
     <None Include="..\Shaders\BasicColor.hlsl" />
     <None Include="..\Shaders\OffscreenBlit.hlsl" />
     <None Include="..\Shaders\GenerateBuffer.hlsl" />
+    <None Include="..\Shaders\TemporalAccumulate.hlsl" />
+    <None Include="..\Shaders\SdfRayMarch.hlsl" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets" />
@@ -131,6 +133,8 @@
     <Error Condition="!Exists('$(SolutionDir)Shaders\BasicColor.hlsl')" Text="Shader file not found: $(SolutionDir)Shaders\BasicColor.hlsl" />
     <Error Condition="!Exists('$(SolutionDir)Shaders\OffscreenBlit.hlsl')" Text="Shader file not found: $(SolutionDir)Shaders\OffscreenBlit.hlsl" />
     <Error Condition="!Exists('$(SolutionDir)Shaders\GenerateBuffer.hlsl')" Text="Shader file not found: $(SolutionDir)Shaders\GenerateBuffer.hlsl" />
+    <Error Condition="!Exists('$(SolutionDir)Shaders\TemporalAccumulate.hlsl')" Text="Shader file not found: $(SolutionDir)Shaders\TemporalAccumulate.hlsl" />
+    <Error Condition="!Exists('$(SolutionDir)Shaders\SdfRayMarch.hlsl')" Text="Shader file not found: $(SolutionDir)Shaders\SdfRayMarch.hlsl" />
     <MakeDir Directories="$(OutDir)Shaders" />
     <Copy SourceFiles="$(SolutionDir)Shaders\BasicColor.hlsl"
           DestinationFiles="$(OutDir)Shaders\BasicColor.hlsl"
@@ -140,6 +144,12 @@
           SkipUnchangedFiles="true" />
     <Copy SourceFiles="$(SolutionDir)Shaders\GenerateBuffer.hlsl"
           DestinationFiles="$(OutDir)Shaders\GenerateBuffer.hlsl"
+          SkipUnchangedFiles="true" />
+    <Copy SourceFiles="$(SolutionDir)Shaders\TemporalAccumulate.hlsl"
+          DestinationFiles="$(OutDir)Shaders\TemporalAccumulate.hlsl"
+          SkipUnchangedFiles="true" />
+    <Copy SourceFiles="$(SolutionDir)Shaders\SdfRayMarch.hlsl"
+          DestinationFiles="$(OutDir)Shaders\SdfRayMarch.hlsl"
           SkipUnchangedFiles="true" />
   </Target>
 </Project>

@@ -46,13 +46,28 @@ namespace sge::d3d12::detail
         bool hasUav = false;
     };
 
-    struct FrameContext
+    struct QueueFrameContext
     {
         Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
+        std::vector<Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList>>
+            commandLists;
+        std::size_t usedCommandLists = 0;
+        UINT64 completionFenceValue = 0;
+    };
+
+    struct FrameContext
+    {
+        std::uint32_t slot = 0;
+        std::array<QueueFrameContext, QueueClassCount> queues;
         Microsoft::WRL::ComPtr<ID3D12Resource> uploadArena;
         std::byte* mappedUpload = nullptr;
         UINT64 uploadOffset = 0;
-        UINT64 fenceValue = 0;
+    };
+
+    struct QueueTimelinePoint
+    {
+        gpu::QueueClass queue = gpu::QueueClass::Direct;
+        UINT64 value = 0;
     };
 
     struct QueueSyncState
@@ -84,7 +99,6 @@ namespace sge::d3d12::detail
         void CreateFrameContexts();
         void CreateFence();
         void CreateRenderTargets();
-        void CreateDepthBuffer();
         void ResizeIfNeeded();
         [[nodiscard]] ID3D12CommandQueue* QueueFor(
             gpu::QueueClass queue) const noexcept;
@@ -96,17 +110,22 @@ namespace sge::d3d12::detail
         [[nodiscard]] const QueueSyncState& SyncFor(
             gpu::QueueClass queue) const noexcept;
         [[nodiscard]] UINT64 SignalQueue(gpu::QueueClass queue);
+        void WaitForCpuQueueValue(gpu::QueueClass queue, UINT64 value);
         void WaitForQueueValue(
             gpu::QueueClass waitingQueue,
             gpu::QueueClass sourceQueue,
             UINT64 value);
+        void BeginFrame(FrameContext& frame);
+        [[nodiscard]] ID3D12GraphicsCommandList* AcquireCommandList(
+            FrameContext& frame, gpu::QueueClass queue);
 
         void EnsureCompiled(
             const ir::SemanticModule& module,
             const compiler::ExecutionPlan& plan);
 
         [[nodiscard]] ResourceRecord CreateStaticBuffer(
-            const ir::ResourceDeclaration& declaration);
+            const ir::ResourceDeclaration& declaration,
+            ID3D12Heap* aliasHeap = nullptr);
 
         [[nodiscard]] ResourceRecord CreateTexture(
             const ir::ResourceDeclaration& declaration,
@@ -122,8 +141,6 @@ namespace sge::d3d12::detail
 
         [[nodiscard]] Microsoft::WRL::ComPtr<ID3D12PipelineState>
             CreatePipeline(const compiler::ExecutableKey& executable);
-
-        void WaitForFrame(FrameContext& frame);
 
         [[nodiscard]] D3D12_GPU_VIRTUAL_ADDRESS UploadConstants(
             FrameContext& frame,
@@ -152,9 +169,22 @@ namespace sge::d3d12::detail
 
         void Transition(
             gpu::ResourceId resource,
-            gpu::AbstractState abstractState);
+            gpu::AbstractState abstractState,
+            std::uint32_t frameLag = 0);
 
-        void ActivateAliasedResource(gpu::ResourceId resource);
+        void ActivateAliasedResource(
+            gpu::ResourceId resource,
+            std::uint32_t frameLag = 0);
+
+        [[nodiscard]] std::size_t ResolveInstanceIndex(
+            gpu::ResourceId resource,
+            std::uint32_t frameLag = 0) const;
+        [[nodiscard]] ResourceRecord* ResolveResource(
+            gpu::ResourceId resource,
+            std::uint32_t frameLag = 0);
+        [[nodiscard]] const ResourceRecord* ResolveResource(
+            gpu::ResourceId resource,
+            std::uint32_t frameLag = 0) const;
 
         HWND window_ = nullptr;
         UINT width_ = 0;
@@ -186,25 +216,24 @@ namespace sge::d3d12::detail
             D3D12_RESOURCE_STATES,
             FrameCount> backBufferStates_{};
 
-        Microsoft::WRL::ComPtr<ID3D12Resource> depthBuffer_;
-        D3D12_RESOURCE_STATES depthState_ =
-            D3D12_RESOURCE_STATE_DEPTH_WRITE;
-
         std::array<FrameContext, FrameCount> frames_;
         Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> commandList_;
+        std::uint64_t frameNumber_ = 0;
+        std::uint32_t activeFrameSlot_ = 0;
+        gpu::QueueClass activeQueue_ = gpu::QueueClass::Direct;
 
         std::array<QueueSyncState, QueueClassCount> queueSyncStates_;
-        std::vector<Microsoft::WRL::ComPtr<ID3D12CommandAllocator>>
-            inFlightAllocators_;
-        std::vector<Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList>>
-            inFlightLists_;
-
         shader::ShaderCompiler shaderCompiler_;
 
         std::unordered_map<
             gpu::ResourceId,
-            ResourceRecord,
-            foundation::StrongIdHash<gpu::ResourceTag>> staticResources_;
+            std::vector<ResourceRecord>,
+            foundation::StrongIdHash<gpu::ResourceTag>> resources_;
+
+        std::unordered_map<
+            gpu::ResourceId,
+            compiler::ResourceInstancePlan,
+            foundation::StrongIdHash<gpu::ResourceTag>> resourceInstancePlans_;
 
         std::unordered_map<
             gpu::ResourceId,
@@ -213,13 +242,18 @@ namespace sge::d3d12::detail
 
         std::unordered_map<
             gpu::PhysicalAllocationId,
-            Microsoft::WRL::ComPtr<ID3D12Heap>,
+            std::vector<Microsoft::WRL::ComPtr<ID3D12Heap>>,
             foundation::StrongIdHash<gpu::PhysicalAllocationTag>> allocationHeaps_;
 
         std::unordered_map<
             gpu::PhysicalAllocationId,
-            gpu::ResourceId,
+            std::vector<std::optional<gpu::ResourceId>>,
             foundation::StrongIdHash<gpu::PhysicalAllocationTag>> activeAliasedResources_;
+
+        std::unordered_map<
+            gpu::ResourceId,
+            std::vector<QueueTimelinePoint>,
+            foundation::StrongIdHash<gpu::ResourceTag>> temporalCompletions_;
 
         std::unordered_map<
             gpu::ProgramId,
@@ -232,7 +266,6 @@ namespace sge::d3d12::detail
             ExecutableKeyHash> pipelines_;
 
         std::optional<gpu::ResourceId> presentationResource_;
-        std::optional<gpu::ResourceId> depthResource_;
         std::optional<std::size_t> compiledStructureHash_;
     };
 }

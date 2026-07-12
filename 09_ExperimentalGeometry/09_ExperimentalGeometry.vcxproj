@@ -78,13 +78,24 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="ExperimentalGeometry.cpp" />
+    <ClCompile Include="SdfLowering.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="ExperimentalGeometry.h" />
+    <ClInclude Include="SdfLowering.h" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\00_Foundation\00_Foundation.vcxproj">
       <Project>{27D93733-D8FB-414F-9FD8-8D73E3CA19F2}</Project>
+    </ProjectReference>
+    <ProjectReference Include="..\02_GpuSemantics\02_GpuSemantics.vcxproj">
+      <Project>{160D73F5-5187-4EA6-835B-3DB9C88856E4}</Project>
+    </ProjectReference>
+    <ProjectReference Include="..\03_RenderIR\03_RenderIR.vcxproj">
+      <Project>{0EF02B28-A855-4676-80BF-0B2C6E7468C3}</Project>
+    </ProjectReference>
+    <ProjectReference Include="..\08_ClassicalRasterFrontend\08_ClassicalRasterFrontend.vcxproj">
+      <Project>{337679C1-DE3C-4AF0-A194-040A1AD824FA}</Project>
     </ProjectReference>
   </ItemGroup>
   <ItemGroup>

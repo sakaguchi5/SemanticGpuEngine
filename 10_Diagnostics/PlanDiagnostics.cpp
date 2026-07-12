@@ -35,6 +35,7 @@ namespace sge::diagnostics
                        << module.Resource(state.resource).name
                        << " -> "
                        << gpu::ToString(state.state)
+                       << " (frame lag " << state.frameLag << ")"
                        << "\n";
             }
         }
@@ -63,6 +64,30 @@ namespace sge::diagnostics
                    << "\n";
         }
 
+        output << "\n[Physical resource instances]\n";
+        for (const auto& instance : plan.resourceInstances)
+        {
+            output << module.Resource(instance.resource).name
+                   << ": lifetime=" << static_cast<int>(instance.lifetime)
+                   << ", selector=" << static_cast<int>(instance.selector)
+                   << ", count=" << instance.physicalInstanceCount
+                   << "\n";
+        }
+
+        output << "\n[Temporal dependencies]\n";
+        for (const auto& dependency : plan.temporalDependencies)
+        {
+            output << module.Resource(dependency.resource).name
+                   << ": frame lag " << dependency.readLag
+                   << " -> scheduled work "
+                   << dependency.consumerScheduledWork
+                   << ", queue "
+                   << static_cast<int>(dependency.producerQueue)
+                   << " -> "
+                   << static_cast<int>(dependency.consumerQueue)
+                   << "\n";
+        }
+
         output << "\n[Abstract transitions]\n";
         for (const auto& transition : plan.transitions)
         {
@@ -71,6 +96,7 @@ namespace sge::diagnostics
                    << gpu::ToString(transition.from)
                    << " -> "
                    << gpu::ToString(transition.to)
+                   << " (frame lag " << transition.frameLag << ")"
                    << " before scheduled work "
                    << transition.beforeScheduledWork
                    << "\n";

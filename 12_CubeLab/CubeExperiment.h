@@ -1,11 +1,18 @@
 #pragma once
 
 #include "03_RenderIR/RenderIR.h"
-#include "08_ClassicalRasterFrontend/ClassicalRaster.h"
+#include "08_ClassicalRasterFrontend/ClassicalLowering.h"
 #include "09_ExperimentalGeometry/ExperimentalGeometry.h"
+#include "09_ExperimentalGeometry/SdfLowering.h"
 
 namespace sge::cube_lab
 {
+    enum class ExperimentMode
+    {
+        Classical,
+        Sdf
+    };
+
     class ComparisonExperiment
     {
     public:
@@ -13,7 +20,8 @@ namespace sge::cube_lab
 
         [[nodiscard]] ir::SemanticModule Build(
             double elapsedSeconds,
-            float aspectRatio) const;
+            float aspectRatio,
+            ExperimentMode mode = ExperimentMode::Classical) const;
 
         [[nodiscard]] const experimental::PgaBox& PgaModel() const noexcept;
         [[nodiscard]] const experimental::SdfBox& SdfModel() const noexcept;
@@ -21,7 +29,7 @@ namespace sge::cube_lab
     private:
         experimental::PgaBox pgaBox_;
         experimental::SdfBox sdfBox_;
-        classical::GeometryRanges ranges_{};
-        std::vector<classical::Vertex> vertices_;
+        classical::ClassicalRasterLowering classicalLowering_;
+        experimental::SdfRayMarchLowering sdfLowering_;
     };
 }

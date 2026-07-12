@@ -30,6 +30,7 @@ namespace sge::compiler
         std::size_t beforeScheduledWork = 0;
         gpu::AbstractState from = gpu::AbstractState::Undefined;
         gpu::AbstractState to = gpu::AbstractState::Undefined;
+        std::uint32_t frameLag = 0;
     };
 
     struct ExecutableKey
@@ -45,6 +46,26 @@ namespace sge::compiler
     {
         gpu::ResourceId resource;
         gpu::AbstractState state = gpu::AbstractState::Undefined;
+        std::uint32_t frameLag = 0;
+    };
+
+    struct ResourceInstancePlan
+    {
+        gpu::ResourceId resource;
+        gpu::ResourceLifetimeClass lifetime =
+            gpu::ResourceLifetimeClass::Persistent;
+        gpu::InstanceSelectorKind selector =
+            gpu::InstanceSelectorKind::Persistent;
+        std::uint32_t physicalInstanceCount = 1;
+    };
+
+    struct TemporalDependency
+    {
+        gpu::ResourceId resource;
+        std::size_t consumerScheduledWork = 0;
+        std::uint32_t readLag = 1;
+        gpu::QueueClass producerQueue = gpu::QueueClass::Direct;
+        gpu::QueueClass consumerQueue = gpu::QueueClass::Direct;
     };
 
     struct ScheduledWork
@@ -63,9 +84,9 @@ namespace sge::compiler
         gpu::QueueClass waitQueue = gpu::QueueClass::Direct;
     };
 
-    // Describes the state handoff required when the same execution plan is
-    // repeated. The last queue releases the resource to the neutral COMMON
-    // state so that the first queue of the next frame can acquire it legally.
+    // End-state normalization for a persistent physical instance. Frame-slot
+    // reuse is guarded separately by queue completion fences, and temporal
+    // data flow is represented by TemporalDependency.
     struct FrameBoundaryTransition
     {
         gpu::ResourceId resource;
@@ -87,6 +108,8 @@ namespace sge::compiler
         std::vector<ExecutableKey> executables;
         std::vector<QueueSynchronization> queueSynchronizations;
         std::vector<FrameBoundaryTransition> frameBoundaryTransitions;
+        std::vector<ResourceInstancePlan> resourceInstances;
+        std::vector<TemporalDependency> temporalDependencies;
     };
 
     struct CompileResult
@@ -152,6 +175,15 @@ namespace sge::compiler
         static std::vector<StateTransition> PlanTransitions(
             const std::vector<ScheduledWork>& works);
 
+        static std::vector<ResourceInstancePlan> PlanResourceInstances(
+            const ir::SemanticModule& module,
+            const gpu::DeviceCapabilities& capabilities);
+
+        static std::vector<TemporalDependency> PlanTemporalDependencies(
+            const ir::SemanticModule& module,
+            const std::vector<std::size_t>& schedule,
+            const std::vector<ScheduledWork>& works);
+
         static std::vector<QueueSynchronization> PlanQueueSynchronization(
             const std::vector<DependencyEdge>& dependencies,
             const std::vector<std::size_t>& schedule,
@@ -159,6 +191,7 @@ namespace sge::compiler
 
         static std::vector<FrameBoundaryTransition>
             PlanFrameBoundaryTransitions(
+                const ir::SemanticModule& module,
                 const std::vector<ScheduledWork>& works);
 
         std::shared_ptr<const ISchedulingPolicy> schedulingPolicy_;

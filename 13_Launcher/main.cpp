@@ -11,7 +11,7 @@
 int WINAPI wWinMain(
     HINSTANCE instance,
     HINSTANCE,
-    PWSTR,
+    PWSTR commandLine,
     int showCommand)
 {
     try
@@ -40,6 +40,10 @@ int WINAPI wWinMain(
         };
 
         sge::cube_lab::ComparisonExperiment experiment;
+        auto mode = commandLine != nullptr
+                && wcsstr(commandLine, L"--sdf") != nullptr
+            ? sge::cube_lab::ExperimentMode::Sdf
+            : sge::cube_lab::ExperimentMode::Classical;
 
         return application.Run(
             [&](const sge::platform::FrameTime& time)
@@ -54,10 +58,20 @@ int WINAPI wWinMain(
                     static_cast<float>(surface.width)
                     / static_cast<float>(surface.height);
 
+                if ((GetAsyncKeyState('1') & 0x0001) != 0)
+                {
+                    mode = sge::cube_lab::ExperimentMode::Classical;
+                }
+                if ((GetAsyncKeyState('2') & 0x0001) != 0)
+                {
+                    mode = sge::cube_lab::ExperimentMode::Sdf;
+                }
+
                 runtime.Execute(
                     experiment.Build(
                         time.elapsedSeconds,
-                        aspectRatio));
+                        aspectRatio,
+                        mode));
             });
     }
     catch (const std::exception& error)

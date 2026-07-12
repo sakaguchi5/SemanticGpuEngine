@@ -26,12 +26,29 @@ namespace sge::gpu
         Presentation
     };
 
-    enum class MemoryClass
+    enum class ResourceLifetimeClass
     {
-        Static,
-        DynamicPerFrame,
-        Transient,
+        Persistent,
+        FrameLocal,
+        Temporal,
         External
+    };
+
+    enum class ResourceUpdateClass
+    {
+        Immutable,
+        CpuUpdated,
+        GpuProduced,
+        Imported
+    };
+
+    enum class InstanceSelectorKind
+    {
+        Persistent,
+        CurrentFrameSlot,
+        PreviousTemporalSlot,
+        CurrentTemporalSlot,
+        ExternalFrameIndex
     };
 
     enum class ResourceFormat
@@ -131,6 +148,7 @@ namespace sge::gpu
         ResourceId resource;
         AccessMode access = AccessMode::Read;
         ResourceRole role = ResourceRole::ProgramInput;
+        std::uint32_t frameLag = 0;
     };
 
     struct ProgramParameter
@@ -155,6 +173,7 @@ namespace sge::gpu
         bool rayExecution = false;
         std::uint32_t constantDataAlignment = 256;
         std::uint64_t localMemoryBudget = 0;
+        std::uint32_t maxFramesInFlight = 3;
     };
 
     [[nodiscard]] AbstractState RequiredState(const ResourceAccess& access);

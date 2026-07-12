@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <string>
 #include <stdexcept>
 #include <utility>
 
@@ -28,7 +29,6 @@ namespace sge::d3d12::detail
         CreateFrameContexts();
         CreateFence();
         CreateRenderTargets();
-        CreateDepthBuffer();
     }
 
     Backend::~Backend()
@@ -81,7 +81,7 @@ namespace sge::d3d12::detail
                 DXGI_MEMORY_SEGMENT_GROUP_LOCAL,
                 &information)))
             {
-                capabilities.localMemoryBudget = information.Budget;
+        capabilities.localMemoryBudget = information.Budget;
             }
         }
 
@@ -99,16 +99,10 @@ namespace sge::d3d12::detail
         }
 
         EnsureCompiled(module, plan);
-
-        // This reference backend deliberately recycles per-work command objects
-        // only after the previous frame is complete. Queue-to-queue dependencies
-        // within the frame remain asynchronous and are expressed by queue fences.
-        WaitIdle();
-        inFlightAllocators_.clear();
-        inFlightLists_.clear();
-
-        FrameContext& frame = frames_[frameIndex_];
-        frame.uploadOffset = 0;
+        activeFrameSlot_ = static_cast<std::uint32_t>(
+            frameNumber_ % FrameCount);
+        FrameContext& frame = frames_[activeFrameSlot_];
+        BeginFrame(frame);
 
         const D3D12_VIEWPORT viewport{
             0.0f,
@@ -141,7 +135,28 @@ namespace sge::d3d12::detail
             const auto& work = module.works.at(scheduled.sourceWorkIndex);
 
             auto* nativeQueue = QueueFor(scheduled.queue);
-            const auto listType = CommandListType(scheduled.queue);
+
+            for (const auto& temporal : plan.temporalDependencies)
+            {
+                if (temporal.consumerScheduledWork != scheduledIndex)
+                {
+                    continue;
+                }
+                const auto completions = temporalCompletions_.find(
+                    temporal.resource);
+                if (completions == temporalCompletions_.end()
+                    || completions->second.empty())
+                {
+                    continue;
+                }
+                const auto count = completions->second.size();
+                const auto slot = static_cast<std::size_t>(
+                    (frameNumber_ + count - (temporal.readLag % count))
+                    % count);
+                const auto point = completions->second[slot];
+                WaitForQueueValue(
+                    scheduled.queue, point.queue, point.value);
+            }
 
             for (const auto& synchronization : plan.queueSynchronizations)
             {
@@ -162,16 +177,8 @@ namespace sge::d3d12::detail
                 }
             }
 
-            ComPtr<ID3D12CommandAllocator> allocator;
-            ComPtr<ID3D12GraphicsCommandList> list;
-            ThrowIfFailed(device_->CreateCommandAllocator(
-                listType, IID_PPV_ARGS(&allocator)),
-                "Create per-work command allocator");
-            ThrowIfFailed(device_->CreateCommandList(
-                0, listType, allocator.Get(), nullptr,
-                IID_PPV_ARGS(&list)),
-                "Create per-work command list");
-            commandList_ = list;
+            commandList_ = AcquireCommandList(frame, scheduled.queue);
+            activeQueue_ = scheduled.queue;
 
             if (scheduled.queue != gpu::QueueClass::Copy)
             {
@@ -186,8 +193,21 @@ namespace sge::d3d12::detail
 
             for (const auto& requirement : scheduled.requiredStates)
             {
-                ActivateAliasedResource(requirement.resource);
-                Transition(requirement.resource, requirement.state);
+                ActivateAliasedResource(
+                    requirement.resource, requirement.frameLag);
+                if (scheduled.queue == gpu::QueueClass::Copy
+                    && (requirement.state == gpu::AbstractState::TransferRead
+                        || requirement.state
+                            == gpu::AbstractState::TransferWrite))
+                {
+                    // COPY lists use implicit COMMON promotion/decay. Queue
+                    // handoff planning guarantees COMMON before submission.
+                    continue;
+                }
+                Transition(
+                    requirement.resource,
+                    requirement.state,
+                    requirement.frameLag);
             }
 
             if (work.Domain() == gpu::ExecutionDomain::Raster)
@@ -208,10 +228,26 @@ namespace sge::d3d12::detail
                     "D3D12 backend received an unsupported work domain.");
             }
 
-            // Apply compiler-planned releases on the queue that performed the
-            // final use. This closes the cyclic edge from this frame's last use
-            // to the next frame's first use without issuing an illegal barrier
-            // on the consumer queue. AbstractState::Undefined maps to COMMON.
+            const bool hasOutgoingQueueHandoff = std::any_of(
+                plan.queueSynchronizations.begin(),
+                plan.queueSynchronizations.end(),
+                [&](const compiler::QueueSynchronization& synchronization)
+                {
+                    return synchronization.signalScheduledWork
+                        == scheduledIndex;
+                });
+            if (hasOutgoingQueueHandoff
+                && scheduled.queue != gpu::QueueClass::Copy)
+            {
+                for (const auto& requirement : scheduled.requiredStates)
+                {
+                    Transition(
+                        requirement.resource,
+                        gpu::AbstractState::Undefined,
+                        requirement.frameLag);
+                }
+            }
+
             for (const auto& boundary : plan.frameBoundaryTransitions)
             {
                 if (boundary.afterScheduledWork != scheduledIndex)
@@ -223,11 +259,50 @@ namespace sge::d3d12::detail
                     throw std::runtime_error(
                         "Frame-boundary transition is assigned to the wrong queue.");
                 }
-                Transition(boundary.resource, boundary.to);
+                const auto instancePlan = resourceInstancePlans_.find(
+                    boundary.resource);
+                if (instancePlan != resourceInstancePlans_.end()
+                    && instancePlan->second.lifetime
+                        == gpu::ResourceLifetimeClass::Persistent)
+                {
+                    Transition(boundary.resource, boundary.to);
+                }
             }
 
-            ThrowIfFailed(commandList_->Close(),
-                "Close per-work command list");
+            const HRESULT closeResult = commandList_->Close();
+            if (FAILED(closeResult))
+            {
+                std::string message = "Close frame command list for work '"
+                    + work.name + "' on queue "
+                    + std::to_string(static_cast<int>(scheduled.queue))
+                    + ", HRESULT="
+                    + std::to_string(static_cast<unsigned long>(closeResult));
+#if defined(_DEBUG)
+                ComPtr<ID3D12InfoQueue> information;
+                if (SUCCEEDED(device_.As(&information)))
+                {
+                    const auto count = information->GetNumStoredMessages();
+                    const auto first = count > 8 ? count - 8 : 0;
+                    for (UINT64 index = first; index < count; ++index)
+                    {
+                        SIZE_T bytes = 0;
+                        information->GetMessage(index, nullptr, &bytes);
+                        std::vector<std::byte> storage(bytes);
+                        auto* debugMessage = reinterpret_cast<
+                            D3D12_MESSAGE*>(storage.data());
+                        if (SUCCEEDED(information->GetMessage(
+                            index, debugMessage, &bytes)))
+                        {
+                            message += "\n";
+                            message.append(
+                                debugMessage->pDescription,
+                                debugMessage->DescriptionByteLength);
+                        }
+                    }
+                }
+#endif
+                throw std::runtime_error(message);
+            }
             ID3D12CommandList* lists[] = {commandList_.Get()};
             nativeQueue->ExecuteCommandLists(1, lists);
 
@@ -235,16 +310,44 @@ namespace sge::d3d12::detail
                 .queue = scheduled.queue,
                 .value = SignalQueue(scheduled.queue)
             };
-            inFlightAllocators_.push_back(std::move(allocator));
-            inFlightLists_.push_back(std::move(list));
+            frame.queues[QueueIndex(scheduled.queue)].completionFenceValue =
+                workSignals[scheduledIndex].value;
+
+            for (const auto& access : work.accesses)
+            {
+                if (access.frameLag != 0
+                    || access.access == gpu::AccessMode::Read)
+                {
+                    continue;
+                }
+                const auto planFound = resourceInstancePlans_.find(
+                    access.resource);
+                if (planFound == resourceInstancePlans_.end()
+                    || planFound->second.lifetime
+                        != gpu::ResourceLifetimeClass::Temporal)
+                {
+                    continue;
+                }
+                auto& completions = temporalCompletions_[access.resource];
+                if (completions.size()
+                    != planFound->second.physicalInstanceCount)
+                {
+                    completions.resize(
+                        planFound->second.physicalInstanceCount);
+                }
+                completions[ResolveInstanceIndex(access.resource)] = {
+                    scheduled.queue,
+                    workSignals[scheduledIndex].value
+                };
+            }
         }
 
         ThrowIfFailed(
             swapChain_->Present(1, 0),
             "SwapChain::Present");
 
-        frame.fenceValue = SignalQueue(gpu::QueueClass::Direct);
         frameIndex_ = swapChain_->GetCurrentBackBufferIndex();
+        ++frameNumber_;
     }
 
     void Backend::WaitIdle()
@@ -343,6 +446,72 @@ namespace sge::d3d12::detail
         ThrowIfFailed(
             QueueFor(waitingQueue)->Wait(SyncFor(sourceQueue).fence.Get(), value),
             "Cross-queue wait");
+    }
+
+    void Backend::WaitForCpuQueueValue(
+        gpu::QueueClass queue,
+        UINT64 value)
+    {
+        if (value == 0)
+        {
+            return;
+        }
+        auto& state = SyncFor(queue);
+        if (state.fence->GetCompletedValue() >= value)
+        {
+            return;
+        }
+        ThrowIfFailed(state.fence->SetEventOnCompletion(value, state.event),
+            "Fence::SetEventOnCompletion");
+        WaitForSingleObject(state.event, INFINITE);
+    }
+
+    void Backend::BeginFrame(FrameContext& frame)
+    {
+        constexpr std::array queues{
+            gpu::QueueClass::Direct,
+            gpu::QueueClass::Compute,
+            gpu::QueueClass::Copy
+        };
+        for (const auto queue : queues)
+        {
+            auto& context = frame.queues[QueueIndex(queue)];
+            WaitForCpuQueueValue(queue, context.completionFenceValue);
+            context.completionFenceValue = 0;
+            context.usedCommandLists = 0;
+            ThrowIfFailed(context.allocator->Reset(),
+                "Reset frame command allocator");
+        }
+        frame.uploadOffset = 0;
+        for (auto& [allocation, active] : activeAliasedResources_)
+        {
+            if (frame.slot < active.size())
+            {
+                active[frame.slot].reset();
+            }
+        }
+    }
+
+    ID3D12GraphicsCommandList* Backend::AcquireCommandList(
+        FrameContext& frame,
+        gpu::QueueClass queue)
+    {
+        auto& context = frame.queues[QueueIndex(queue)];
+        const auto listType = CommandListType(queue);
+        if (context.usedCommandLists == context.commandLists.size())
+        {
+            ComPtr<ID3D12GraphicsCommandList> list;
+            ThrowIfFailed(device_->CreateCommandList(
+                0, listType, context.allocator.Get(), nullptr,
+                IID_PPV_ARGS(&list)), "Create frame command list");
+            context.commandLists.push_back(std::move(list));
+        }
+        else
+        {
+            ThrowIfFailed(context.commandLists[context.usedCommandLists]->Reset(
+                context.allocator.Get(), nullptr), "Reset frame command list");
+        }
+        return context.commandLists[context.usedCommandLists++].Get();
     }
 
     void Backend::EnableDebugLayer()
@@ -524,13 +693,22 @@ namespace sge::d3d12::detail
 
     void Backend::CreateFrameContexts()
     {
-        for (auto& frame : frames_)
+        for (std::uint32_t slot = 0; slot < FrameCount; ++slot)
         {
-            ThrowIfFailed(
-                device_->CreateCommandAllocator(
-                    D3D12_COMMAND_LIST_TYPE_DIRECT,
-                    IID_PPV_ARGS(&frame.allocator)),
-                "CreateCommandAllocator");
+            auto& frame = frames_[slot];
+            frame.slot = slot;
+            constexpr std::array queues{
+                gpu::QueueClass::Direct,
+                gpu::QueueClass::Compute,
+                gpu::QueueClass::Copy
+            };
+            for (const auto queue : queues)
+            {
+                ThrowIfFailed(device_->CreateCommandAllocator(
+                    CommandListType(queue),
+                    IID_PPV_ARGS(&frame.queues[QueueIndex(queue)].allocator)),
+                    "Create frame command allocator");
+            }
 
             const auto uploadProperties = HeapProperties(
                 D3D12_HEAP_TYPE_UPLOAD);
@@ -555,19 +733,6 @@ namespace sge::d3d12::detail
                     reinterpret_cast<void**>(&frame.mappedUpload)),
                 "Map frame upload arena");
         }
-
-        ThrowIfFailed(
-            device_->CreateCommandList(
-                0,
-                D3D12_COMMAND_LIST_TYPE_DIRECT,
-                frames_[0].allocator.Get(),
-                nullptr,
-                IID_PPV_ARGS(&commandList_)),
-            "CreateGraphicsCommandList");
-
-        ThrowIfFailed(
-            commandList_->Close(),
-            "Close initial command list");
     }
 
     void Backend::CreateFence()
@@ -619,52 +784,6 @@ namespace sge::d3d12::detail
         }
     }
 
-    void Backend::CreateDepthBuffer()
-    {
-        if (width_ == 0 || height_ == 0)
-        {
-            return;
-        }
-
-        D3D12_CLEAR_VALUE clearValue{};
-        clearValue.Format = DXGI_FORMAT_D32_FLOAT;
-        clearValue.DepthStencil.Depth = 1.0f;
-
-        D3D12_RESOURCE_DESC description{};
-        description.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        description.Width = width_;
-        description.Height = height_;
-        description.DepthOrArraySize = 1;
-        description.MipLevels = 1;
-        description.Format = DXGI_FORMAT_D32_FLOAT;
-        description.SampleDesc.Count = 1;
-        description.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-        description.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
-
-        const auto properties = HeapProperties(D3D12_HEAP_TYPE_DEFAULT);
-
-        ThrowIfFailed(
-            device_->CreateCommittedResource(
-                &properties,
-                D3D12_HEAP_FLAG_NONE,
-                &description,
-                D3D12_RESOURCE_STATE_DEPTH_WRITE,
-                &clearValue,
-                IID_PPV_ARGS(&depthBuffer_)),
-            "Create depth buffer");
-
-        D3D12_DEPTH_STENCIL_VIEW_DESC view{};
-        view.Format = DXGI_FORMAT_D32_FLOAT;
-        view.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
-
-        device_->CreateDepthStencilView(
-            depthBuffer_.Get(),
-            &view,
-            dsvHeap_->GetCPUDescriptorHandleForHeapStart());
-
-        depthState_ = D3D12_RESOURCE_STATE_DEPTH_WRITE;
-    }
-
     void Backend::ResizeIfNeeded()
     {
         RECT client{};
@@ -698,7 +817,6 @@ namespace sge::d3d12::detail
         {
             buffer.Reset();
         }
-        depthBuffer_.Reset();
 
         DXGI_SWAP_CHAIN_DESC description{};
         ThrowIfFailed(
@@ -716,25 +834,6 @@ namespace sge::d3d12::detail
 
         frameIndex_ = swapChain_->GetCurrentBackBufferIndex();
         CreateRenderTargets();
-        CreateDepthBuffer();
-    }
-
-    void Backend::WaitForFrame(FrameContext& frame)
-    {
-        auto& state = SyncFor(gpu::QueueClass::Direct);
-        if (frame.fenceValue == 0
-            || state.fence->GetCompletedValue() >= frame.fenceValue)
-        {
-            return;
-        }
-
-        ThrowIfFailed(
-            state.fence->SetEventOnCompletion(
-                frame.fenceValue,
-                state.event),
-            "Fence::SetEventOnCompletion");
-
-        WaitForSingleObject(state.event, INFINITE);
     }
 }
 

@@ -35,6 +35,7 @@ namespace
         sge::gpu::ResourceId resource;
         sge::gpu::ResourceRole role;
         AccessExpectation mode = AccessExpectation::Read;
+        std::uint32_t frameLag = 0;
     };
 
     bool ModeMatches(
@@ -78,17 +79,20 @@ namespace
                 case gpu::ProgramParameterKind::ConstantBuffer:
                     expected.push_back({binding.resource,
                         gpu::ResourceRole::ConstantInput,
-                        AccessExpectation::Read});
+                        AccessExpectation::Read,
+                        binding.frameLag});
                     break;
                 case gpu::ProgramParameterKind::ShaderResource:
                     expected.push_back({binding.resource,
                         gpu::ResourceRole::ProgramInput,
-                        AccessExpectation::Read});
+                        AccessExpectation::Read,
+                        binding.frameLag});
                     break;
                 case gpu::ProgramParameterKind::UnorderedAccess:
                     expected.push_back({binding.resource,
                         gpu::ResourceRole::ProgramOutput,
-                        AccessExpectation::WriteOrReadWrite});
+                        AccessExpectation::WriteOrReadWrite,
+                        binding.frameLag});
                     break;
                 case gpu::ProgramParameterKind::Sampler:
                     break;
@@ -133,10 +137,12 @@ namespace
             const auto& copy = std::get<ir::CopyWork>(work.payload);
             expected.push_back({copy.source,
                 gpu::ResourceRole::TransferSource,
-                AccessExpectation::Read});
+                AccessExpectation::Read,
+                copy.sourceFrameLag});
             expected.push_back({copy.destination,
                 gpu::ResourceRole::TransferDestination,
-                AccessExpectation::Write});
+                AccessExpectation::Write,
+                copy.destinationFrameLag});
             break;
         }
         case gpu::ExecutionDomain::Present:
@@ -170,6 +176,7 @@ namespace
                     return !used[index]
                         && access.resource == requirement.resource
                         && access.role == requirement.role
+                        && access.frameLag == requirement.frameLag
                         && ModeMatches(access.access, requirement.mode);
                 });
 
@@ -234,7 +241,11 @@ namespace sge::compiler
         result.plan.queueSynchronizations = PlanQueueSynchronization(
             result.plan.dependencies, schedule, result.plan.scheduledWorks);
         result.plan.frameBoundaryTransitions =
-            PlanFrameBoundaryTransitions(result.plan.scheduledWorks);
+            PlanFrameBoundaryTransitions(module, result.plan.scheduledWorks);
+        result.plan.resourceInstances = PlanResourceInstances(
+            module, capabilities);
+        result.plan.temporalDependencies = PlanTemporalDependencies(
+            module, schedule, result.plan.scheduledWorks);
 
         for (const auto& scheduled : result.plan.scheduledWorks)
         {
@@ -293,19 +304,26 @@ namespace sge::compiler
             }
 
             if (resource.Kind() == gpu::ResourceKind::Buffer
-                && resource.memoryClass != gpu::MemoryClass::DynamicPerFrame
-                && resource.memoryClass != gpu::MemoryClass::External
+                && resource.update != gpu::ResourceUpdateClass::CpuUpdated
+                && resource.lifetime != gpu::ResourceLifetimeClass::External
                 && resource.SizeBytes() == 0)
             {
                 throw std::runtime_error(
                     "Semantic validation failed: non-dynamic buffer has zero size.");
             }
 
-            if (resource.memoryClass == gpu::MemoryClass::Static
+            if (resource.update == gpu::ResourceUpdateClass::Immutable
                 && resource.data.size() != resource.SizeBytes())
             {
                 throw std::runtime_error(
                     "Semantic validation failed: static resource data size mismatch.");
+            }
+
+            if (resource.lifetime == gpu::ResourceLifetimeClass::External
+                && resource.update != gpu::ResourceUpdateClass::Imported)
+            {
+                throw std::runtime_error(
+                    "Semantic validation failed: external resource must be imported.");
             }
         }
 
@@ -404,6 +422,20 @@ namespace sge::compiler
                     throw std::runtime_error(
                         "Semantic validation failed: work references an unknown resource.");
                 }
+                const auto& resource = module.Resource(access.resource);
+                if (access.frameLag > 0
+                    && resource.lifetime
+                        != gpu::ResourceLifetimeClass::Temporal)
+                {
+                    throw std::runtime_error(
+                        "Semantic validation failed: frame-lagged access requires a temporal resource.");
+                }
+                if (access.frameLag > 0
+                    && access.access != gpu::AccessMode::Read)
+                {
+                    throw std::runtime_error(
+                        "Semantic validation failed: past temporal instances are read-only.");
+                }
             }
 
             const auto validateBindings = [&](const auto& bindings,
@@ -494,6 +526,10 @@ namespace sge::compiler
         {
             for (const auto& access : module.works[workIndex].accesses)
             {
+                if (access.frameLag > 0)
+                {
+                    continue;
+                }
                 auto& history = histories[access.resource];
 
                 const bool reads =
@@ -686,7 +722,8 @@ namespace sge::compiler
             gpu::PhysicalAllocationId allocation{nextAllocation++};
 
             if (allowAliasing
-                && resource.memoryClass == gpu::MemoryClass::Transient)
+                && resource.lifetime == gpu::ResourceLifetimeClass::FrameLocal
+                && resource.update == gpu::ResourceUpdateClass::GpuProduced)
             {
                 std::unordered_set<std::uint32_t> consideredAllocations;
                 for (const auto& seed : lifetimes)
@@ -708,8 +745,10 @@ namespace sge::compiler
                         const auto& existingResource =
                             module.Resource(existing.resource);
                         const bool compatible =
-                            existingResource.memoryClass
-                                == gpu::MemoryClass::Transient
+                            existingResource.lifetime
+                                == gpu::ResourceLifetimeClass::FrameLocal
+                            && existingResource.update
+                                == gpu::ResourceUpdateClass::GpuProduced
                             && existingResource.Kind() == resource.Kind()
                             && existingResource.Format() == resource.Format()
                             && existingResource.description == resource.description;
@@ -813,14 +852,16 @@ namespace sge::compiler
                     [&](const RequiredResourceState& value)
                     {
                         return value.resource == access.resource
-                            && value.state == state;
+                            && value.state == state
+                            && value.frameLag == access.frameLag;
                     });
 
                 if (duplicate == scheduled.requiredStates.end())
                 {
                     scheduled.requiredStates.push_back({
                         .resource = access.resource,
-                        .state = state
+                        .state = state,
+                        .frameLag = access.frameLag
                     });
                 }
             }
@@ -835,9 +876,8 @@ namespace sge::compiler
         const std::vector<ScheduledWork>& works)
     {
         std::unordered_map<
-            gpu::ResourceId,
-            gpu::AbstractState,
-            foundation::StrongIdHash<gpu::ResourceTag>> currentStates;
+            std::uint64_t,
+            gpu::AbstractState> currentStates;
 
         std::vector<StateTransition> transitions;
 
@@ -847,7 +887,10 @@ namespace sge::compiler
         {
             for (const auto& requirement : works[workIndex].requiredStates)
             {
-                const auto found = currentStates.find(requirement.resource);
+                const auto key =
+                    (static_cast<std::uint64_t>(requirement.resource.Value()) << 32u)
+                    | requirement.frameLag;
+                const auto found = currentStates.find(key);
                 const auto current = found == currentStates.end()
                     ? gpu::AbstractState::Undefined
                     : found->second;
@@ -858,10 +901,11 @@ namespace sge::compiler
                         .resource = requirement.resource,
                         .beforeScheduledWork = workIndex,
                         .from = current,
-                        .to = requirement.state
+                        .to = requirement.state,
+                        .frameLag = requirement.frameLag
                     });
 
-                    currentStates[requirement.resource] = requirement.state;
+                    currentStates[key] = requirement.state;
                 }
             }
         }
@@ -869,8 +913,105 @@ namespace sge::compiler
         return transitions;
     }
 
+    std::vector<ResourceInstancePlan> RenderCompiler::PlanResourceInstances(
+        const ir::SemanticModule& module,
+        const gpu::DeviceCapabilities& capabilities)
+    {
+        const auto frameCount = std::max(1u, capabilities.maxFramesInFlight);
+        std::vector<ResourceInstancePlan> result;
+        result.reserve(module.resources.size());
+
+        for (const auto& resource : module.resources)
+        {
+            ResourceInstancePlan plan;
+            plan.resource = resource.id;
+            plan.lifetime = resource.lifetime;
+            switch (resource.lifetime)
+            {
+            case gpu::ResourceLifetimeClass::Persistent:
+                plan.selector = gpu::InstanceSelectorKind::Persistent;
+                plan.physicalInstanceCount = 1;
+                break;
+            case gpu::ResourceLifetimeClass::FrameLocal:
+                plan.selector = gpu::InstanceSelectorKind::CurrentFrameSlot;
+                plan.physicalInstanceCount = frameCount;
+                break;
+            case gpu::ResourceLifetimeClass::Temporal:
+                plan.selector = gpu::InstanceSelectorKind::CurrentTemporalSlot;
+                plan.physicalInstanceCount = std::max(2u, frameCount);
+                break;
+            case gpu::ResourceLifetimeClass::External:
+                plan.selector = gpu::InstanceSelectorKind::ExternalFrameIndex;
+                plan.physicalInstanceCount = 0;
+                break;
+            }
+            result.push_back(plan);
+        }
+        return result;
+    }
+
+    std::vector<TemporalDependency> RenderCompiler::PlanTemporalDependencies(
+        const ir::SemanticModule& module,
+        const std::vector<std::size_t>& schedule,
+        const std::vector<ScheduledWork>& works)
+    {
+        std::vector<std::size_t> scheduledPosition(schedule.size());
+        for (std::size_t index = 0; index < schedule.size(); ++index)
+        {
+            scheduledPosition.at(schedule[index]) = index;
+        }
+
+        std::unordered_map<
+            gpu::ResourceId,
+            std::size_t,
+            foundation::StrongIdHash<gpu::ResourceTag>> lastWriters;
+        for (std::size_t sourceIndex = 0;
+             sourceIndex < module.works.size(); ++sourceIndex)
+        {
+            for (const auto& access : module.works[sourceIndex].accesses)
+            {
+                if (access.frameLag == 0
+                    && access.access != gpu::AccessMode::Read)
+                {
+                    lastWriters[access.resource] = sourceIndex;
+                }
+            }
+        }
+
+        std::vector<TemporalDependency> result;
+        for (std::size_t scheduledIndex = 0;
+             scheduledIndex < works.size(); ++scheduledIndex)
+        {
+            const auto& source = module.works.at(
+                works[scheduledIndex].sourceWorkIndex);
+            for (const auto& access : source.accesses)
+            {
+                if (access.frameLag == 0)
+                {
+                    continue;
+                }
+                const auto writer = lastWriters.find(access.resource);
+                if (writer == lastWriters.end())
+                {
+                    throw std::runtime_error(
+                        "Temporal resource is read without a current-frame writer.");
+                }
+                const auto writerScheduled = scheduledPosition.at(writer->second);
+                result.push_back({
+                    .resource = access.resource,
+                    .consumerScheduledWork = scheduledIndex,
+                    .readLag = access.frameLag,
+                    .producerQueue = works.at(writerScheduled).queue,
+                    .consumerQueue = works.at(scheduledIndex).queue
+                });
+            }
+        }
+        return result;
+    }
+
     std::vector<FrameBoundaryTransition>
         RenderCompiler::PlanFrameBoundaryTransitions(
+            const ir::SemanticModule& module,
             const std::vector<ScheduledWork>& works)
     {
         struct RepeatedUse
@@ -897,6 +1038,10 @@ namespace sge::compiler
             const auto& scheduled = works[scheduledIndex];
             for (const auto& requirement : scheduled.requiredStates)
             {
+                if (requirement.frameLag > 0)
+                {
+                    continue;
+                }
                 const auto found = useIndices.find(requirement.resource);
                 if (found == useIndices.end())
                 {
@@ -923,6 +1068,11 @@ namespace sge::compiler
         std::vector<FrameBoundaryTransition> result;
         for (const auto& use : uses)
         {
+            if (module.Resource(use.resource).lifetime
+                != gpu::ResourceLifetimeClass::Persistent)
+            {
+                continue;
+            }
             // A repeated plan is cyclic: the last use is followed by the first
             // use of the next frame. A queue change requires the producer queue
             // to release the resource to COMMON before that cycle edge.

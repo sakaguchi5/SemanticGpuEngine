@@ -24,22 +24,34 @@ namespace sge::d3d12::detail
 
         WaitIdle();
 
-        staticResources_.clear();
+        resources_.clear();
+        resourceInstancePlans_.clear();
         physicalAllocations_.clear();
         allocationHeaps_.clear();
         activeAliasedResources_.clear();
+        temporalCompletions_.clear();
         programs_.clear();
         pipelines_.clear();
         presentationResource_.reset();
-        depthResource_.reset();
         nextRtvDescriptor_ = FrameCount;
-        nextDsvDescriptor_ = 1;
+        nextDsvDescriptor_ = 0;
         nextShaderDescriptor_ = 0;
+
+        for (const auto& instance : plan.resourceInstances)
+        {
+            resourceInstancePlans_.emplace(instance.resource, instance);
+            if (instance.lifetime == gpu::ResourceLifetimeClass::Temporal)
+            {
+                temporalCompletions_[instance.resource].assign(
+                    instance.physicalInstanceCount, {});
+            }
+        }
 
         struct HeapRequirement
         {
             UINT64 size = 0;
             UINT64 alignment = 0;
+            D3D12_HEAP_FLAGS flags = D3D12_HEAP_FLAG_NONE;
         };
         std::unordered_map<
             gpu::PhysicalAllocationId,
@@ -49,22 +61,50 @@ namespace sge::d3d12::detail
         for (const auto& lifetime : plan.lifetimes)
         {
             const auto& resource = module.Resource(lifetime.resource);
-            if (resource.memoryClass != gpu::MemoryClass::Transient
-                || (resource.Kind() != gpu::ResourceKind::Texture1D
+            if (resource.lifetime != gpu::ResourceLifetimeClass::FrameLocal
+                || resource.update != gpu::ResourceUpdateClass::GpuProduced
+                || (resource.Kind() != gpu::ResourceKind::Buffer
+                    && resource.Kind() != gpu::ResourceKind::Texture1D
                     && resource.Kind() != gpu::ResourceKind::Texture2D
                     && resource.Kind() != gpu::ResourceKind::Texture3D))
             {
                 continue;
             }
-            const auto native = TextureDescription(
-                std::get<ir::TextureDescription>(resource.description),
-                width_, height_);
+            D3D12_RESOURCE_DESC native{};
+            D3D12_HEAP_FLAGS heapFlags = D3D12_HEAP_FLAG_NONE;
+            if (resource.Kind() == gpu::ResourceKind::Buffer)
+            {
+                native = BufferDescription(resource.SizeBytes());
+                const auto& buffer = std::get<ir::BufferDescription>(
+                    resource.description);
+                if ((static_cast<std::uint32_t>(buffer.usage)
+                    & static_cast<std::uint32_t>(ir::BufferUsage::Storage)) != 0)
+                {
+                    native.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+                }
+                heapFlags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+            }
+            else
+            {
+                native = TextureDescription(
+                    std::get<ir::TextureDescription>(resource.description),
+                    width_, height_);
+                const auto& texture = std::get<ir::TextureDescription>(
+                    resource.description);
+                const auto usage = static_cast<std::uint32_t>(texture.usage);
+                heapFlags = (usage
+                    & (static_cast<std::uint32_t>(ir::TextureUsage::ColorAttachment)
+                        | static_cast<std::uint32_t>(ir::TextureUsage::DepthAttachment))) != 0
+                    ? D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES
+                    : D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES;
+            }
             const auto information = device_->GetResourceAllocationInfo(
                 0, 1, &native);
             auto& requirement = requirements[lifetime.allocation];
             requirement.size = std::max(requirement.size, information.SizeInBytes);
             requirement.alignment = std::max(
                 requirement.alignment, information.Alignment);
+            requirement.flags = heapFlags;
             physicalAllocations_[resource.id] = lifetime.allocation;
         }
 
@@ -74,70 +114,71 @@ namespace sge::d3d12::detail
             description.SizeInBytes = requirement.size;
             description.Alignment = requirement.alignment;
             description.Properties = HeapProperties(D3D12_HEAP_TYPE_DEFAULT);
-            description.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES;
+            description.Flags = requirement.flags;
 
-            for (const auto& [resource, resourceAllocation] : physicalAllocations_)
+            std::vector<ComPtr<ID3D12Heap>> heaps(FrameCount);
+            for (auto& heap : heaps)
             {
-                if (resourceAllocation == allocation)
-                {
-                    const auto& texture = std::get<ir::TextureDescription>(
-                        module.Resource(resource).description);
-                    const auto usage = static_cast<std::uint32_t>(texture.usage);
-                    if ((usage & (static_cast<std::uint32_t>(
-                            ir::TextureUsage::ColorAttachment)
-                        | static_cast<std::uint32_t>(
-                            ir::TextureUsage::DepthAttachment))) != 0)
-                    {
-                        description.Flags =
-                            D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES;
-                        break;
-                    }
-                }
+                ThrowIfFailed(device_->CreateHeap(
+                    &description, IID_PPV_ARGS(&heap)), "Create alias heap");
             }
-
-            ComPtr<ID3D12Heap> heap;
-            ThrowIfFailed(device_->CreateHeap(
-                &description, IID_PPV_ARGS(&heap)), "Create alias heap");
-            allocationHeaps_.emplace(allocation, std::move(heap));
+            allocationHeaps_.emplace(allocation, std::move(heaps));
+            activeAliasedResources_[allocation].resize(FrameCount);
         }
 
         for (const auto& resource : module.resources)
         {
-            if (resource.Kind() == gpu::ResourceKind::Presentation)
+            if (resource.lifetime == gpu::ResourceLifetimeClass::External)
             {
-                presentationResource_ = resource.id;
-                continue;
-            }
-
-            if (resource.Kind() == gpu::ResourceKind::Texture2D
-                && resource.Format() == gpu::ResourceFormat::Depth32Float)
-            {
-                depthResource_ = resource.id;
-                continue;
-            }
-
-            if (resource.Kind() == gpu::ResourceKind::Texture1D
-                || resource.Kind() == gpu::ResourceKind::Texture2D
-                || resource.Kind() == gpu::ResourceKind::Texture3D)
-            {
-                ID3D12Heap* heap = nullptr;
-                const auto allocation = physicalAllocations_.find(resource.id);
-                if (allocation != physicalAllocations_.end())
+                if (resource.Kind() == gpu::ResourceKind::Presentation)
                 {
-                    heap = allocationHeaps_.at(allocation->second).Get();
+                    presentationResource_ = resource.id;
                 }
-                staticResources_.emplace(
-                    resource.id, CreateTexture(resource, heap));
                 continue;
             }
 
-            if (resource.Kind() == gpu::ResourceKind::Buffer
-                && resource.memoryClass != gpu::MemoryClass::DynamicPerFrame
-                && resource.memoryClass != gpu::MemoryClass::External)
+            if (resource.update == gpu::ResourceUpdateClass::CpuUpdated)
             {
-                staticResources_.emplace(
-                    resource.id,
-                    CreateStaticBuffer(resource));
+                continue;
+            }
+
+            const auto instancePlan = resourceInstancePlans_.find(resource.id);
+            if (instancePlan == resourceInstancePlans_.end())
+            {
+                throw std::runtime_error(
+                    "Resource has no compiled instance plan.");
+            }
+            auto& instances = resources_[resource.id];
+            instances.reserve(instancePlan->second.physicalInstanceCount);
+
+            for (std::uint32_t instance = 0;
+                 instance < instancePlan->second.physicalInstanceCount;
+                 ++instance)
+            {
+                if (resource.Kind() == gpu::ResourceKind::Texture1D
+                    || resource.Kind() == gpu::ResourceKind::Texture2D
+                    || resource.Kind() == gpu::ResourceKind::Texture3D)
+                {
+                    ID3D12Heap* heap = nullptr;
+                    const auto allocation = physicalAllocations_.find(resource.id);
+                    if (allocation != physicalAllocations_.end())
+                    {
+                        heap = allocationHeaps_.at(allocation->second)
+                            .at(instance % FrameCount).Get();
+                    }
+                    instances.push_back(CreateTexture(resource, heap));
+                }
+                else if (resource.Kind() == gpu::ResourceKind::Buffer)
+                {
+                    ID3D12Heap* heap = nullptr;
+                    const auto allocation = physicalAllocations_.find(resource.id);
+                    if (allocation != physicalAllocations_.end())
+                    {
+                        heap = allocationHeaps_.at(allocation->second)
+                            .at(instance % FrameCount).Get();
+                    }
+                    instances.push_back(CreateStaticBuffer(resource, heap));
+                }
             }
         }
 
@@ -175,6 +216,13 @@ namespace sge::d3d12::detail
             clear.Color[3] = 1.0f;
             clearPointer = &clear;
         }
+        else if ((usage & static_cast<std::uint32_t>(
+            ir::TextureUsage::DepthAttachment)) != 0)
+        {
+            clear.Format = description.Format;
+            clear.DepthStencil.Depth = 1.0f;
+            clearPointer = &clear;
+        }
 
         ResourceRecord record;
         const HRESULT createResult = aliasHeap != nullptr
@@ -203,6 +251,20 @@ namespace sge::d3d12::detail
             device_->CreateRenderTargetView(
                 record.resource.Get(), nullptr, record.rtv);
             record.hasRtv = true;
+        }
+
+        if ((usage & static_cast<std::uint32_t>(
+            ir::TextureUsage::DepthAttachment)) != 0)
+        {
+            record.dsv = dsvHeap_->GetCPUDescriptorHandleForHeapStart();
+            record.dsv.ptr += static_cast<SIZE_T>(nextDsvDescriptor_++)
+                * dsvIncrement_;
+            D3D12_DEPTH_STENCIL_VIEW_DESC view{};
+            view.Format = description.Format;
+            view.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+            device_->CreateDepthStencilView(
+                record.resource.Get(), &view, record.dsv);
+            record.hasDsv = true;
         }
 
         const auto allocateShaderDescriptor = [&]()
@@ -272,7 +334,8 @@ namespace sge::d3d12::detail
     }
 
     ResourceRecord Backend::CreateStaticBuffer(
-        const ir::ResourceDeclaration& declaration)
+        const ir::ResourceDeclaration& declaration,
+        ID3D12Heap* aliasHeap)
     {
         ResourceRecord record;
 
@@ -290,17 +353,25 @@ namespace sge::d3d12::detail
             description.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         }
 
-        ThrowIfFailed(
-            device_->CreateCommittedResource(
+        const auto initialState = declaration.data.empty()
+            ? D3D12_RESOURCE_STATE_COMMON
+            : D3D12_RESOURCE_STATE_COPY_DEST;
+        const HRESULT createResult = aliasHeap != nullptr
+            ? device_->CreatePlacedResource(
+                aliasHeap,
+                0,
+                &description,
+                initialState,
+                nullptr,
+                IID_PPV_ARGS(&record.resource))
+            : device_->CreateCommittedResource(
                 &defaultProperties,
                 D3D12_HEAP_FLAG_NONE,
                 &description,
-                declaration.data.empty()
-                    ? D3D12_RESOURCE_STATE_COMMON
-                    : D3D12_RESOURCE_STATE_COPY_DEST,
+                initialState,
                 nullptr,
-                IID_PPV_ARGS(&record.resource)),
-            "Create static default buffer");
+                IID_PPV_ARGS(&record.resource));
+        ThrowIfFailed(createResult, "Create buffer resource");
 
         if (!declaration.data.empty())
         {
@@ -743,8 +814,9 @@ namespace sge::d3d12::detail
                 continue;
             }
 
-            const auto resource = staticResources_.find(binding.resource);
-            if (resource == staticResources_.end())
+            const auto* resource = ResolveResource(
+                binding.resource, binding.frameLag);
+            if (resource == nullptr)
             {
                 throw std::runtime_error(
                     "Program binding references an unmaterialized resource.");
@@ -753,21 +825,21 @@ namespace sge::d3d12::detail
             D3D12_GPU_DESCRIPTOR_HANDLE descriptor{};
             if (parameter.kind == gpu::ProgramParameterKind::ShaderResource)
             {
-                if (!resource->second.hasSrv)
+                if (!resource->hasSrv)
                 {
                     throw std::runtime_error(
                         "Shader-resource binding has no SRV descriptor.");
                 }
-                descriptor = resource->second.srvDescriptor;
+                descriptor = resource->srvDescriptor;
             }
             else
             {
-                if (!resource->second.hasUav)
+                if (!resource->hasUav)
                 {
                     throw std::runtime_error(
                         "Unordered-access binding has no UAV descriptor.");
                 }
-                descriptor = resource->second.uavDescriptor;
+                descriptor = resource->uavDescriptor;
             }
 
             if (compute)
@@ -809,8 +881,8 @@ namespace sge::d3d12::detail
                 "Raster work has no compiled program.");
         }
 
-        const auto geometry = staticResources_.find(raster.vertexResource);
-        if (geometry == staticResources_.end())
+        const auto* geometry = ResolveResource(raster.vertexResource);
+        if (geometry == nullptr)
         {
             throw std::runtime_error(
                 "Raster work has no static vertex resource.");
@@ -829,17 +901,27 @@ namespace sge::d3d12::detail
         }
         else
         {
-            const auto target = staticResources_.find(color);
-            if (target == staticResources_.end() || !target->second.hasRtv)
+            const auto* target = ResolveResource(color);
+            if (target == nullptr || !target->hasRtv)
             {
                 throw std::runtime_error(
                     "Raster color attachment has no RTV.");
             }
-            rtv = target->second.rtv;
+            rtv = target->rtv;
         }
 
-        auto dsv = dsvHeap_->GetCPUDescriptorHandleForHeapStart();
         const bool hasDepth = raster.attachments.depth.IsValid();
+        D3D12_CPU_DESCRIPTOR_HANDLE dsv{};
+        if (hasDepth)
+        {
+            const auto* depth = ResolveResource(raster.attachments.depth);
+            if (depth == nullptr || !depth->hasDsv)
+            {
+                throw std::runtime_error(
+                    "Raster depth attachment has no DSV.");
+            }
+            dsv = depth->dsv;
+        }
         commandList_->OMSetRenderTargets(
             1, &rtv, FALSE, hasDepth ? &dsv : nullptr);
 
@@ -866,7 +948,7 @@ namespace sge::d3d12::detail
         commandList_->IASetPrimitiveTopology(
             NativeTopology(raster.rasterState.topology));
         commandList_->IASetVertexBuffers(
-            0, 1, &geometry->second.vertexView);
+            0, 1, &geometry->vertexView);
         commandList_->DrawInstanced(
             raster.vertexCount,
             1,
@@ -905,7 +987,10 @@ namespace sge::d3d12::detail
         {
             if (access.access != gpu::AccessMode::Read)
             {
-                Transition(access.resource, gpu::AbstractState::Undefined);
+                Transition(
+                    access.resource,
+                    gpu::AbstractState::Undefined,
+                    access.frameLag);
             }
         }
     }
@@ -915,10 +1000,10 @@ namespace sge::d3d12::detail
         const ir::WorkDeclaration& work)
     {
         const auto& copy = std::get<ir::CopyWork>(work.payload);
-        const auto source = staticResources_.find(copy.source);
-        const auto destination = staticResources_.find(copy.destination);
-        if (source == staticResources_.end()
-            || destination == staticResources_.end())
+        auto* source = ResolveResource(copy.source, copy.sourceFrameLag);
+        auto* destination = ResolveResource(
+            copy.destination, copy.destinationFrameLag);
+        if (source == nullptr || destination == nullptr)
         {
             throw std::runtime_error(
                 "Copy work references an unmaterialized resource.");
@@ -927,26 +1012,30 @@ namespace sge::d3d12::detail
         if (copy.sizeBytes == 0)
         {
             commandList_->CopyResource(
-                destination->second.resource.Get(),
-                source->second.resource.Get());
+                destination->resource.Get(),
+                source->resource.Get());
         }
         else
         {
             commandList_->CopyBufferRegion(
-                destination->second.resource.Get(), copy.destinationOffset,
-                source->second.resource.Get(), copy.sourceOffset,
+                destination->resource.Get(), copy.destinationOffset,
+                source->resource.Get(), copy.sourceOffset,
                 copy.sizeBytes);
         }
 
-        Transition(copy.source, gpu::AbstractState::Undefined);
-        Transition(copy.destination, gpu::AbstractState::Undefined);
+        // COPY queue resources remain in COPY_SOURCE/COPY_DEST. A later
+        // consumer performs the legal transition after the queue fence wait.
     }
 
     void Backend::Transition(
         gpu::ResourceId resource,
-        gpu::AbstractState abstractState)
+        gpu::AbstractState abstractState,
+        std::uint32_t frameLag)
     {
-        const auto target = NativeState(abstractState);
+        const auto target = abstractState == gpu::AbstractState::ProgramRead
+            && activeQueue_ == gpu::QueueClass::Compute
+            ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+            : NativeState(abstractState);
 
         ID3D12Resource* nativeResource = nullptr;
         D3D12_RESOURCE_STATES* currentState = nullptr;
@@ -956,18 +1045,13 @@ namespace sge::d3d12::detail
             nativeResource = backBuffers_[frameIndex_].Get();
             currentState = &backBufferStates_[frameIndex_];
         }
-        else if (depthResource_ && resource == *depthResource_)
-        {
-            nativeResource = depthBuffer_.Get();
-            currentState = &depthState_;
-        }
         else
         {
-            const auto found = staticResources_.find(resource);
-            if (found != staticResources_.end())
+            auto* found = ResolveResource(resource, frameLag);
+            if (found != nullptr)
             {
-                nativeResource = found->second.resource.Get();
-                currentState = &found->second.state;
+                nativeResource = found->resource.Get();
+                currentState = &found->state;
             }
             else
             {
@@ -993,7 +1077,61 @@ namespace sge::d3d12::detail
         *currentState = target;
     }
 
-    void Backend::ActivateAliasedResource(gpu::ResourceId resource)
+    std::size_t Backend::ResolveInstanceIndex(
+        gpu::ResourceId resource,
+        std::uint32_t frameLag) const
+    {
+        const auto plan = resourceInstancePlans_.find(resource);
+        if (plan == resourceInstancePlans_.end())
+        {
+            return 0;
+        }
+        const auto count = std::max<std::uint32_t>(
+            1, plan->second.physicalInstanceCount);
+        switch (plan->second.lifetime)
+        {
+        case gpu::ResourceLifetimeClass::Persistent:
+            return 0;
+        case gpu::ResourceLifetimeClass::FrameLocal:
+            return activeFrameSlot_ % count;
+        case gpu::ResourceLifetimeClass::Temporal:
+            return static_cast<std::size_t>(
+                (frameNumber_ + count - (frameLag % count)) % count);
+        case gpu::ResourceLifetimeClass::External:
+            return frameIndex_;
+        }
+        return 0;
+    }
+
+    ResourceRecord* Backend::ResolveResource(
+        gpu::ResourceId resource,
+        std::uint32_t frameLag)
+    {
+        const auto found = resources_.find(resource);
+        if (found == resources_.end() || found->second.empty())
+        {
+            return nullptr;
+        }
+        return &found->second.at(
+            ResolveInstanceIndex(resource, frameLag));
+    }
+
+    const ResourceRecord* Backend::ResolveResource(
+        gpu::ResourceId resource,
+        std::uint32_t frameLag) const
+    {
+        const auto found = resources_.find(resource);
+        if (found == resources_.end() || found->second.empty())
+        {
+            return nullptr;
+        }
+        return &found->second.at(
+            ResolveInstanceIndex(resource, frameLag));
+    }
+
+    void Backend::ActivateAliasedResource(
+        gpu::ResourceId resource,
+        std::uint32_t frameLag)
     {
         const auto allocation = physicalAllocations_.find(resource);
         if (allocation == physicalAllocations_.end())
@@ -1001,24 +1139,28 @@ namespace sge::d3d12::detail
             return;
         }
 
-        const auto previous = activeAliasedResources_.find(allocation->second);
-        if (previous != activeAliasedResources_.end()
-            && previous->second != resource)
+        auto& active = activeAliasedResources_[allocation->second];
+        const auto instance = ResolveInstanceIndex(resource, frameLag);
+        if (active.size() <= instance)
         {
-            const auto before = staticResources_.find(previous->second);
-            const auto after = staticResources_.find(resource);
-            if (before != staticResources_.end()
-                && after != staticResources_.end())
+            active.resize(instance + 1);
+        }
+        const auto previous = active[instance];
+        if (previous && *previous != resource)
+        {
+            const auto* before = ResolveResource(*previous, frameLag);
+            const auto* after = ResolveResource(resource, frameLag);
+            if (before != nullptr && after != nullptr)
             {
                 D3D12_RESOURCE_BARRIER barrier{};
                 barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_ALIASING;
                 barrier.Aliasing.pResourceBefore =
-                    before->second.resource.Get();
+                    before->resource.Get();
                 barrier.Aliasing.pResourceAfter =
-                    after->second.resource.Get();
+                    after->resource.Get();
                 commandList_->ResourceBarrier(1, &barrier);
             }
         }
-        activeAliasedResources_[allocation->second] = resource;
+        active[instance] = resource;
     }
 }

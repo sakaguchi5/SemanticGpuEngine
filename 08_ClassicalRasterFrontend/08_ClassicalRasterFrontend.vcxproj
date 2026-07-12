@@ -79,14 +79,22 @@
   <ItemGroup>
     <ClCompile Include="ClassicalMath.cpp" />
     <ClCompile Include="ClassicalRaster.cpp" />
+    <ClCompile Include="ClassicalLowering.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="ClassicalMath.h" />
     <ClInclude Include="ClassicalRaster.h" />
+    <ClInclude Include="ClassicalLowering.h" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\00_Foundation\00_Foundation.vcxproj">
       <Project>{27D93733-D8FB-414F-9FD8-8D73E3CA19F2}</Project>
+    </ProjectReference>
+    <ProjectReference Include="..\02_GpuSemantics\02_GpuSemantics.vcxproj">
+      <Project>{160D73F5-5187-4EA6-835B-3DB9C88856E4}</Project>
+    </ProjectReference>
+    <ProjectReference Include="..\03_RenderIR\03_RenderIR.vcxproj">
+      <Project>{0EF02B28-A855-4676-80BF-0B2C6E7468C3}</Project>
     </ProjectReference>
   </ItemGroup>
   <ItemGroup>
