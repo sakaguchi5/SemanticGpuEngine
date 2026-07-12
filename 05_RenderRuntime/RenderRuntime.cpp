@@ -22,9 +22,12 @@ namespace sge::runtime
 
     RenderRuntime::~RenderRuntime()
     {
-        if (backend_)
+        try
         {
-            backend_->WaitIdle();
+            WaitIdle();
+        }
+        catch (...)
+        {
         }
     }
 
@@ -64,6 +67,14 @@ namespace sge::runtime
         }
 
         backend_->Execute(module, *cachedPlan_);
+    }
+
+    void RenderRuntime::WaitIdle()
+    {
+        if (backend_)
+        {
+            backend_->WaitIdle();
+        }
     }
 
     const std::vector<std::string>& RenderRuntime::LastDiagnostics()

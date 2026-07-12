@@ -325,6 +325,13 @@ namespace sge::compiler
                 throw std::runtime_error(
                     "Semantic validation failed: external resource must be imported.");
             }
+
+            if (resource.lifetime == gpu::ResourceLifetimeClass::Persistent
+                && resource.update != gpu::ResourceUpdateClass::Immutable)
+            {
+                throw std::runtime_error(
+                    "Semantic validation failed: persistent resources must be immutable.");
+            }
         }
 
         for (const auto& program : module.programs)
@@ -423,6 +430,13 @@ namespace sge::compiler
                         "Semantic validation failed: work references an unknown resource.");
                 }
                 const auto& resource = module.Resource(access.resource);
+                if (resource.lifetime
+                        == gpu::ResourceLifetimeClass::Persistent
+                    && access.access != gpu::AccessMode::Read)
+                {
+                    throw std::runtime_error(
+                        "Semantic validation failed: persistent resources are read-only.");
+                }
                 if (access.frameLag > 0
                     && resource.lifetime
                         != gpu::ResourceLifetimeClass::Temporal)
@@ -435,6 +449,12 @@ namespace sge::compiler
                 {
                     throw std::runtime_error(
                         "Semantic validation failed: past temporal instances are read-only.");
+                }
+                if (access.frameLag
+                    == std::numeric_limits<std::uint32_t>::max())
+                {
+                    throw std::runtime_error(
+                        "Semantic validation failed: temporal frame lag is too large.");
                 }
             }
 
@@ -937,9 +957,25 @@ namespace sge::compiler
                 plan.physicalInstanceCount = frameCount;
                 break;
             case gpu::ResourceLifetimeClass::Temporal:
+            {
+                std::uint32_t maximumFrameLag = 0;
+                for (const auto& work : module.works)
+                {
+                    for (const auto& access : work.accesses)
+                    {
+                        if (access.resource == resource.id)
+                        {
+                            maximumFrameLag = std::max(
+                                maximumFrameLag, access.frameLag);
+                        }
+                    }
+                }
                 plan.selector = gpu::InstanceSelectorKind::CurrentTemporalSlot;
-                plan.physicalInstanceCount = std::max(2u, frameCount);
+                plan.maximumFrameLag = maximumFrameLag;
+                plan.physicalInstanceCount = std::max({
+                    2u, frameCount, maximumFrameLag + 1u});
                 break;
+            }
             case gpu::ResourceLifetimeClass::External:
                 plan.selector = gpu::InstanceSelectorKind::ExternalFrameIndex;
                 plan.physicalInstanceCount = 0;

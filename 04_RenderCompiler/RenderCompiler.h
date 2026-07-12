@@ -57,6 +57,7 @@ namespace sge::compiler
         gpu::InstanceSelectorKind selector =
             gpu::InstanceSelectorKind::Persistent;
         std::uint32_t physicalInstanceCount = 1;
+        std::uint32_t maximumFrameLag = 0;
     };
 
     struct TemporalDependency

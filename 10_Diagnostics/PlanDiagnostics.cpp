@@ -71,6 +71,7 @@ namespace sge::diagnostics
                    << ": lifetime=" << static_cast<int>(instance.lifetime)
                    << ", selector=" << static_cast<int>(instance.selector)
                    << ", count=" << instance.physicalInstanceCount
+                   << ", max-frame-lag=" << instance.maximumFrameLag
                    << "\n";
         }
 

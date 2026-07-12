@@ -44,6 +44,7 @@ namespace sge::runtime
         ~RenderRuntime();
 
         void Execute(const ir::SemanticModule& module);
+        void WaitIdle();
 
         [[nodiscard]] const std::vector<std::string>& LastDiagnostics()
             const noexcept;

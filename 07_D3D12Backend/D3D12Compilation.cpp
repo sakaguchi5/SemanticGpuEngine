@@ -29,7 +29,7 @@ namespace sge::d3d12::detail
         physicalAllocations_.clear();
         allocationHeaps_.clear();
         activeAliasedResources_.clear();
-        temporalCompletions_.clear();
+        temporalInstanceUsages_.clear();
         programs_.clear();
         pipelines_.clear();
         presentationResource_.reset();
@@ -42,7 +42,7 @@ namespace sge::d3d12::detail
             resourceInstancePlans_.emplace(instance.resource, instance);
             if (instance.lifetime == gpu::ResourceLifetimeClass::Temporal)
             {
-                temporalCompletions_[instance.resource].assign(
+                temporalInstanceUsages_[instance.resource].assign(
                     instance.physicalInstanceCount, {});
             }
         }
@@ -1095,8 +1095,13 @@ namespace sge::d3d12::detail
         case gpu::ResourceLifetimeClass::FrameLocal:
             return activeFrameSlot_ % count;
         case gpu::ResourceLifetimeClass::Temporal:
+            if (frameLag >= count)
+            {
+                throw std::runtime_error(
+                    "Temporal frame lag exceeds its physical instance ring.");
+            }
             return static_cast<std::size_t>(
-                (frameNumber_ + count - (frameLag % count)) % count);
+                (frameNumber_ + count - frameLag) % count);
         case gpu::ResourceLifetimeClass::External:
             return frameIndex_;
         }

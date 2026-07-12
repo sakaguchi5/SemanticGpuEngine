@@ -11,10 +11,13 @@ using Microsoft::WRL::ComPtr;
 
 namespace sge::d3d12::detail
 {
-    Backend::Backend(platform::NativeSurface surface)
+    Backend::Backend(
+        platform::NativeSurface surface,
+        BackendConfiguration configuration)
         : window_(static_cast<HWND>(surface.handle)),
           width_(surface.width),
-          height_(surface.height)
+          height_(surface.height),
+          configuration_(configuration)
     {
         if (window_ == nullptr)
         {
@@ -103,6 +106,7 @@ namespace sge::d3d12::detail
             frameNumber_ % FrameCount);
         FrameContext& frame = frames_[activeFrameSlot_];
         BeginFrame(frame);
+        ValidateDebugLayer();
 
         const D3D12_VIEWPORT viewport{
             0.0f,
@@ -136,26 +140,9 @@ namespace sge::d3d12::detail
 
             auto* nativeQueue = QueueFor(scheduled.queue);
 
-            for (const auto& temporal : plan.temporalDependencies)
+            for (const auto& access : work.accesses)
             {
-                if (temporal.consumerScheduledWork != scheduledIndex)
-                {
-                    continue;
-                }
-                const auto completions = temporalCompletions_.find(
-                    temporal.resource);
-                if (completions == temporalCompletions_.end()
-                    || completions->second.empty())
-                {
-                    continue;
-                }
-                const auto count = completions->second.size();
-                const auto slot = static_cast<std::size_t>(
-                    (frameNumber_ + count - (temporal.readLag % count))
-                    % count);
-                const auto point = completions->second[slot];
-                WaitForQueueValue(
-                    scheduled.queue, point.queue, point.value);
+                WaitForTemporalAccess(access, scheduled.queue);
             }
 
             for (const auto& synchronization : plan.queueSynchronizations)
@@ -248,6 +235,28 @@ namespace sge::d3d12::detail
                 }
             }
 
+            // A temporal instance may be consumed by a different queue in a
+            // later frame. Release it on its last-use queue before recording
+            // that queue's completion point; the future user waits that point
+            // and acquires the instance from COMMON.
+            if (scheduled.queue != gpu::QueueClass::Copy)
+            {
+                for (const auto& access : work.accesses)
+                {
+                    const auto instancePlan = resourceInstancePlans_.find(
+                        access.resource);
+                    if (instancePlan != resourceInstancePlans_.end()
+                        && instancePlan->second.lifetime
+                            == gpu::ResourceLifetimeClass::Temporal)
+                    {
+                        Transition(
+                            access.resource,
+                            gpu::AbstractState::Undefined,
+                            access.frameLag);
+                    }
+                }
+            }
+
             for (const auto& boundary : plan.frameBoundaryTransitions)
             {
                 if (boundary.afterScheduledWork != scheduledIndex)
@@ -315,30 +324,10 @@ namespace sge::d3d12::detail
 
             for (const auto& access : work.accesses)
             {
-                if (access.frameLag != 0
-                    || access.access == gpu::AccessMode::Read)
-                {
-                    continue;
-                }
-                const auto planFound = resourceInstancePlans_.find(
-                    access.resource);
-                if (planFound == resourceInstancePlans_.end()
-                    || planFound->second.lifetime
-                        != gpu::ResourceLifetimeClass::Temporal)
-                {
-                    continue;
-                }
-                auto& completions = temporalCompletions_[access.resource];
-                if (completions.size()
-                    != planFound->second.physicalInstanceCount)
-                {
-                    completions.resize(
-                        planFound->second.physicalInstanceCount);
-                }
-                completions[ResolveInstanceIndex(access.resource)] = {
+                RecordTemporalAccess(
+                    access,
                     scheduled.queue,
-                    workSignals[scheduledIndex].value
-                };
+                    workSignals[scheduledIndex].value);
             }
         }
 
@@ -379,6 +368,7 @@ namespace sge::d3d12::detail
                 WaitForSingleObject(state.event, INFINITE);
             }
         }
+        ValidateDebugLayer();
     }
 
     ID3D12CommandQueue* Backend::QueueFor(
@@ -448,6 +438,72 @@ namespace sge::d3d12::detail
             "Cross-queue wait");
     }
 
+    void Backend::WaitForTemporalAccess(
+        const gpu::ResourceAccess& access,
+        gpu::QueueClass queue)
+    {
+        const auto plan = resourceInstancePlans_.find(access.resource);
+        if (plan == resourceInstancePlans_.end()
+            || plan->second.lifetime
+                != gpu::ResourceLifetimeClass::Temporal)
+        {
+            return;
+        }
+
+        auto usages = temporalInstanceUsages_.find(access.resource);
+        if (usages == temporalInstanceUsages_.end())
+        {
+            throw std::runtime_error(
+                "Temporal resource has no physical usage timeline.");
+        }
+        auto& usage = usages->second.at(
+            ResolveInstanceIndex(access.resource, access.frameLag));
+
+        WaitForQueueValue(
+            queue, usage.lastWriter.queue, usage.lastWriter.value);
+
+        // Temporal instances are normalized to COMMON after every use. Keep
+        // cross-queue readers ordered as well, so their acquire/release
+        // transitions cannot overlap on the same physical instance.
+        constexpr std::array queues{
+            gpu::QueueClass::Direct,
+            gpu::QueueClass::Compute,
+            gpu::QueueClass::Copy
+        };
+        for (const auto readerQueue : queues)
+        {
+            WaitForQueueValue(
+                queue,
+                readerQueue,
+                usage.lastReaders[QueueIndex(readerQueue)]);
+        }
+    }
+
+    void Backend::RecordTemporalAccess(
+        const gpu::ResourceAccess& access,
+        gpu::QueueClass queue,
+        UINT64 completionValue)
+    {
+        const auto plan = resourceInstancePlans_.find(access.resource);
+        if (plan == resourceInstancePlans_.end()
+            || plan->second.lifetime
+                != gpu::ResourceLifetimeClass::Temporal)
+        {
+            return;
+        }
+
+        auto& usage = temporalInstanceUsages_.at(access.resource).at(
+            ResolveInstanceIndex(access.resource, access.frameLag));
+        if (access.access == gpu::AccessMode::Read)
+        {
+            usage.lastReaders[QueueIndex(queue)] = completionValue;
+            return;
+        }
+
+        usage.lastWriter = {queue, completionValue};
+        usage.lastReaders.fill(0);
+    }
+
     void Backend::WaitForCpuQueueValue(
         gpu::QueueClass queue,
         UINT64 value)
@@ -483,13 +539,6 @@ namespace sge::d3d12::detail
                 "Reset frame command allocator");
         }
         frame.uploadOffset = 0;
-        for (auto& [allocation, active] : activeAliasedResources_)
-        {
-            if (frame.slot < active.size())
-            {
-                active[frame.slot].reset();
-            }
-        }
     }
 
     ID3D12GraphicsCommandList* Backend::AcquireCommandList(
@@ -525,6 +574,48 @@ namespace sge::d3d12::detail
 #endif
     }
 
+    void Backend::ValidateDebugLayer()
+    {
+#if defined(_DEBUG)
+        ComPtr<ID3D12InfoQueue> information;
+        if (FAILED(device_.As(&information)))
+        {
+            return;
+        }
+
+        std::string errors;
+        const auto count = information->GetNumStoredMessages();
+        for (UINT64 index = 0; index < count; ++index)
+        {
+            SIZE_T bytes = 0;
+            information->GetMessage(index, nullptr, &bytes);
+            std::vector<std::byte> storage(bytes);
+            auto* message = reinterpret_cast<D3D12_MESSAGE*>(storage.data());
+            if (FAILED(information->GetMessage(index, message, &bytes))
+                || (message->Severity != D3D12_MESSAGE_SEVERITY_ERROR
+                    && message->Severity
+                        != D3D12_MESSAGE_SEVERITY_CORRUPTION))
+            {
+                continue;
+            }
+            if (!errors.empty())
+            {
+                errors += "\n";
+            }
+            errors.append(
+                message->pDescription,
+                message->DescriptionByteLength);
+        }
+        information->ClearStoredMessages();
+
+        if (!errors.empty())
+        {
+            throw std::runtime_error(
+                "D3D12 debug layer reported an error:\n" + errors);
+        }
+#endif
+    }
+
     void Backend::CreateDeviceAndQueue()
     {
         UINT factoryFlags = 0;
@@ -547,34 +638,37 @@ namespace sge::d3d12::detail
 
         ThrowIfFailed(factoryResult, "CreateDXGIFactory2");
 
-        for (UINT index = 0; ; ++index)
+        if (!configuration_.forceWarp)
         {
-            ComPtr<IDXGIAdapter1> candidate;
-
-            if (factory_->EnumAdapterByGpuPreference(
-                index,
-                DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
-                IID_PPV_ARGS(&candidate)) == DXGI_ERROR_NOT_FOUND)
+            for (UINT index = 0; ; ++index)
             {
-                break;
-            }
+                ComPtr<IDXGIAdapter1> candidate;
 
-            DXGI_ADAPTER_DESC1 description{};
-            candidate->GetDesc1(&description);
+                if (factory_->EnumAdapterByGpuPreference(
+                    index,
+                    DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+                    IID_PPV_ARGS(&candidate)) == DXGI_ERROR_NOT_FOUND)
+                {
+                    break;
+                }
 
-            if ((description.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0)
-            {
-                continue;
-            }
+                DXGI_ADAPTER_DESC1 description{};
+                candidate->GetDesc1(&description);
 
-            if (SUCCEEDED(D3D12CreateDevice(
-                candidate.Get(),
-                D3D_FEATURE_LEVEL_12_0,
-                __uuidof(ID3D12Device),
-                nullptr)))
-            {
-                adapter_ = candidate;
-                break;
+                if ((description.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0)
+                {
+                    continue;
+                }
+
+                if (SUCCEEDED(D3D12CreateDevice(
+                    candidate.Get(),
+                    D3D_FEATURE_LEVEL_12_0,
+                    __uuidof(ID3D12Device),
+                    nullptr)))
+                {
+                    adapter_ = candidate;
+                    break;
+                }
             }
         }
 
@@ -840,8 +934,9 @@ namespace sge::d3d12::detail
 namespace sge::d3d12
 {
     std::unique_ptr<runtime::IRenderBackend> CreateBackend(
-        platform::NativeSurface surface)
+        platform::NativeSurface surface,
+        BackendConfiguration configuration)
     {
-        return std::make_unique<detail::Backend>(surface);
+        return std::make_unique<detail::Backend>(surface, configuration);
     }
 }

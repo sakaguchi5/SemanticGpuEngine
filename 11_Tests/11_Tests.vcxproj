@@ -53,7 +53,7 @@
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>d3d12.lib;dxgi.lib;dxguid.lib;d3dcompiler.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -73,18 +73,22 @@
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>d3d12.lib;dxgi.lib;dxguid.lib;d3dcompiler.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="CompilerTests.cpp" />
+    <ClCompile Include="D3D12IntegrationTests.cpp" />
   </ItemGroup>
   <ItemGroup>
-
+    <ClInclude Include="D3D12IntegrationTests.h" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\00_Foundation\00_Foundation.vcxproj">
       <Project>{27D93733-D8FB-414F-9FD8-8D73E3CA19F2}</Project>
+    </ProjectReference>
+    <ProjectReference Include="..\01_Platform\01_Platform.vcxproj">
+      <Project>{B6CBC834-95AB-407B-ADAD-71390173619B}</Project>
     </ProjectReference>
     <ProjectReference Include="..\02_GpuSemantics\02_GpuSemantics.vcxproj">
       <Project>{160D73F5-5187-4EA6-835B-3DB9C88856E4}</Project>
@@ -94,6 +98,15 @@
     </ProjectReference>
     <ProjectReference Include="..\04_RenderCompiler\04_RenderCompiler.vcxproj">
       <Project>{2697C7F4-8454-4510-9BCF-59604FE23F5E}</Project>
+    </ProjectReference>
+    <ProjectReference Include="..\05_RenderRuntime\05_RenderRuntime.vcxproj">
+      <Project>{F87EF94C-CE59-4F91-A72B-45071EABBD01}</Project>
+    </ProjectReference>
+    <ProjectReference Include="..\06_ShaderSystem\06_ShaderSystem.vcxproj">
+      <Project>{1E2D2AA6-6898-40A2-A0DD-5F4BFDA87133}</Project>
+    </ProjectReference>
+    <ProjectReference Include="..\07_D3D12Backend\07_D3D12Backend.vcxproj">
+      <Project>{A8DAB13F-30D2-431A-B704-55489A6CF238}</Project>
     </ProjectReference>
     <ProjectReference Include="..\08_ClassicalRasterFrontend\08_ClassicalRasterFrontend.vcxproj">
       <Project>{337679C1-DE3C-4AF0-A194-040A1AD824FA}</Project>
@@ -106,8 +119,22 @@
     </ProjectReference>
   </ItemGroup>
   <ItemGroup>
-
+    <None Include="..\Shaders\GenerateBuffer.hlsl" />
+    <None Include="..\Shaders\IntegrationTemporalRead.hlsl" />
+    <None Include="..\Shaders\IntegrationTemporalWrite.hlsl" />
   </ItemGroup>
+  <Target Name="CopyIntegrationShaderFiles" AfterTargets="Build">
+    <MakeDir Directories="$(OutDir)Shaders" />
+    <Copy SourceFiles="$(SolutionDir)Shaders\GenerateBuffer.hlsl"
+          DestinationFiles="$(OutDir)Shaders\GenerateBuffer.hlsl"
+          SkipUnchangedFiles="true" />
+    <Copy SourceFiles="$(SolutionDir)Shaders\IntegrationTemporalRead.hlsl"
+          DestinationFiles="$(OutDir)Shaders\IntegrationTemporalRead.hlsl"
+          SkipUnchangedFiles="true" />
+    <Copy SourceFiles="$(SolutionDir)Shaders\IntegrationTemporalWrite.hlsl"
+          DestinationFiles="$(OutDir)Shaders\IntegrationTemporalWrite.hlsl"
+          SkipUnchangedFiles="true" />
+  </Target>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets" />
 </Project>

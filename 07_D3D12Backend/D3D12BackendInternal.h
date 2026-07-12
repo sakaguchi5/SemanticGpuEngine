@@ -3,6 +3,7 @@
 #include "01_Platform/Platform.h"
 #include "05_RenderRuntime/RenderRuntime.h"
 #include "06_ShaderSystem/ShaderCompiler.h"
+#include "07_D3D12Backend/D3D12Backend.h"
 #include "07_D3D12Backend/D3D12Helpers.h"
 
 #include <d3d12.h>
@@ -70,6 +71,12 @@ namespace sge::d3d12::detail
         UINT64 value = 0;
     };
 
+    struct PhysicalInstanceUsage
+    {
+        QueueTimelinePoint lastWriter;
+        std::array<UINT64, QueueClassCount> lastReaders{};
+    };
+
     struct QueueSyncState
     {
         Microsoft::WRL::ComPtr<ID3D12Fence> fence;
@@ -80,7 +87,9 @@ namespace sge::d3d12::detail
     class Backend final : public runtime::IRenderBackend
     {
     public:
-        explicit Backend(platform::NativeSurface surface);
+        Backend(
+            platform::NativeSurface surface,
+            BackendConfiguration configuration);
         ~Backend() override;
 
         [[nodiscard]] gpu::DeviceCapabilities Capabilities() const override;
@@ -93,6 +102,7 @@ namespace sge::d3d12::detail
 
     private:
         void EnableDebugLayer();
+        void ValidateDebugLayer();
         void CreateDeviceAndQueue();
         void CreateSwapChain();
         void CreateDescriptorHeaps();
@@ -115,6 +125,13 @@ namespace sge::d3d12::detail
             gpu::QueueClass waitingQueue,
             gpu::QueueClass sourceQueue,
             UINT64 value);
+        void WaitForTemporalAccess(
+            const gpu::ResourceAccess& access,
+            gpu::QueueClass queue);
+        void RecordTemporalAccess(
+            const gpu::ResourceAccess& access,
+            gpu::QueueClass queue,
+            UINT64 completionValue);
         void BeginFrame(FrameContext& frame);
         [[nodiscard]] ID3D12GraphicsCommandList* AcquireCommandList(
             FrameContext& frame, gpu::QueueClass queue);
@@ -221,6 +238,7 @@ namespace sge::d3d12::detail
         std::uint64_t frameNumber_ = 0;
         std::uint32_t activeFrameSlot_ = 0;
         gpu::QueueClass activeQueue_ = gpu::QueueClass::Direct;
+        BackendConfiguration configuration_;
 
         std::array<QueueSyncState, QueueClassCount> queueSyncStates_;
         shader::ShaderCompiler shaderCompiler_;
@@ -252,8 +270,8 @@ namespace sge::d3d12::detail
 
         std::unordered_map<
             gpu::ResourceId,
-            std::vector<QueueTimelinePoint>,
-            foundation::StrongIdHash<gpu::ResourceTag>> temporalCompletions_;
+            std::vector<PhysicalInstanceUsage>,
+            foundation::StrongIdHash<gpu::ResourceTag>> temporalInstanceUsages_;
 
         std::unordered_map<
             gpu::ProgramId,

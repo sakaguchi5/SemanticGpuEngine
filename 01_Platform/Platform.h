@@ -5,6 +5,12 @@
 #include <string>
 #include <windows.h>
 
+// WinGDI defines DeviceCapabilities as an A/W macro. The engine uses the
+// same descriptive name for its API-independent target model.
+#ifdef DeviceCapabilities
+#undef DeviceCapabilities
+#endif
+
 namespace sge::platform
 {
     struct NativeSurface

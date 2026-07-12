@@ -83,7 +83,7 @@ Escキーで終了します。
 - `10_Diagnostics`
   - ExecutionPlanと依存グラフの出力
 - `11_Tests`
-  - GPUを必要としないCompiler・Frontendテスト
+  - Compiler・Frontendテストと、12フレームのD3D12/WARP統合テスト
 - `12_CubeLab`
   - 複数の幾何表現を比較する受け入れ実験
 - `13_Launcher`
@@ -141,6 +141,9 @@ Runtime、D3D12 Backendへ至る垂直経路が実装されています。通常
 - FrameLocal Resourceの3重化
 - frame slot内のPlaced Resource Aliasing
 - 明示的なTemporal Resourceとframe-lag read
+- Temporal physical instance単位のwriter／reader完了追跡
+- 最大frame lagから導出するTemporal ring容量
+- frame slot循環境界を含むAliasing Barrier
 - SDF Pixel Shader Ray Marching Frontend
 - Classical / SDF Loweringの明示切り替え
 

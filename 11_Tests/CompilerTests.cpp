@@ -4,6 +4,7 @@
 #include "09_ExperimentalGeometry/ExperimentalGeometry.h"
 #include "09_ExperimentalGeometry/SdfLowering.h"
 #include "12_CubeLab/CubeExperiment.h"
+#include "11_Tests/D3D12IntegrationTests.h"
 
 #include <algorithm>
 #include <cassert>
@@ -591,9 +592,151 @@ namespace
         assert(result.plan.temporalDependencies[0].readLag == 1);
         assert(result.plan.resourceInstances.size() == 1);
         assert(result.plan.resourceInstances[0].physicalInstanceCount == 3);
+        assert(result.plan.resourceInstances[0].maximumFrameLag == 1);
         assert(result.plan.resourceInstances[0].selector
             == gpu::InstanceSelectorKind::CurrentTemporalSlot);
         assert(result.plan.scheduledWorks[0].requiredStates.size() == 2);
+    }
+
+    void TestTemporalLagDeterminesRingCapacity()
+    {
+        using namespace sge;
+        constexpr gpu::ResourceId history{0};
+
+        ir::SemanticModule module;
+        module.resources.push_back({
+            .id = history,
+            .name = "LongTemporalHistory",
+            .lifetime = gpu::ResourceLifetimeClass::Temporal,
+            .update = gpu::ResourceUpdateClass::GpuProduced,
+            .description = ir::BufferDescription{
+                .sizeBytes = 16,
+                .usage = ir::BufferUsage::Storage}
+        });
+        module.programs.push_back({
+            .id = gpu::ProgramId{0},
+            .name = "LongTemporalCompute",
+            .computeEntry = "CSMain",
+            .parameters = {
+                {.name = "Previous1",
+                    .kind = gpu::ProgramParameterKind::ShaderResource,
+                    .stage = gpu::ProgramStage::Compute,
+                    .registerIndex = 0},
+                {.name = "Previous2",
+                    .kind = gpu::ProgramParameterKind::ShaderResource,
+                    .stage = gpu::ProgramStage::Compute,
+                    .registerIndex = 1},
+                {.name = "Previous3",
+                    .kind = gpu::ProgramParameterKind::ShaderResource,
+                    .stage = gpu::ProgramStage::Compute,
+                    .registerIndex = 2},
+                {.name = "Previous4",
+                    .kind = gpu::ProgramParameterKind::ShaderResource,
+                    .stage = gpu::ProgramStage::Compute,
+                    .registerIndex = 3},
+                {.name = "Current",
+                    .kind = gpu::ProgramParameterKind::UnorderedAccess,
+                    .stage = gpu::ProgramStage::Compute,
+                    .registerIndex = 0}
+            }
+        });
+        module.works.push_back({
+            .id = gpu::WorkId{0},
+            .name = "ReadFourPreviousFrames",
+            .accesses = {
+                {history, gpu::AccessMode::Read,
+                    gpu::ResourceRole::ProgramInput, 1},
+                {history, gpu::AccessMode::Read,
+                    gpu::ResourceRole::ProgramInput, 2},
+                {history, gpu::AccessMode::Read,
+                    gpu::ResourceRole::ProgramInput, 3},
+                {history, gpu::AccessMode::Read,
+                    gpu::ResourceRole::ProgramInput, 4},
+                {history, gpu::AccessMode::Write,
+                    gpu::ResourceRole::ProgramOutput, 0}},
+            .payload = ir::ComputeWork{
+                .program = gpu::ProgramId{0},
+                .bindings = {
+                    {0, history, 1}, {1, history, 2},
+                    {2, history, 3}, {3, history, 4},
+                    {4, history, 0}}}
+        });
+
+        gpu::DeviceCapabilities capabilities;
+        capabilities.computeExecution = true;
+        capabilities.concurrentCompute = true;
+        capabilities.maxFramesInFlight = 3;
+        const auto result = compiler::RenderCompiler{}.Compile(
+            module, capabilities);
+
+        assert(result.plan.resourceInstances.size() == 1);
+        assert(result.plan.resourceInstances[0].maximumFrameLag == 4);
+        assert(result.plan.resourceInstances[0].physicalInstanceCount == 5);
+        assert(result.plan.temporalDependencies.size() == 4);
+    }
+
+    void TestPersistentResourcesAreImmutableAndReadOnly()
+    {
+        using namespace sge;
+        constexpr gpu::ResourceId persistent{0};
+
+        const auto expectFailure = [](const ir::SemanticModule& module)
+        {
+            gpu::DeviceCapabilities capabilities;
+            capabilities.computeExecution = true;
+            bool failed = false;
+            try
+            {
+                (void)compiler::RenderCompiler{}.Compile(module, capabilities);
+            }
+            catch (const std::runtime_error&)
+            {
+                failed = true;
+            }
+            assert(failed);
+        };
+
+        ir::SemanticModule produced;
+        produced.resources.push_back({
+            .id = persistent,
+            .name = "InvalidProducedPersistent",
+            .lifetime = gpu::ResourceLifetimeClass::Persistent,
+            .update = gpu::ResourceUpdateClass::GpuProduced,
+            .description = ir::BufferDescription{
+                .sizeBytes = 16,
+                .usage = ir::BufferUsage::Storage}
+        });
+        expectFailure(produced);
+
+        ir::SemanticModule written;
+        written.resources.push_back({
+            .id = persistent,
+            .name = "InvalidWrittenPersistent",
+            .lifetime = gpu::ResourceLifetimeClass::Persistent,
+            .update = gpu::ResourceUpdateClass::Immutable,
+            .description = ir::BufferDescription{
+                .sizeBytes = 16,
+                .usage = ir::BufferUsage::Storage},
+            .data = std::vector<std::byte>(16)
+        });
+        written.programs.push_back({
+            .id = gpu::ProgramId{0},
+            .name = "WritePersistent",
+            .computeEntry = "CSMain",
+            .parameters = {{.name = "Output",
+                .kind = gpu::ProgramParameterKind::UnorderedAccess,
+                .stage = gpu::ProgramStage::Compute}}
+        });
+        written.works.push_back({
+            .id = gpu::WorkId{0},
+            .name = "WritePersistent",
+            .accesses = {{persistent, gpu::AccessMode::Write,
+                gpu::ResourceRole::ProgramOutput}},
+            .payload = ir::ComputeWork{
+                .program = gpu::ProgramId{0},
+                .bindings = {{0, persistent}}}
+        });
+        expectFailure(written);
     }
 
     void TestCubePlan()
@@ -675,10 +818,14 @@ int main()
         TestAliasingChecksWholeAllocationSlot();
         TestCrossQueueUnorderedResourcesDoNotAlias();
         TestTemporalResourcePlan();
+        TestTemporalLagDeterminesRingCapacity();
+        TestPersistentResourcesAreImmutableAndReadOnly();
         TestPgaAndSdfModels();
         TestCubePlan();
         TestSdfFrontendPlan();
-        std::cout << "All compiler and frontend tests passed.\n";
+        RunD3D12IntegrationTests();
+        std::cout
+            << "All compiler, frontend, and D3D12 WARP tests passed.\n";
         return 0;
     }
     catch (const std::exception& error)
