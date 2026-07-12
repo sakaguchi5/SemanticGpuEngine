@@ -2,6 +2,7 @@
 #include "07_D3D12Backend/D3D12BackendInternal.h"
 
 #include <algorithm>
+#include <array>
 #include <stdexcept>
 #include <utility>
 
@@ -49,10 +50,13 @@ namespace sge::d3d12::detail
             }
         }
 
-        if (fenceEvent_ != nullptr)
+        for (auto& state : queueSyncStates_)
         {
-            CloseHandle(fenceEvent_);
-            fenceEvent_ = nullptr;
+            if (state.event != nullptr)
+            {
+                CloseHandle(state.event);
+                state.event = nullptr;
+            }
         }
     }
 
@@ -96,9 +100,9 @@ namespace sge::d3d12::detail
 
         EnsureCompiled(module, plan);
 
-        // Per-work command lists make queue crossings explicit. The reference
-        // backend waits for the preceding frame before recycling them; this is
-        // intentionally conservative and keeps queue synchronization correct.
+        // This reference backend deliberately recycles per-work command objects
+        // only after the previous frame is complete. Queue-to-queue dependencies
+        // within the frame remain asynchronous and are expressed by queue fences.
         WaitIdle();
         inFlightAllocators_.clear();
         inFlightLists_.clear();
@@ -122,14 +126,19 @@ namespace sge::d3d12::detail
             static_cast<LONG>(height_)
         };
 
-        std::vector<UINT64> workSignals(plan.scheduledWorks.size(), 0);
+        struct WorkSignal
+        {
+            gpu::QueueClass queue = gpu::QueueClass::Direct;
+            UINT64 value = 0;
+        };
+
+        std::vector<WorkSignal> workSignals(plan.scheduledWorks.size());
         for (std::size_t scheduledIndex = 0;
              scheduledIndex < plan.scheduledWorks.size();
              ++scheduledIndex)
         {
             const auto& scheduled = plan.scheduledWorks[scheduledIndex];
-            const auto& work = module.works.at(
-                scheduled.sourceWorkIndex);
+            const auto& work = module.works.at(scheduled.sourceWorkIndex);
 
             auto* nativeQueue = QueueFor(scheduled.queue);
             const auto listType = CommandListType(scheduled.queue);
@@ -138,10 +147,18 @@ namespace sge::d3d12::detail
             {
                 if (synchronization.waitScheduledWork == scheduledIndex)
                 {
-                    const auto value = workSignals.at(
+                    const auto& signal = workSignals.at(
                         synchronization.signalScheduledWork);
-                    ThrowIfFailed(nativeQueue->Wait(fence_.Get(), value),
-                        "Cross-queue wait");
+                    if (signal.value == 0
+                        || signal.queue != synchronization.signalQueue)
+                    {
+                        throw std::runtime_error(
+                            "Queue synchronization references an unsignaled work.");
+                    }
+                    WaitForQueueValue(
+                        scheduled.queue,
+                        synchronization.signalQueue,
+                        signal.value);
                 }
             }
 
@@ -191,13 +208,15 @@ namespace sge::d3d12::detail
                     "D3D12 backend received an unsupported work domain.");
             }
 
-            ThrowIfFailed(commandList_->Close(), "Close per-work command list");
+            ThrowIfFailed(commandList_->Close(),
+                "Close per-work command list");
             ID3D12CommandList* lists[] = {commandList_.Get()};
             nativeQueue->ExecuteCommandLists(1, lists);
-            const UINT64 signalValue = nextFenceValue_++;
-            ThrowIfFailed(nativeQueue->Signal(fence_.Get(), signalValue),
-                "Signal work completion");
-            workSignals[scheduledIndex] = signalValue;
+
+            workSignals[scheduledIndex] = {
+                .queue = scheduled.queue,
+                .value = SignalQueue(scheduled.queue)
+            };
             inFlightAllocators_.push_back(std::move(allocator));
             inFlightLists_.push_back(std::move(list));
         }
@@ -206,41 +225,39 @@ namespace sge::d3d12::detail
             swapChain_->Present(1, 0),
             "SwapChain::Present");
 
-        const UINT64 signalValue = nextFenceValue_++;
-        ThrowIfFailed(
-            queue_->Signal(fence_.Get(), signalValue),
-            "CommandQueue::Signal");
-
-        frame.fenceValue = signalValue;
+        frame.fenceValue = SignalQueue(gpu::QueueClass::Direct);
         frameIndex_ = swapChain_->GetCurrentBackBufferIndex();
     }
 
     void Backend::WaitIdle()
     {
-        if (!queue_ || !fence_)
+        if (!queue_)
         {
             return;
         }
 
-        const auto waitQueue = [&](ID3D12CommandQueue* nativeQueue)
-        {
-            if (nativeQueue == nullptr)
-            {
-                return;
-            }
-            const UINT64 signalValue = nextFenceValue_++;
-            ThrowIfFailed(nativeQueue->Signal(fence_.Get(), signalValue),
-                "CommandQueue::Signal");
-            if (fence_->GetCompletedValue() < signalValue)
-            {
-                ThrowIfFailed(fence_->SetEventOnCompletion(
-                    signalValue, fenceEvent_), "Fence::SetEventOnCompletion");
-                WaitForSingleObject(fenceEvent_, INFINITE);
-            }
+        constexpr std::array queues{
+            gpu::QueueClass::Direct,
+            gpu::QueueClass::Compute,
+            gpu::QueueClass::Copy
         };
-        waitQueue(queue_.Get());
-        waitQueue(computeQueue_.Get());
-        waitQueue(copyQueue_.Get());
+
+        for (const auto queue : queues)
+        {
+            if (QueueFor(queue) == nullptr || !SyncFor(queue).fence)
+            {
+                continue;
+            }
+
+            const UINT64 value = SignalQueue(queue);
+            auto& state = SyncFor(queue);
+            if (state.fence->GetCompletedValue() < value)
+            {
+                ThrowIfFailed(state.fence->SetEventOnCompletion(
+                    value, state.event), "Fence::SetEventOnCompletion");
+                WaitForSingleObject(state.event, INFINITE);
+            }
+        }
     }
 
     ID3D12CommandQueue* Backend::QueueFor(
@@ -263,6 +280,51 @@ namespace sge::d3d12::detail
         case gpu::QueueClass::Copy: return D3D12_COMMAND_LIST_TYPE_COPY;
         default: return D3D12_COMMAND_LIST_TYPE_DIRECT;
         }
+    }
+
+    std::size_t Backend::QueueIndex(gpu::QueueClass queue) noexcept
+    {
+        switch (queue)
+        {
+        case gpu::QueueClass::Compute: return 1;
+        case gpu::QueueClass::Copy: return 2;
+        default: return 0;
+        }
+    }
+
+    QueueSyncState& Backend::SyncFor(gpu::QueueClass queue) noexcept
+    {
+        return queueSyncStates_[QueueIndex(queue)];
+    }
+
+    const QueueSyncState& Backend::SyncFor(
+        gpu::QueueClass queue) const noexcept
+    {
+        return queueSyncStates_[QueueIndex(queue)];
+    }
+
+    UINT64 Backend::SignalQueue(gpu::QueueClass queue)
+    {
+        auto& state = SyncFor(queue);
+        const UINT64 value = state.nextSignalValue++;
+        ThrowIfFailed(
+            QueueFor(queue)->Signal(state.fence.Get(), value),
+            "Signal queue fence");
+        return value;
+    }
+
+    void Backend::WaitForQueueValue(
+        gpu::QueueClass waitingQueue,
+        gpu::QueueClass sourceQueue,
+        UINT64 value)
+    {
+        if (waitingQueue == sourceQueue || value == 0)
+        {
+            return;
+        }
+        ThrowIfFailed(
+            QueueFor(waitingQueue)->Wait(SyncFor(sourceQueue).fence.Get(), value),
+            "Cross-queue wait");
     }
 
     void Backend::EnableDebugLayer()
@@ -492,18 +554,28 @@ namespace sge::d3d12::detail
 
     void Backend::CreateFence()
     {
-        ThrowIfFailed(
-            device_->CreateFence(
-                0,
-                D3D12_FENCE_FLAG_NONE,
-                IID_PPV_ARGS(&fence_)),
-            "CreateFence");
+        constexpr std::array queues{
+            gpu::QueueClass::Direct,
+            gpu::QueueClass::Compute,
+            gpu::QueueClass::Copy
+        };
 
-        fenceEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-        if (fenceEvent_ == nullptr)
+        for (const auto queue : queues)
         {
-            throw std::runtime_error(
-                "CreateEventW failed for the D3D12 fence.");
+            auto& state = SyncFor(queue);
+            ThrowIfFailed(
+                device_->CreateFence(
+                    0,
+                    D3D12_FENCE_FLAG_NONE,
+                    IID_PPV_ARGS(&state.fence)),
+                "Create queue fence");
+
+            state.event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            if (state.event == nullptr)
+            {
+                throw std::runtime_error(
+                    "CreateEventW failed for a D3D12 queue fence.");
+            }
         }
     }
 
@@ -595,6 +667,7 @@ namespace sge::d3d12::detail
 
         width_ = newWidth;
         height_ = newHeight;
+        compiledStructureHash_.reset();
 
         if (width_ == 0 || height_ == 0)
         {
@@ -630,19 +703,20 @@ namespace sge::d3d12::detail
 
     void Backend::WaitForFrame(FrameContext& frame)
     {
+        auto& state = SyncFor(gpu::QueueClass::Direct);
         if (frame.fenceValue == 0
-            || fence_->GetCompletedValue() >= frame.fenceValue)
+            || state.fence->GetCompletedValue() >= frame.fenceValue)
         {
             return;
         }
 
         ThrowIfFailed(
-            fence_->SetEventOnCompletion(
+            state.fence->SetEventOnCompletion(
                 frame.fenceValue,
-                fenceEvent_),
+                state.event),
             "Fence::SetEventOnCompletion");
 
-        WaitForSingleObject(fenceEvent_, INFINITE);
+        WaitForSingleObject(state.event, INFINITE);
     }
 }
 

@@ -25,8 +25,13 @@ namespace
     constexpr gpu::WorkId CubeWork{2};
     constexpr gpu::WorkId PlaneWork{3};
     constexpr gpu::WorkId LineWork{4};
-    constexpr gpu::WorkId BlitWork{5};
-    constexpr gpu::WorkId PresentWork{6};
+    constexpr gpu::WorkId GeneratedTriangleWork{5};
+    constexpr gpu::WorkId BlitWork{6};
+    constexpr gpu::WorkId PresentWork{7};
+
+    constexpr std::uint64_t GeneratedVertexCount = 3;
+    constexpr std::uint64_t GeneratedVertexBufferSize =
+        GeneratedVertexCount * sizeof(classical::Vertex);
 }
 
 namespace sge::cube_lab
@@ -166,21 +171,24 @@ namespace sge::cube_lab
             },
             {
                 .id = GeneratedBufferResource,
-                .name = "ComputeGeneratedBuffer",
+                .name = "ComputeGeneratedVertices",
                 .memoryClass = gpu::MemoryClass::Transient,
                 .description = ir::BufferDescription{
-                    .sizeBytes = 256,
+                    .sizeBytes = GeneratedVertexBufferSize,
+                    .strideBytes = 0,
                     .usage = ir::BufferUsage::Storage
                         | ir::BufferUsage::CopySource
                 }
             },
             {
                 .id = CopiedBufferResource,
-                .name = "CopiedBuffer",
+                .name = "ComputeGeneratedVertexBuffer",
                 .memoryClass = gpu::MemoryClass::Transient,
                 .description = ir::BufferDescription{
-                    .sizeBytes = 256,
-                    .usage = ir::BufferUsage::CopyDestination
+                    .sizeBytes = GeneratedVertexBufferSize,
+                    .strideBytes = sizeof(classical::Vertex),
+                    .usage = ir::BufferUsage::Vertex
+                        | ir::BufferUsage::CopyDestination
                 }
             }
         };
@@ -194,6 +202,7 @@ namespace sge::cube_lab
                 .pixelEntry = "PSMain",
                 .parameters = {
                     {
+                        .name = "Scene",
                         .kind = gpu::ProgramParameterKind::ConstantBuffer,
                         .stage = gpu::ProgramStage::Vertex,
                         .registerIndex = 0,
@@ -219,7 +228,7 @@ namespace sge::cube_lab
             },
             {
                 .id = GenerateProgram,
-                .name = "GenerateBuffer",
+                .name = "GenerateTriangleVertices",
                 .shaderPath = "Shaders/GenerateBuffer.hlsl",
                 .computeEntry = "CSMain",
                 .parameters = {
@@ -237,9 +246,10 @@ namespace sge::cube_lab
         module.works = {
             {
                 .id = GenerateWork,
-                .name = "GenerateBufferOnComputeQueue",
+                .name = "GenerateTriangleOnComputeQueue",
                 .accesses = {{GeneratedBufferResource,
-                    gpu::AccessMode::Write, gpu::ResourceRole::ProgramOutput}},
+                    gpu::AccessMode::Write,
+                    gpu::ResourceRole::ProgramOutput}},
                 .payload = ir::ComputeWork{
                     .program = GenerateProgram,
                     .bindings = {{0, GeneratedBufferResource}},
@@ -248,7 +258,7 @@ namespace sge::cube_lab
             },
             {
                 .id = CopyWork,
-                .name = "CopyGeneratedBuffer",
+                .name = "CopyGeneratedTriangle",
                 .accesses = {
                     {GeneratedBufferResource, gpu::AccessMode::Read,
                         gpu::ResourceRole::TransferSource},
@@ -258,33 +268,21 @@ namespace sge::cube_lab
                 .payload = ir::CopyWork{
                     .source = GeneratedBufferResource,
                     .destination = CopiedBufferResource,
-                    .sizeBytes = 256
+                    .sizeBytes = GeneratedVertexBufferSize
                 }
             },
             {
                 .id = CubeWork,
                 .name = "DrawCube",
                 .accesses = {
-                    {
-                        GeometryResource,
-                        gpu::AccessMode::Read,
-                        gpu::ResourceRole::VertexInput
-                    },
-                    {
-                        CubeConstantsResource,
-                        gpu::AccessMode::Read,
-                        gpu::ResourceRole::ConstantInput
-                    },
-                    {
-                        OffscreenColorResource,
-                        gpu::AccessMode::Write,
-                        gpu::ResourceRole::ColorOutput
-                    },
-                    {
-                        DepthResource,
-                        gpu::AccessMode::Write,
-                        gpu::ResourceRole::DepthOutput
-                    }
+                    {GeometryResource, gpu::AccessMode::Read,
+                        gpu::ResourceRole::VertexInput},
+                    {CubeConstantsResource, gpu::AccessMode::Read,
+                        gpu::ResourceRole::ConstantInput},
+                    {OffscreenColorResource, gpu::AccessMode::Write,
+                        gpu::ResourceRole::ColorOutput},
+                    {DepthResource, gpu::AccessMode::Write,
+                        gpu::ResourceRole::DepthOutput}
                 },
                 .payload = ir::RasterWork{
                     .program = ColorProgram,
@@ -310,26 +308,14 @@ namespace sge::cube_lab
                 .id = PlaneWork,
                 .name = "DrawCoordinatePlanes",
                 .accesses = {
-                    {
-                        GeometryResource,
-                        gpu::AccessMode::Read,
-                        gpu::ResourceRole::VertexInput
-                    },
-                    {
-                        WorldConstantsResource,
-                        gpu::AccessMode::Read,
-                        gpu::ResourceRole::ConstantInput
-                    },
-                    {
-                        OffscreenColorResource,
-                        gpu::AccessMode::Write,
-                        gpu::ResourceRole::ColorOutput
-                    },
-                    {
-                        DepthResource,
-                        gpu::AccessMode::Read,
-                        gpu::ResourceRole::DepthOutput
-                    }
+                    {GeometryResource, gpu::AccessMode::Read,
+                        gpu::ResourceRole::VertexInput},
+                    {WorldConstantsResource, gpu::AccessMode::Read,
+                        gpu::ResourceRole::ConstantInput},
+                    {OffscreenColorResource, gpu::AccessMode::Write,
+                        gpu::ResourceRole::ColorOutput},
+                    {DepthResource, gpu::AccessMode::Read,
+                        gpu::ResourceRole::DepthOutput}
                 },
                 .payload = ir::RasterWork{
                     .program = ColorProgram,
@@ -349,26 +335,14 @@ namespace sge::cube_lab
                 .id = LineWork,
                 .name = "DrawGridAndAxes",
                 .accesses = {
-                    {
-                        GeometryResource,
-                        gpu::AccessMode::Read,
-                        gpu::ResourceRole::VertexInput
-                    },
-                    {
-                        WorldConstantsResource,
-                        gpu::AccessMode::Read,
-                        gpu::ResourceRole::ConstantInput
-                    },
-                    {
-                        OffscreenColorResource,
-                        gpu::AccessMode::Write,
-                        gpu::ResourceRole::ColorOutput
-                    },
-                    {
-                        DepthResource,
-                        gpu::AccessMode::Read,
-                        gpu::ResourceRole::DepthOutput
-                    }
+                    {GeometryResource, gpu::AccessMode::Read,
+                        gpu::ResourceRole::VertexInput},
+                    {WorldConstantsResource, gpu::AccessMode::Read,
+                        gpu::ResourceRole::ConstantInput},
+                    {OffscreenColorResource, gpu::AccessMode::Write,
+                        gpu::ResourceRole::ColorOutput},
+                    {DepthResource, gpu::AccessMode::Read,
+                        gpu::ResourceRole::DepthOutput}
                 },
                 .payload = ir::RasterWork{
                     .program = ColorProgram,
@@ -381,6 +355,31 @@ namespace sge::cube_lab
                         .topology = gpu::PrimitiveTopology::LineList,
                         .composition = gpu::CompositionMode::AlphaOver,
                         .depth = gpu::DepthMode::ReadOnly
+                    }
+                }
+            },
+            {
+                .id = GeneratedTriangleWork,
+                .name = "DrawComputeGeneratedTriangle",
+                .accesses = {
+                    {CopiedBufferResource, gpu::AccessMode::Read,
+                        gpu::ResourceRole::VertexInput},
+                    {WorldConstantsResource, gpu::AccessMode::Read,
+                        gpu::ResourceRole::ConstantInput},
+                    {OffscreenColorResource, gpu::AccessMode::Write,
+                        gpu::ResourceRole::ColorOutput}
+                },
+                .payload = ir::RasterWork{
+                    .program = ColorProgram,
+                    .vertexResource = CopiedBufferResource,
+                    .bindings = {{0, WorldConstantsResource}},
+                    .attachments = {{OffscreenColorResource}, {}},
+                    .vertexCount = static_cast<std::uint32_t>(
+                        GeneratedVertexCount),
+                    .rasterState = {
+                        .topology = gpu::PrimitiveTopology::TriangleList,
+                        .composition = gpu::CompositionMode::AlphaOver,
+                        .depth = gpu::DepthMode::Disabled
                     }
                 }
             },
@@ -411,13 +410,8 @@ namespace sge::cube_lab
             {
                 .id = PresentWork,
                 .name = "Present",
-                .accesses = {
-                    {
-                        ColorResource,
-                        gpu::AccessMode::Read,
-                        gpu::ResourceRole::Presentation
-                    }
-                },
+                .accesses = {{ColorResource, gpu::AccessMode::Read,
+                    gpu::ResourceRole::Presentation}},
                 .payload = ir::PresentWork{ColorResource}
             }
         };

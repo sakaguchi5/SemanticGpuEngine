@@ -125,6 +125,8 @@ namespace sge::compiler
         static std::vector<ResourceLifetime> AnalyzeLifetimes(
             const ir::SemanticModule& module,
             const std::vector<std::size_t>& schedule,
+            const std::vector<DependencyEdge>& dependencies,
+            const std::vector<ScheduledWork>& works,
             bool allowAliasing);
 
         static std::vector<ScheduledWork> BuildScheduledWorks(

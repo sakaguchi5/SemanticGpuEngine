@@ -20,6 +20,7 @@ namespace sge::d3d12::detail
 {
     constexpr UINT FrameCount = 3;
     constexpr UINT64 UploadArenaSize = 1024ull * 1024ull;
+    constexpr std::size_t QueueClassCount = 3;
 
     struct ProgramRecord
     {
@@ -37,10 +38,12 @@ namespace sge::d3d12::detail
         D3D12_VERTEX_BUFFER_VIEW vertexView{};
         D3D12_CPU_DESCRIPTOR_HANDLE rtv{};
         D3D12_CPU_DESCRIPTOR_HANDLE dsv{};
-        D3D12_GPU_DESCRIPTOR_HANDLE shaderDescriptor{};
+        D3D12_GPU_DESCRIPTOR_HANDLE srvDescriptor{};
+        D3D12_GPU_DESCRIPTOR_HANDLE uavDescriptor{};
         bool hasRtv = false;
         bool hasDsv = false;
-        bool hasShaderDescriptor = false;
+        bool hasSrv = false;
+        bool hasUav = false;
     };
 
     struct FrameContext
@@ -50,6 +53,13 @@ namespace sge::d3d12::detail
         std::byte* mappedUpload = nullptr;
         UINT64 uploadOffset = 0;
         UINT64 fenceValue = 0;
+    };
+
+    struct QueueSyncState
+    {
+        Microsoft::WRL::ComPtr<ID3D12Fence> fence;
+        HANDLE event = nullptr;
+        UINT64 nextSignalValue = 1;
     };
 
     class Backend final : public runtime::IRenderBackend
@@ -80,6 +90,16 @@ namespace sge::d3d12::detail
             gpu::QueueClass queue) const noexcept;
         [[nodiscard]] static D3D12_COMMAND_LIST_TYPE CommandListType(
             gpu::QueueClass queue) noexcept;
+        [[nodiscard]] static std::size_t QueueIndex(
+            gpu::QueueClass queue) noexcept;
+        [[nodiscard]] QueueSyncState& SyncFor(gpu::QueueClass queue) noexcept;
+        [[nodiscard]] const QueueSyncState& SyncFor(
+            gpu::QueueClass queue) const noexcept;
+        [[nodiscard]] UINT64 SignalQueue(gpu::QueueClass queue);
+        void WaitForQueueValue(
+            gpu::QueueClass waitingQueue,
+            gpu::QueueClass sourceQueue,
+            UINT64 value);
 
         void EnsureCompiled(
             const ir::SemanticModule& module,
@@ -173,9 +193,7 @@ namespace sge::d3d12::detail
         std::array<FrameContext, FrameCount> frames_;
         Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> commandList_;
 
-        Microsoft::WRL::ComPtr<ID3D12Fence> fence_;
-        HANDLE fenceEvent_ = nullptr;
-        UINT64 nextFenceValue_ = 1;
+        std::array<QueueSyncState, QueueClassCount> queueSyncStates_;
         std::vector<Microsoft::WRL::ComPtr<ID3D12CommandAllocator>>
             inFlightAllocators_;
         std::vector<Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList>>

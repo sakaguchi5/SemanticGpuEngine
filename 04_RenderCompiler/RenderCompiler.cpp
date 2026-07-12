@@ -7,6 +7,7 @@
 #include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 namespace
 {
@@ -20,6 +21,174 @@ namespace
     {
         return (static_cast<std::uint64_t>(before) << 32u)
             | static_cast<std::uint64_t>(after);
+    }
+
+    enum class AccessExpectation
+    {
+        Read,
+        Write,
+        WriteOrReadWrite
+    };
+
+    struct ExpectedAccess
+    {
+        sge::gpu::ResourceId resource;
+        sge::gpu::ResourceRole role;
+        AccessExpectation mode = AccessExpectation::Read;
+    };
+
+    bool ModeMatches(
+        sge::gpu::AccessMode actual,
+        AccessExpectation expected) noexcept
+    {
+        using sge::gpu::AccessMode;
+        switch (expected)
+        {
+        case AccessExpectation::Read:
+            return actual == AccessMode::Read;
+        case AccessExpectation::Write:
+            return actual == AccessMode::Write;
+        case AccessExpectation::WriteOrReadWrite:
+            return actual == AccessMode::Write
+                || actual == AccessMode::ReadWrite;
+        }
+        return false;
+    }
+
+    std::vector<ExpectedAccess> BuildExpectedAccesses(
+        const sge::ir::SemanticModule& module,
+        const sge::ir::WorkDeclaration& work)
+    {
+        using namespace sge;
+        std::vector<ExpectedAccess> expected;
+
+        const auto addBindings = [&](gpu::ProgramId programId,
+                                     const std::vector<ir::ResourceBinding>& bindings)
+        {
+            const auto& program = module.Program(programId);
+            for (const auto& binding : bindings)
+            {
+                if (binding.parameterIndex >= program.parameters.size())
+                {
+                    continue;
+                }
+
+                switch (program.parameters[binding.parameterIndex].kind)
+                {
+                case gpu::ProgramParameterKind::ConstantBuffer:
+                    expected.push_back({binding.resource,
+                        gpu::ResourceRole::ConstantInput,
+                        AccessExpectation::Read});
+                    break;
+                case gpu::ProgramParameterKind::ShaderResource:
+                    expected.push_back({binding.resource,
+                        gpu::ResourceRole::ProgramInput,
+                        AccessExpectation::Read});
+                    break;
+                case gpu::ProgramParameterKind::UnorderedAccess:
+                    expected.push_back({binding.resource,
+                        gpu::ResourceRole::ProgramOutput,
+                        AccessExpectation::WriteOrReadWrite});
+                    break;
+                case gpu::ProgramParameterKind::Sampler:
+                    break;
+                }
+            }
+        };
+
+        switch (work.Domain())
+        {
+        case gpu::ExecutionDomain::Raster:
+        {
+            const auto& raster = std::get<ir::RasterWork>(work.payload);
+            expected.push_back({raster.vertexResource,
+                gpu::ResourceRole::VertexInput,
+                AccessExpectation::Read});
+            addBindings(raster.program, raster.bindings);
+            for (const auto color : raster.attachments.colors)
+            {
+                expected.push_back({color,
+                    gpu::ResourceRole::ColorOutput,
+                    AccessExpectation::WriteOrReadWrite});
+            }
+            if (raster.attachments.depth.IsValid()
+                && raster.rasterState.depth != gpu::DepthMode::Disabled)
+            {
+                expected.push_back({raster.attachments.depth,
+                    gpu::ResourceRole::DepthOutput,
+                    raster.rasterState.depth == gpu::DepthMode::ReadOnly
+                        ? AccessExpectation::Read
+                        : AccessExpectation::WriteOrReadWrite});
+            }
+            break;
+        }
+        case gpu::ExecutionDomain::Compute:
+        {
+            const auto& compute = std::get<ir::ComputeWork>(work.payload);
+            addBindings(compute.program, compute.bindings);
+            break;
+        }
+        case gpu::ExecutionDomain::Copy:
+        {
+            const auto& copy = std::get<ir::CopyWork>(work.payload);
+            expected.push_back({copy.source,
+                gpu::ResourceRole::TransferSource,
+                AccessExpectation::Read});
+            expected.push_back({copy.destination,
+                gpu::ResourceRole::TransferDestination,
+                AccessExpectation::Write});
+            break;
+        }
+        case gpu::ExecutionDomain::Present:
+        {
+            const auto& present = std::get<ir::PresentWork>(work.payload);
+            expected.push_back({present.source,
+                gpu::ResourceRole::Presentation,
+                AccessExpectation::Read});
+            break;
+        }
+        }
+
+        return expected;
+    }
+
+    void ValidateAccessContract(
+        const sge::ir::SemanticModule& module,
+        const sge::ir::WorkDeclaration& work)
+    {
+        const auto expected = BuildExpectedAccesses(module, work);
+        std::vector<bool> used(work.accesses.size(), false);
+
+        for (const auto& requirement : expected)
+        {
+            const auto found = std::find_if(
+                work.accesses.begin(), work.accesses.end(),
+                [&](const sge::gpu::ResourceAccess& access)
+                {
+                    const auto index = static_cast<std::size_t>(
+                        &access - work.accesses.data());
+                    return !used[index]
+                        && access.resource == requirement.resource
+                        && access.role == requirement.role
+                        && ModeMatches(access.access, requirement.mode);
+                });
+
+            if (found == work.accesses.end())
+            {
+                throw std::runtime_error(
+                    "Semantic validation failed: payload/access mismatch in work '"
+                    + work.name + "'.");
+            }
+            used[static_cast<std::size_t>(found - work.accesses.begin())] = true;
+        }
+
+        if (expected.size() != work.accesses.size()
+            || std::find(used.begin(), used.end(), false) != used.end())
+        {
+            throw std::runtime_error(
+                "Semantic validation failed: work '" + work.name
+                + "' contains an access not represented by its payload.");
+        }
     }
 }
 
@@ -53,10 +222,14 @@ namespace sge::compiler
         const auto schedule = schedulingPolicy_->Schedule(
             module, result.plan.dependencies);
 
-        result.plan.lifetimes = AnalyzeLifetimes(
-            module, schedule, capabilities.resourceAliasing);
         result.plan.scheduledWorks = BuildScheduledWorks(
             module, schedule, capabilities);
+        result.plan.lifetimes = AnalyzeLifetimes(
+            module,
+            schedule,
+            result.plan.dependencies,
+            result.plan.scheduledWorks,
+            capabilities.resourceAliasing);
         result.plan.transitions = PlanTransitions(result.plan.scheduledWorks);
         result.plan.queueSynchronizations = PlanQueueSynchronization(
             result.plan.dependencies, schedule, result.plan.scheduledWorks);
@@ -91,6 +264,8 @@ namespace sge::compiler
             + " abstract transitions.");
         result.diagnostics.push_back(
             std::string("Scheduling policy: ") + schedulingPolicy_->Name());
+        result.diagnostics.push_back(
+            "Payload/resource-access contracts are consistent.");
 
         return result;
     }
@@ -228,7 +403,7 @@ namespace sge::compiler
             }
 
             const auto validateBindings = [&](const auto& bindings,
-                                              gpu::ProgramId programId)
+                                               gpu::ProgramId programId)
             {
                 const auto& program = module.Program(programId);
                 std::unordered_set<std::uint32_t> bound;
@@ -272,6 +447,8 @@ namespace sge::compiler
                 const auto& compute = std::get<ir::ComputeWork>(work.payload);
                 validateBindings(compute.bindings, compute.program);
             }
+
+            ValidateAccessContract(module, work);
         }
 
         diagnostics.push_back("Semantic validation passed.");
@@ -422,6 +599,8 @@ namespace sge::compiler
     std::vector<ResourceLifetime> RenderCompiler::AnalyzeLifetimes(
         const ir::SemanticModule& module,
         const std::vector<std::size_t>& schedule,
+        const std::vector<DependencyEdge>& dependencies,
+        const std::vector<ScheduledWork>& works,
         bool allowAliasing)
     {
         struct Range
@@ -448,6 +627,45 @@ namespace sge::compiler
             }
         }
 
+        std::vector<std::vector<bool>> happensBefore(
+            module.works.size(),
+            std::vector<bool>(module.works.size(), false));
+        for (const auto& edge : dependencies)
+        {
+            happensBefore.at(edge.before).at(edge.after) = true;
+        }
+        for (std::size_t middle = 0; middle < happensBefore.size(); ++middle)
+        {
+            for (std::size_t before = 0; before < happensBefore.size(); ++before)
+            {
+                if (!happensBefore[before][middle])
+                {
+                    continue;
+                }
+                for (std::size_t after = 0; after < happensBefore.size(); ++after)
+                {
+                    happensBefore[before][after] = happensBefore[before][after]
+                        || happensBefore[middle][after];
+                }
+            }
+        }
+
+        const auto orderedBefore = [&](std::size_t earlier,
+                                       std::size_t later)
+        {
+            if (earlier >= later)
+            {
+                return false;
+            }
+            if (works.at(earlier).queue == works.at(later).queue)
+            {
+                return true;
+            }
+            return static_cast<bool>(
+                happensBefore.at(works.at(earlier).sourceWorkIndex)
+                    .at(works.at(later).sourceWorkIndex));
+        };
+
         std::vector<ResourceLifetime> lifetimes;
         lifetimes.reserve(ranges.size());
 
@@ -466,25 +684,54 @@ namespace sge::compiler
             if (allowAliasing
                 && resource.memoryClass == gpu::MemoryClass::Transient)
             {
-                for (const auto& existing : lifetimes)
+                std::unordered_set<std::uint32_t> consideredAllocations;
+                for (const auto& seed : lifetimes)
                 {
-                    const auto& existingResource =
-                        module.Resource(existing.resource);
-
-                    const bool compatible =
-                        existingResource.memoryClass
-                            == gpu::MemoryClass::Transient
-                        && existingResource.Kind() == resource.Kind()
-                        && existingResource.Format() == resource.Format()
-                        && existingResource.description == resource.description;
-
-                    const bool disjoint =
-                        existing.lastUse < range->second.first
-                        || range->second.last < existing.firstUse;
-
-                    if (compatible && disjoint)
+                    if (!consideredAllocations.insert(
+                        seed.allocation.Value()).second)
                     {
-                        allocation = existing.allocation;
+                        continue;
+                    }
+
+                    bool canReuseAllocation = true;
+                    for (const auto& existing : lifetimes)
+                    {
+                        if (existing.allocation != seed.allocation)
+                        {
+                            continue;
+                        }
+
+                        const auto& existingResource =
+                            module.Resource(existing.resource);
+                        const bool compatible =
+                            existingResource.memoryClass
+                                == gpu::MemoryClass::Transient
+                            && existingResource.Kind() == resource.Kind()
+                            && existingResource.Format() == resource.Format()
+                            && existingResource.description == resource.description;
+
+                        const bool disjoint =
+                            existing.lastUse < range->second.first
+                            || range->second.last < existing.firstUse;
+
+                        const bool ordered =
+                            existing.lastUse < range->second.first
+                                ? orderedBefore(
+                                    existing.lastUse, range->second.first)
+                                : range->second.last < existing.firstUse
+                                    && orderedBefore(
+                                        range->second.last, existing.firstUse);
+
+                        if (!compatible || !disjoint || !ordered)
+                        {
+                            canReuseAllocation = false;
+                            break;
+                        }
+                    }
+
+                    if (canReuseAllocation)
+                    {
+                        allocation = seed.allocation;
                         break;
                     }
                 }
@@ -630,11 +877,13 @@ namespace sge::compiler
         }
 
         std::vector<QueueSynchronization> result;
+        std::unordered_set<std::uint64_t> unique;
         for (const auto& dependency : dependencies)
         {
             const auto before = scheduledPosition.at(dependency.before);
             const auto after = scheduledPosition.at(dependency.after);
-            if (works.at(before).queue != works.at(after).queue)
+            if (works.at(before).queue != works.at(after).queue
+                && unique.insert(EdgeKey(before, after)).second)
             {
                 result.push_back({
                     .signalScheduledWork = before,

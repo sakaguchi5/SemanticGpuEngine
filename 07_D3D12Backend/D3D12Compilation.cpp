@@ -5,6 +5,7 @@
 #include <iterator>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 using Microsoft::WRL::ComPtr;
@@ -75,7 +76,6 @@ namespace sge::d3d12::detail
             description.Properties = HeapProperties(D3D12_HEAP_TYPE_DEFAULT);
             description.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES;
 
-            // Attachment textures require an RT/DS-capable heap.
             for (const auto& [resource, resourceAllocation] : physicalAllocations_)
             {
                 if (resourceAllocation == allocation)
@@ -83,10 +83,13 @@ namespace sge::d3d12::detail
                     const auto& texture = std::get<ir::TextureDescription>(
                         module.Resource(resource).description);
                     const auto usage = static_cast<std::uint32_t>(texture.usage);
-                    if ((usage & (static_cast<std::uint32_t>(ir::TextureUsage::ColorAttachment)
-                        | static_cast<std::uint32_t>(ir::TextureUsage::DepthAttachment))) != 0)
+                    if ((usage & (static_cast<std::uint32_t>(
+                            ir::TextureUsage::ColorAttachment)
+                        | static_cast<std::uint32_t>(
+                            ir::TextureUsage::DepthAttachment))) != 0)
                     {
-                        description.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES;
+                        description.Flags =
+                            D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES;
                         break;
                     }
                 }
@@ -202,8 +205,7 @@ namespace sge::d3d12::detail
             record.hasRtv = true;
         }
 
-        if ((usage & static_cast<std::uint32_t>(ir::TextureUsage::Sampled)) != 0
-            || (usage & static_cast<std::uint32_t>(ir::TextureUsage::Storage)) != 0)
+        const auto allocateShaderDescriptor = [&]()
         {
             auto cpu = shaderHeap_->GetCPUDescriptorHandleForHeapStart();
             auto gpu = shaderHeap_->GetGPUDescriptorHandleForHeapStart();
@@ -211,48 +213,59 @@ namespace sge::d3d12::detail
                 * shaderIncrement_;
             gpu.ptr += static_cast<UINT64>(nextShaderDescriptor_++)
                 * shaderIncrement_;
+            return std::pair{cpu, gpu};
+        };
 
-            if ((usage & static_cast<std::uint32_t>(ir::TextureUsage::Storage)) != 0)
+        if ((usage & static_cast<std::uint32_t>(
+            ir::TextureUsage::Sampled)) != 0)
+        {
+            const auto [cpu, gpu] = allocateShaderDescriptor();
+            D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+            view.Format = description.Format;
+            view.ViewDimension = texture.dimension == gpu::ResourceKind::Texture1D
+                ? D3D12_SRV_DIMENSION_TEXTURE1D
+                : texture.dimension == gpu::ResourceKind::Texture3D
+                    ? D3D12_SRV_DIMENSION_TEXTURE3D
+                    : D3D12_SRV_DIMENSION_TEXTURE2D;
+            view.Shader4ComponentMapping =
+                D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            if (texture.dimension == gpu::ResourceKind::Texture1D)
             {
-                D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
-                view.Format = description.Format;
-                view.ViewDimension = texture.dimension == gpu::ResourceKind::Texture1D
-                    ? D3D12_UAV_DIMENSION_TEXTURE1D
-                    : texture.dimension == gpu::ResourceKind::Texture3D
-                        ? D3D12_UAV_DIMENSION_TEXTURE3D
-                        : D3D12_UAV_DIMENSION_TEXTURE2D;
-                if (texture.dimension == gpu::ResourceKind::Texture3D)
-                {
-                    view.Texture3D.WSize = texture.depth;
-                }
-                device_->CreateUnorderedAccessView(
-                    record.resource.Get(), nullptr, &view, cpu);
+                view.Texture1D.MipLevels = texture.mipLevels;
+            }
+            else if (texture.dimension == gpu::ResourceKind::Texture3D)
+            {
+                view.Texture3D.MipLevels = texture.mipLevels;
             }
             else
             {
-                D3D12_SHADER_RESOURCE_VIEW_DESC view{};
-                view.Format = description.Format;
-                view.ViewDimension = texture.dimension == gpu::ResourceKind::Texture1D
-                    ? D3D12_SRV_DIMENSION_TEXTURE1D
-                    : texture.dimension == gpu::ResourceKind::Texture3D
-                        ? D3D12_SRV_DIMENSION_TEXTURE3D
-                        : D3D12_SRV_DIMENSION_TEXTURE2D;
-                view.Shader4ComponentMapping =
-                    D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
                 view.Texture2D.MipLevels = texture.mipLevels;
-                if (texture.dimension == gpu::ResourceKind::Texture1D)
-                {
-                    view.Texture1D.MipLevels = texture.mipLevels;
-                }
-                else if (texture.dimension == gpu::ResourceKind::Texture3D)
-                {
-                    view.Texture3D.MipLevels = texture.mipLevels;
-                }
-                device_->CreateShaderResourceView(
-                    record.resource.Get(), &view, cpu);
             }
-            record.shaderDescriptor = gpu;
-            record.hasShaderDescriptor = true;
+            device_->CreateShaderResourceView(
+                record.resource.Get(), &view, cpu);
+            record.srvDescriptor = gpu;
+            record.hasSrv = true;
+        }
+
+        if ((usage & static_cast<std::uint32_t>(
+            ir::TextureUsage::Storage)) != 0)
+        {
+            const auto [cpu, gpu] = allocateShaderDescriptor();
+            D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
+            view.Format = description.Format;
+            view.ViewDimension = texture.dimension == gpu::ResourceKind::Texture1D
+                ? D3D12_UAV_DIMENSION_TEXTURE1D
+                : texture.dimension == gpu::ResourceKind::Texture3D
+                    ? D3D12_UAV_DIMENSION_TEXTURE3D
+                    : D3D12_UAV_DIMENSION_TEXTURE2D;
+            if (texture.dimension == gpu::ResourceKind::Texture3D)
+            {
+                view.Texture3D.WSize = texture.depth;
+            }
+            device_->CreateUnorderedAccessView(
+                record.resource.Get(), nullptr, &view, cpu);
+            record.uavDescriptor = gpu;
+            record.hasUav = true;
         }
 
         return record;
@@ -265,7 +278,6 @@ namespace sge::d3d12::detail
 
         const auto defaultProperties = HeapProperties(
             D3D12_HEAP_TYPE_DEFAULT);
-
         const auto uploadProperties = HeapProperties(
             D3D12_HEAP_TYPE_UPLOAD);
 
@@ -292,113 +304,132 @@ namespace sge::d3d12::detail
 
         if (!declaration.data.empty())
         {
-        ComPtr<ID3D12Resource> upload;
-        ThrowIfFailed(
-            device_->CreateCommittedResource(
-                &uploadProperties,
-                D3D12_HEAP_FLAG_NONE,
-                &description,
-                D3D12_RESOURCE_STATE_GENERIC_READ,
-                nullptr,
-                IID_PPV_ARGS(&upload)),
-            "Create static upload buffer");
+            ComPtr<ID3D12Resource> upload;
+            const auto uploadDescription = BufferDescription(
+                declaration.SizeBytes());
+            ThrowIfFailed(
+                device_->CreateCommittedResource(
+                    &uploadProperties,
+                    D3D12_HEAP_FLAG_NONE,
+                    &uploadDescription,
+                    D3D12_RESOURCE_STATE_GENERIC_READ,
+                    nullptr,
+                    IID_PPV_ARGS(&upload)),
+                "Create static upload buffer");
 
-        void* mapped = nullptr;
-        ThrowIfFailed(
-            upload->Map(0, nullptr, &mapped),
-            "Map static upload buffer");
+            void* mapped = nullptr;
+            ThrowIfFailed(
+                upload->Map(0, nullptr, &mapped),
+                "Map static upload buffer");
+            std::memcpy(
+                mapped,
+                declaration.data.data(),
+                declaration.data.size());
+            upload->Unmap(0, nullptr);
 
-        std::memcpy(
-            mapped,
-            declaration.data.data(),
-            declaration.data.size());
+            ComPtr<ID3D12CommandAllocator> allocator;
+            ComPtr<ID3D12GraphicsCommandList> list;
+            ThrowIfFailed(
+                device_->CreateCommandAllocator(
+                    D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    IID_PPV_ARGS(&allocator)),
+                "Create upload command allocator");
+            ThrowIfFailed(
+                device_->CreateCommandList(
+                    0,
+                    D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    allocator.Get(),
+                    nullptr,
+                    IID_PPV_ARGS(&list)),
+                "Create upload command list");
 
-        upload->Unmap(0, nullptr);
-
-        ComPtr<ID3D12CommandAllocator> allocator;
-        ComPtr<ID3D12GraphicsCommandList> list;
-
-        ThrowIfFailed(
-            device_->CreateCommandAllocator(
-                D3D12_COMMAND_LIST_TYPE_DIRECT,
-                IID_PPV_ARGS(&allocator)),
-            "Create upload command allocator");
-
-        ThrowIfFailed(
-            device_->CreateCommandList(
+            list->CopyBufferRegion(
+                record.resource.Get(),
                 0,
-                D3D12_COMMAND_LIST_TYPE_DIRECT,
-                allocator.Get(),
-                nullptr,
-                IID_PPV_ARGS(&list)),
-            "Create upload command list");
+                upload.Get(),
+                0,
+                declaration.SizeBytes());
 
-        list->CopyBufferRegion(
-            record.resource.Get(),
-            0,
-            upload.Get(),
-            0,
-            declaration.SizeBytes());
+            D3D12_RESOURCE_BARRIER barrier{};
+            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barrier.Transition.pResource = record.resource.Get();
+            barrier.Transition.Subresource =
+                D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+            barrier.Transition.StateAfter =
+                D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
+            list->ResourceBarrier(1, &barrier);
 
-        D3D12_RESOURCE_BARRIER barrier{};
-        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        barrier.Transition.pResource = record.resource.Get();
-        barrier.Transition.Subresource =
-            D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-        barrier.Transition.StateAfter =
-            D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
-
-        list->ResourceBarrier(1, &barrier);
-
-        ThrowIfFailed(list->Close(), "Close upload command list");
-
-        ID3D12CommandList* lists[] = {list.Get()};
-        queue_->ExecuteCommandLists(1, lists);
-        WaitIdle();
-
-        record.state =
-            D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
+            ThrowIfFailed(list->Close(), "Close upload command list");
+            ID3D12CommandList* lists[] = {list.Get()};
+            queue_->ExecuteCommandLists(1, lists);
+            WaitIdle();
+            record.state =
+                D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
         }
 
         record.vertexView.BufferLocation =
             record.resource->GetGPUVirtualAddress();
-
         record.vertexView.SizeInBytes =
             static_cast<UINT>(declaration.SizeBytes());
+        record.vertexView.StrideInBytes = bufferDescription.strideBytes;
 
-        record.vertexView.StrideInBytes =
-            std::get<ir::BufferDescription>(declaration.description).strideBytes;
-
-        const auto& buffer =
-            std::get<ir::BufferDescription>(declaration.description);
-        const auto usage = static_cast<std::uint32_t>(buffer.usage);
+        const auto usage = static_cast<std::uint32_t>(bufferDescription.usage);
         if ((usage & static_cast<std::uint32_t>(ir::BufferUsage::Storage)) != 0)
         {
-            auto cpu = shaderHeap_->GetCPUDescriptorHandleForHeapStart();
-            auto gpu = shaderHeap_->GetGPUDescriptorHandleForHeapStart();
-            cpu.ptr += static_cast<SIZE_T>(nextShaderDescriptor_)
-                * shaderIncrement_;
-            gpu.ptr += static_cast<UINT64>(nextShaderDescriptor_++)
-                * shaderIncrement_;
-            D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
-            view.Format = DXGI_FORMAT_UNKNOWN;
-            view.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-            view.Buffer.NumElements = buffer.strideBytes == 0
-                ? static_cast<UINT>(buffer.sizeBytes / 4)
-                : static_cast<UINT>(buffer.sizeBytes / buffer.strideBytes);
-            view.Buffer.StructureByteStride = buffer.strideBytes;
-            view.Buffer.Flags = buffer.strideBytes == 0
-                ? D3D12_BUFFER_UAV_FLAG_RAW
-                : D3D12_BUFFER_UAV_FLAG_NONE;
-            if (buffer.strideBytes == 0)
+            const auto allocateShaderDescriptor = [&]()
             {
-                view.Format = DXGI_FORMAT_R32_TYPELESS;
+                auto cpu = shaderHeap_->GetCPUDescriptorHandleForHeapStart();
+                auto gpu = shaderHeap_->GetGPUDescriptorHandleForHeapStart();
+                cpu.ptr += static_cast<SIZE_T>(nextShaderDescriptor_)
+                    * shaderIncrement_;
+                gpu.ptr += static_cast<UINT64>(nextShaderDescriptor_++)
+                    * shaderIncrement_;
+                return std::pair{cpu, gpu};
+            };
+
+            const UINT elementCount = bufferDescription.strideBytes == 0
+                ? static_cast<UINT>(bufferDescription.sizeBytes / 4)
+                : static_cast<UINT>(bufferDescription.sizeBytes
+                    / bufferDescription.strideBytes);
+
+            {
+                const auto [cpu, gpu] = allocateShaderDescriptor();
+                D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+                view.Format = bufferDescription.strideBytes == 0
+                    ? DXGI_FORMAT_R32_TYPELESS
+                    : DXGI_FORMAT_UNKNOWN;
+                view.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+                view.Shader4ComponentMapping =
+                    D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                view.Buffer.NumElements = elementCount;
+                view.Buffer.StructureByteStride = bufferDescription.strideBytes;
+                view.Buffer.Flags = bufferDescription.strideBytes == 0
+                    ? D3D12_BUFFER_SRV_FLAG_RAW
+                    : D3D12_BUFFER_SRV_FLAG_NONE;
+                device_->CreateShaderResourceView(
+                    record.resource.Get(), &view, cpu);
+                record.srvDescriptor = gpu;
+                record.hasSrv = true;
             }
-            device_->CreateUnorderedAccessView(
-                record.resource.Get(), nullptr, &view, cpu);
-            record.shaderDescriptor = gpu;
-            record.hasShaderDescriptor = true;
+
+            {
+                const auto [cpu, gpu] = allocateShaderDescriptor();
+                D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
+                view.Format = bufferDescription.strideBytes == 0
+                    ? DXGI_FORMAT_R32_TYPELESS
+                    : DXGI_FORMAT_UNKNOWN;
+                view.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+                view.Buffer.NumElements = elementCount;
+                view.Buffer.StructureByteStride = bufferDescription.strideBytes;
+                view.Buffer.Flags = bufferDescription.strideBytes == 0
+                    ? D3D12_BUFFER_UAV_FLAG_RAW
+                    : D3D12_BUFFER_UAV_FLAG_NONE;
+                device_->CreateUnorderedAccessView(
+                    record.resource.Get(), nullptr, &view, cpu);
+                record.uavDescriptor = gpu;
+                record.hasUav = true;
+            }
         }
 
         return record;
@@ -427,7 +458,8 @@ namespace sge::d3d12::detail
                 record.vertex, gpu::ProgramStage::Vertex);
             auto pixelBindings = shaderCompiler_.ReflectBindings(
                 record.pixel, gpu::ProgramStage::Pixel);
-            reflected.insert(reflected.end(), pixelBindings.begin(), pixelBindings.end());
+            reflected.insert(
+                reflected.end(), pixelBindings.begin(), pixelBindings.end());
         }
 
         shaderCompiler_.ValidateInterface(
@@ -476,25 +508,28 @@ namespace sge::d3d12::detail
                 sampler.MaxLOD = D3D12_FLOAT32_MAX;
                 sampler.ShaderRegister = parameter.registerIndex;
                 sampler.RegisterSpace = parameter.registerSpace;
-                sampler.ShaderVisibility = parameter.stage == gpu::ProgramStage::Vertex
-                    ? D3D12_SHADER_VISIBILITY_VERTEX
-                    : parameter.stage == gpu::ProgramStage::Pixel
-                        ? D3D12_SHADER_VISIBILITY_PIXEL
-                        : D3D12_SHADER_VISIBILITY_ALL;
+                sampler.ShaderVisibility =
+                    parameter.stage == gpu::ProgramStage::Vertex
+                        ? D3D12_SHADER_VISIBILITY_VERTEX
+                        : parameter.stage == gpu::ProgramStage::Pixel
+                            ? D3D12_SHADER_VISIBILITY_PIXEL
+                            : D3D12_SHADER_VISIBILITY_ALL;
                 samplers.push_back(sampler);
                 continue;
             }
             else
             {
                 auto& range = ranges[parameters.size()];
-                range.RangeType = parameter.kind == gpu::ProgramParameterKind::ShaderResource
-                    ? D3D12_DESCRIPTOR_RANGE_TYPE_SRV
-                    : D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+                range.RangeType =
+                    parameter.kind == gpu::ProgramParameterKind::ShaderResource
+                        ? D3D12_DESCRIPTOR_RANGE_TYPE_SRV
+                        : D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
                 range.NumDescriptors = 1;
                 range.BaseShaderRegister = parameter.registerIndex;
                 range.RegisterSpace = parameter.registerSpace;
                 range.OffsetInDescriptorsFromTableStart = 0;
-                native.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+                native.ParameterType =
+                    D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
                 native.DescriptorTable.NumDescriptorRanges = 1;
                 native.DescriptorTable.pDescriptorRanges = &range;
             }
@@ -504,15 +539,10 @@ namespace sge::d3d12::detail
             case gpu::ProgramStage::Vertex:
                 native.ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
                 break;
-
             case gpu::ProgramStage::Pixel:
                 native.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
                 break;
-
             case gpu::ProgramStage::Compute:
-                native.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-                break;
-
             case gpu::ProgramStage::AllGraphics:
             default:
                 native.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
@@ -525,8 +555,7 @@ namespace sge::d3d12::detail
         }
 
         D3D12_ROOT_SIGNATURE_DESC description{};
-        description.NumParameters =
-            static_cast<UINT>(parameters.size());
+        description.NumParameters = static_cast<UINT>(parameters.size());
         description.pParameters = parameters.data();
         description.NumStaticSamplers = static_cast<UINT>(samplers.size());
         description.pStaticSamplers = samplers.data();
@@ -540,18 +569,15 @@ namespace sge::d3d12::detail
 
         ComPtr<ID3DBlob> serialized;
         ComPtr<ID3DBlob> errors;
-
         const HRESULT result = D3D12SerializeRootSignature(
             &description,
             D3D_ROOT_SIGNATURE_VERSION_1,
             &serialized,
             &errors);
-
         if (FAILED(result))
         {
             std::string message =
                 "D3D12 root signature serialization failed.";
-
             if (errors)
             {
                 message += "\n";
@@ -559,7 +585,6 @@ namespace sge::d3d12::detail
                     static_cast<const char*>(errors->GetBufferPointer()),
                     errors->GetBufferSize());
             }
-
             throw std::runtime_error(message);
         }
 
@@ -571,7 +596,6 @@ namespace sge::d3d12::detail
                 serialized->GetBufferSize(),
                 IID_PPV_ARGS(&rootSignature)),
             "CreateRootSignature");
-
         return rootSignature;
     }
 
@@ -602,22 +626,12 @@ namespace sge::d3d12::detail
 
         D3D12_INPUT_ELEMENT_DESC inputLayout[] = {
             {
-                "POSITION",
-                0,
-                DXGI_FORMAT_R32G32B32_FLOAT,
-                0,
-                0,
-                D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
-                0
+                "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT,
+                0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0
             },
             {
-                "COLOR",
-                0,
-                DXGI_FORMAT_R32G32B32A32_FLOAT,
-                0,
-                12,
-                D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
-                0
+                "COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT,
+                0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0
             }
         };
 
@@ -645,7 +659,10 @@ namespace sge::d3d12::detail
             executable.rasterState.topology);
         description.NumRenderTargets = 1;
         description.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-        description.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+        description.DSVFormat = executable.rasterState.depth
+                == gpu::DepthMode::Disabled
+            ? DXGI_FORMAT_UNKNOWN
+            : DXGI_FORMAT_D32_FLOAT;
         description.SampleDesc.Count = 1;
 
         ComPtr<ID3D12PipelineState> pipeline;
@@ -654,7 +671,6 @@ namespace sge::d3d12::detail
                 &description,
                 IID_PPV_ARGS(&pipeline)),
             "CreateGraphicsPipelineState");
-
         return pipeline;
     }
 
@@ -665,7 +681,6 @@ namespace sge::d3d12::detail
         const UINT64 alignedOffset = AlignUp(
             frame.uploadOffset,
             D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
-
         const UINT64 alignedSize = AlignUp(
             declaration.data.size(),
             D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
@@ -680,11 +695,8 @@ namespace sge::d3d12::detail
             frame.mappedUpload + alignedOffset,
             declaration.data.data(),
             declaration.data.size());
-
         frame.uploadOffset = alignedOffset + alignedSize;
-
-        return frame.uploadArena->GetGPUVirtualAddress()
-            + alignedOffset;
+        return frame.uploadArena->GetGPUVirtualAddress() + alignedOffset;
     }
 
     void Backend::BindResources(
@@ -700,16 +712,20 @@ namespace sge::d3d12::detail
         {
             throw std::runtime_error("Cannot bind an uncompiled program.");
         }
+
         for (const auto& binding : bindings)
         {
             const auto& parameter = declaration.parameters.at(
                 binding.parameterIndex);
             if (parameter.kind == gpu::ProgramParameterKind::Sampler)
             {
-                throw std::runtime_error("Static samplers do not take resource bindings.");
+                throw std::runtime_error(
+                    "Static samplers do not take resource bindings.");
             }
-            const UINT rootIndex = compiledProgram->second.rootParameterIndices.at(
-                binding.parameterIndex);
+
+            const UINT rootIndex =
+                compiledProgram->second.rootParameterIndices.at(
+                    binding.parameterIndex);
             if (parameter.kind == gpu::ProgramParameterKind::ConstantBuffer)
             {
                 const auto address = UploadConstants(
@@ -728,23 +744,41 @@ namespace sge::d3d12::detail
             }
 
             const auto resource = staticResources_.find(binding.resource);
-            if (resource == staticResources_.end()
-                || !resource->second.hasShaderDescriptor)
+            if (resource == staticResources_.end())
             {
                 throw std::runtime_error(
-                    "Program binding has no SRV/UAV descriptor.");
+                    "Program binding references an unmaterialized resource.");
             }
+
+            D3D12_GPU_DESCRIPTOR_HANDLE descriptor{};
+            if (parameter.kind == gpu::ProgramParameterKind::ShaderResource)
+            {
+                if (!resource->second.hasSrv)
+                {
+                    throw std::runtime_error(
+                        "Shader-resource binding has no SRV descriptor.");
+                }
+                descriptor = resource->second.srvDescriptor;
+            }
+            else
+            {
+                if (!resource->second.hasUav)
+                {
+                    throw std::runtime_error(
+                        "Unordered-access binding has no UAV descriptor.");
+                }
+                descriptor = resource->second.uavDescriptor;
+            }
+
             if (compute)
             {
                 commandList_->SetComputeRootDescriptorTable(
-                    rootIndex,
-                    resource->second.shaderDescriptor);
+                    rootIndex, descriptor);
             }
             else
             {
                 commandList_->SetGraphicsRootDescriptorTable(
-                    rootIndex,
-                    resource->second.shaderDescriptor);
+                    rootIndex, descriptor);
             }
         }
     }
@@ -798,26 +832,22 @@ namespace sge::d3d12::detail
             const auto target = staticResources_.find(color);
             if (target == staticResources_.end() || !target->second.hasRtv)
             {
-                throw std::runtime_error("Raster color attachment has no RTV.");
+                throw std::runtime_error(
+                    "Raster color attachment has no RTV.");
             }
             rtv = target->second.rtv;
         }
 
         auto dsv = dsvHeap_->GetCPUDescriptorHandleForHeapStart();
         const bool hasDepth = raster.attachments.depth.IsValid();
-
         commandList_->OMSetRenderTargets(
             1, &rtv, FALSE, hasDepth ? &dsv : nullptr);
 
         if (raster.clear.clearColor)
         {
             commandList_->ClearRenderTargetView(
-                rtv,
-                raster.clear.color.data(),
-                0,
-                nullptr);
+                rtv, raster.clear.color.data(), 0, nullptr);
         }
-
         if (raster.clear.clearDepth && hasDepth)
         {
             commandList_->ClearDepthStencilView(
@@ -836,9 +866,7 @@ namespace sge::d3d12::detail
         commandList_->IASetPrimitiveTopology(
             NativeTopology(raster.rasterState.topology));
         commandList_->IASetVertexBuffers(
-            0,
-            1,
-            &geometry->second.vertexView);
+            0, 1, &geometry->second.vertexView);
         commandList_->DrawInstanced(
             raster.vertexCount,
             1,
@@ -860,16 +888,19 @@ namespace sge::d3d12::detail
         const auto program = programs_.find(compute.program);
         if (pipeline == pipelines_.end() || program == programs_.end())
         {
-            throw std::runtime_error("Compute work has no compiled executable.");
+            throw std::runtime_error(
+                "Compute work has no compiled executable.");
         }
+
         commandList_->SetPipelineState(pipeline->second.Get());
-        commandList_->SetComputeRootSignature(program->second.rootSignature.Get());
+        commandList_->SetComputeRootSignature(
+            program->second.rootSignature.Get());
         BindResources(module, compute.program, compute.bindings, frame, true);
         commandList_->Dispatch(
-            compute.groupCountX, compute.groupCountY, compute.groupCountZ);
+            compute.groupCountX,
+            compute.groupCountY,
+            compute.groupCountZ);
 
-        // Cross-queue ownership is expressed through COMMON. This keeps the
-        // following copy/direct queue transition legal on D3D12.
         for (const auto& access : work.accesses)
         {
             if (access.access != gpu::AccessMode::Read)
@@ -889,8 +920,10 @@ namespace sge::d3d12::detail
         if (source == staticResources_.end()
             || destination == staticResources_.end())
         {
-            throw std::runtime_error("Copy work references an unmaterialized resource.");
+            throw std::runtime_error(
+                "Copy work references an unmaterialized resource.");
         }
+
         if (copy.sizeBytes == 0)
         {
             commandList_->CopyResource(
@@ -904,6 +937,7 @@ namespace sge::d3d12::detail
                 source->second.resource.Get(), copy.sourceOffset,
                 copy.sizeBytes);
         }
+
         Transition(copy.source, gpu::AbstractState::Undefined);
         Transition(copy.destination, gpu::AbstractState::Undefined);
     }
@@ -917,8 +951,7 @@ namespace sge::d3d12::detail
         ID3D12Resource* nativeResource = nullptr;
         D3D12_RESOURCE_STATES* currentState = nullptr;
 
-        if (presentationResource_
-            && resource == *presentationResource_)
+        if (presentationResource_ && resource == *presentationResource_)
         {
             nativeResource = backBuffers_[frameIndex_].Get();
             currentState = &backBufferStates_[frameIndex_];
@@ -938,8 +971,6 @@ namespace sge::d3d12::detail
             }
             else
             {
-                // Dynamic constants live in persistently mapped GENERIC_READ
-                // memory and require no explicit transition.
                 return;
             }
         }
@@ -958,7 +989,6 @@ namespace sge::d3d12::detail
             D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         barrier.Transition.StateBefore = *currentState;
         barrier.Transition.StateAfter = target;
-
         commandList_->ResourceBarrier(1, &barrier);
         *currentState = target;
     }
@@ -982,8 +1012,10 @@ namespace sge::d3d12::detail
             {
                 D3D12_RESOURCE_BARRIER barrier{};
                 barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_ALIASING;
-                barrier.Aliasing.pResourceBefore = before->second.resource.Get();
-                barrier.Aliasing.pResourceAfter = after->second.resource.Get();
+                barrier.Aliasing.pResourceBefore =
+                    before->second.resource.Get();
+                barrier.Aliasing.pResourceAfter =
+                    after->second.resource.Get();
                 commandList_->ResourceBarrier(1, &barrier);
             }
         }
