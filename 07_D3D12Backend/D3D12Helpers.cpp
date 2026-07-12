@@ -1,0 +1,195 @@
+#include "07_D3D12Backend/D3D12Helpers.h"
+
+#include <cstdio>
+#include <stdexcept>
+#include <string>
+
+namespace sge::d3d12::detail
+{
+    void ThrowIfFailed(HRESULT result, const char* operation)
+    {
+        if (SUCCEEDED(result))
+        {
+            return;
+        }
+
+        char hexadecimal[16]{};
+        sprintf_s(
+            hexadecimal,
+            "%08X",
+            static_cast<unsigned>(result));
+
+        throw std::runtime_error(
+            std::string(operation)
+            + " failed. HRESULT=0x"
+            + hexadecimal);
+    }
+
+    UINT64 AlignUp(UINT64 value, UINT64 alignment) noexcept
+    {
+        return (value + alignment - 1ull) & ~(alignment - 1ull);
+    }
+
+    D3D12_HEAP_PROPERTIES HeapProperties(
+        D3D12_HEAP_TYPE type) noexcept
+    {
+        D3D12_HEAP_PROPERTIES properties{};
+        properties.Type = type;
+        properties.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+        properties.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+        properties.CreationNodeMask = 1;
+        properties.VisibleNodeMask = 1;
+        return properties;
+    }
+
+    D3D12_RESOURCE_DESC BufferDescription(UINT64 size) noexcept
+    {
+        D3D12_RESOURCE_DESC description{};
+        description.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        description.Width = size;
+        description.Height = 1;
+        description.DepthOrArraySize = 1;
+        description.MipLevels = 1;
+        description.Format = DXGI_FORMAT_UNKNOWN;
+        description.SampleDesc.Count = 1;
+        description.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        return description;
+    }
+
+    D3D12_RASTERIZER_DESC RasterizerDescription() noexcept
+    {
+        D3D12_RASTERIZER_DESC description{};
+        description.FillMode = D3D12_FILL_MODE_SOLID;
+        description.CullMode = D3D12_CULL_MODE_NONE;
+        description.FrontCounterClockwise = FALSE;
+        description.DepthBias = D3D12_DEFAULT_DEPTH_BIAS;
+        description.DepthBiasClamp = D3D12_DEFAULT_DEPTH_BIAS_CLAMP;
+        description.SlopeScaledDepthBias =
+            D3D12_DEFAULT_SLOPE_SCALED_DEPTH_BIAS;
+        description.DepthClipEnable = TRUE;
+        description.MultisampleEnable = FALSE;
+        description.AntialiasedLineEnable = FALSE;
+        description.ForcedSampleCount = 0;
+        description.ConservativeRaster =
+            D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF;
+        return description;
+    }
+
+    D3D12_BLEND_DESC BlendDescription(
+        gpu::CompositionMode composition) noexcept
+    {
+        D3D12_BLEND_DESC description{};
+        description.AlphaToCoverageEnable = FALSE;
+        description.IndependentBlendEnable = FALSE;
+
+        auto& target = description.RenderTarget[0];
+        target.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        target.LogicOpEnable = FALSE;
+        target.LogicOp = D3D12_LOGIC_OP_NOOP;
+
+        if (composition == gpu::CompositionMode::AlphaOver)
+        {
+            target.BlendEnable = TRUE;
+            target.SrcBlend = D3D12_BLEND_SRC_ALPHA;
+            target.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+            target.BlendOp = D3D12_BLEND_OP_ADD;
+            target.SrcBlendAlpha = D3D12_BLEND_ONE;
+            target.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+            target.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+        }
+        else
+        {
+            target.BlendEnable = FALSE;
+            target.SrcBlend = D3D12_BLEND_ONE;
+            target.DestBlend = D3D12_BLEND_ZERO;
+            target.BlendOp = D3D12_BLEND_OP_ADD;
+            target.SrcBlendAlpha = D3D12_BLEND_ONE;
+            target.DestBlendAlpha = D3D12_BLEND_ZERO;
+            target.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+        }
+
+        return description;
+    }
+
+    D3D12_DEPTH_STENCIL_DESC DepthDescription(
+        gpu::DepthMode mode) noexcept
+    {
+        D3D12_DEPTH_STENCIL_DESC description{};
+        description.DepthEnable = mode != gpu::DepthMode::Disabled;
+        description.DepthWriteMask =
+            mode == gpu::DepthMode::ReadWrite
+            ? D3D12_DEPTH_WRITE_MASK_ALL
+            : D3D12_DEPTH_WRITE_MASK_ZERO;
+        description.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+        description.StencilEnable = FALSE;
+        return description;
+    }
+
+    D3D12_RESOURCE_STATES NativeState(
+        gpu::AbstractState state) noexcept
+    {
+        using State = gpu::AbstractState;
+
+        switch (state)
+        {
+        case State::VertexRead:
+        case State::ConstantRead:
+            return D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
+
+        case State::ProgramRead:
+            return D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+                | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+
+        case State::ProgramWrite:
+            return D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+
+        case State::ColorWrite:
+            return D3D12_RESOURCE_STATE_RENDER_TARGET;
+
+        case State::DepthRead:
+            return D3D12_RESOURCE_STATE_DEPTH_READ;
+
+        case State::DepthWrite:
+            return D3D12_RESOURCE_STATE_DEPTH_WRITE;
+
+        case State::TransferRead:
+            return D3D12_RESOURCE_STATE_COPY_SOURCE;
+
+        case State::TransferWrite:
+            return D3D12_RESOURCE_STATE_COPY_DEST;
+
+        case State::Present:
+            return D3D12_RESOURCE_STATE_PRESENT;
+
+        case State::Undefined:
+        default:
+            return D3D12_RESOURCE_STATE_COMMON;
+        }
+    }
+
+    D3D_PRIMITIVE_TOPOLOGY NativeTopology(
+        gpu::PrimitiveTopology topology) noexcept
+    {
+        return topology == gpu::PrimitiveTopology::LineList
+            ? D3D_PRIMITIVE_TOPOLOGY_LINELIST
+            : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+    }
+
+    D3D12_PRIMITIVE_TOPOLOGY_TYPE NativeTopologyType(
+        gpu::PrimitiveTopology topology) noexcept
+    {
+        return topology == gpu::PrimitiveTopology::LineList
+            ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE
+            : D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    }
+
+    std::size_t ExecutableKeyHash::operator()(
+        const compiler::ExecutableKey& key) const noexcept
+    {
+        std::size_t seed = key.program.Value();
+        foundation::HashEnum(seed, key.rasterState.topology);
+        foundation::HashEnum(seed, key.rasterState.composition);
+        foundation::HashEnum(seed, key.rasterState.depth);
+        return seed;
+    }
+}

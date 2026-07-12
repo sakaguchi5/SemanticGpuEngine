@@ -1,0 +1,147 @@
+#pragma once
+
+#include "00_Foundation/StrongId.h"
+
+#include <cstdint>
+
+namespace sge::gpu
+{
+    struct ResourceTag;
+    struct WorkTag;
+    struct ProgramTag;
+    struct PhysicalAllocationTag;
+
+    using ResourceId = foundation::StrongId<ResourceTag>;
+    using WorkId = foundation::StrongId<WorkTag>;
+    using ProgramId = foundation::StrongId<ProgramTag>;
+    using PhysicalAllocationId = foundation::StrongId<PhysicalAllocationTag>;
+
+    enum class ResourceKind
+    {
+        Buffer,
+        Texture2D,
+        Presentation
+    };
+
+    enum class MemoryClass
+    {
+        Static,
+        DynamicPerFrame,
+        Transient,
+        External
+    };
+
+    enum class ResourceFormat
+    {
+        Unknown,
+        Rgba8Unorm,
+        Depth32Float
+    };
+
+    enum class AccessMode
+    {
+        Read,
+        Write,
+        ReadWrite
+    };
+
+    enum class ResourceRole
+    {
+        VertexInput,
+        ConstantInput,
+        ProgramInput,
+        ProgramOutput,
+        ColorOutput,
+        DepthOutput,
+        TransferSource,
+        TransferDestination,
+        Presentation
+    };
+
+    enum class ExecutionDomain
+    {
+        Raster,
+        Compute,
+        Copy,
+        Present
+    };
+
+    enum class PrimitiveTopology
+    {
+        TriangleList,
+        LineList
+    };
+
+    enum class CompositionMode
+    {
+        Replace,
+        AlphaOver
+    };
+
+    enum class DepthMode
+    {
+        Disabled,
+        ReadOnly,
+        ReadWrite
+    };
+
+    enum class AbstractState
+    {
+        Undefined,
+        VertexRead,
+        ConstantRead,
+        ProgramRead,
+        ProgramWrite,
+        ColorWrite,
+        DepthRead,
+        DepthWrite,
+        TransferRead,
+        TransferWrite,
+        Present
+    };
+
+    enum class ProgramParameterKind
+    {
+        ConstantBuffer,
+        ShaderResource,
+        UnorderedAccess,
+        Sampler
+    };
+
+    enum class ProgramStage
+    {
+        Vertex,
+        Pixel,
+        AllGraphics
+    };
+
+    struct ResourceAccess
+    {
+        ResourceId resource;
+        AccessMode access = AccessMode::Read;
+        ResourceRole role = ResourceRole::ProgramInput;
+    };
+
+    struct ProgramParameter
+    {
+        ProgramParameterKind kind = ProgramParameterKind::ConstantBuffer;
+        ProgramStage stage = ProgramStage::AllGraphics;
+        std::uint32_t registerIndex = 0;
+        std::uint32_t registerSpace = 0;
+
+        auto operator<=>(const ProgramParameter&) const = default;
+    };
+
+    struct DeviceCapabilities
+    {
+        bool rasterExecution = true;
+        bool computeExecution = true;
+        bool concurrentCompute = false;
+        bool rayExecution = false;
+        std::uint32_t constantDataAlignment = 256;
+        std::uint64_t localMemoryBudget = 0;
+    };
+
+    [[nodiscard]] AbstractState RequiredState(const ResourceAccess& access);
+    [[nodiscard]] const char* ToString(AbstractState state) noexcept;
+}

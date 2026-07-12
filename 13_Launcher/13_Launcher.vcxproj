@@ -1,0 +1,135 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64"><Configuration>Debug</Configuration><Platform>x64</Platform></ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64"><Configuration>Release</Configuration><Platform>x64</Platform></ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>18.0</VCProjectVersion>
+    <Keyword>Win32Proj</Keyword>
+    <ProjectGuid>{79C152F9-D814-41DE-880E-C7DFCE89E9D0}</ProjectGuid>
+    <RootNamespace>13_Launcher</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings" />
+  <ImportGroup Label="Shared" />
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <PropertyGroup>
+    <OutDir>$(SolutionDir)bin\$(Platform)\$(Configuration)\</OutDir>
+    <IntDir>$(SolutionDir)obj\13_Launcher\$(Platform)\$(Configuration)\</IntDir>
+    <TargetName>13_Launcher</TargetName>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ClCompile>
+      <WarningLevel>Level4</WarningLevel>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>_DEBUG;UNICODE;_UNICODE;NOMINMAX;WIN32_LEAN_AND_MEAN;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <AdditionalIncludeDirectories>$(SolutionDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalOptions>/utf-8 /permissive- /Zc:preprocessor %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalDependencies>d3d12.lib;dxgi.lib;dxguid.lib;d3dcompiler.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <WarningLevel>Level4</WarningLevel>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>NDEBUG;UNICODE;_UNICODE;NOMINMAX;WIN32_LEAN_AND_MEAN;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <AdditionalIncludeDirectories>$(SolutionDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalOptions>/utf-8 /permissive- /Zc:preprocessor %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalDependencies>d3d12.lib;dxgi.lib;dxguid.lib;d3dcompiler.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="main.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\00_Foundation\00_Foundation.vcxproj">
+      <Project>{27D93733-D8FB-414F-9FD8-8D73E3CA19F2}</Project>
+    </ProjectReference>
+    <ProjectReference Include="..\01_Platform\01_Platform.vcxproj">
+      <Project>{B6CBC834-95AB-407B-ADAD-71390173619B}</Project>
+    </ProjectReference>
+    <ProjectReference Include="..\02_GpuSemantics\02_GpuSemantics.vcxproj">
+      <Project>{160D73F5-5187-4EA6-835B-3DB9C88856E4}</Project>
+    </ProjectReference>
+    <ProjectReference Include="..\03_RenderIR\03_RenderIR.vcxproj">
+      <Project>{0EF02B28-A855-4676-80BF-0B2C6E7468C3}</Project>
+    </ProjectReference>
+    <ProjectReference Include="..\04_RenderCompiler\04_RenderCompiler.vcxproj">
+      <Project>{2697C7F4-8454-4510-9BCF-59604FE23F5E}</Project>
+    </ProjectReference>
+    <ProjectReference Include="..\05_RenderRuntime\05_RenderRuntime.vcxproj">
+      <Project>{F87EF94C-CE59-4F91-A72B-45071EABBD01}</Project>
+    </ProjectReference>
+    <ProjectReference Include="..\06_ShaderSystem\06_ShaderSystem.vcxproj">
+      <Project>{1E2D2AA6-6898-40A2-A0DD-5F4BFDA87133}</Project>
+    </ProjectReference>
+    <ProjectReference Include="..\07_D3D12Backend\07_D3D12Backend.vcxproj">
+      <Project>{A8DAB13F-30D2-431A-B704-55489A6CF238}</Project>
+    </ProjectReference>
+    <ProjectReference Include="..\08_ClassicalRasterFrontend\08_ClassicalRasterFrontend.vcxproj">
+      <Project>{337679C1-DE3C-4AF0-A194-040A1AD824FA}</Project>
+    </ProjectReference>
+    <ProjectReference Include="..\09_ExperimentalGeometry\09_ExperimentalGeometry.vcxproj">
+      <Project>{8AC70923-C1DE-472C-A26A-00F5B7B20762}</Project>
+    </ProjectReference>
+    <ProjectReference Include="..\10_Diagnostics\10_Diagnostics.vcxproj">
+      <Project>{5B6C6E8E-CE21-4FC4-AB3E-919E69EF23CD}</Project>
+    </ProjectReference>
+    <ProjectReference Include="..\12_CubeLab\12_CubeLab.vcxproj">
+      <Project>{80A319C6-8813-45A3-AC3B-01E56C4D9516}</Project>
+    </ProjectReference>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="..\Shaders\BasicColor.hlsl" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets" />
+  <Target Name="CopyShaderFiles" AfterTargets="Build">
+    <Error Condition="!Exists('$(SolutionDir)Shaders\BasicColor.hlsl')" Text="Shader file not found: $(SolutionDir)Shaders\BasicColor.hlsl" />
+    <MakeDir Directories="$(OutDir)Shaders" />
+    <Copy SourceFiles="$(SolutionDir)Shaders\BasicColor.hlsl"
+          DestinationFiles="$(OutDir)Shaders\BasicColor.hlsl"
+          SkipUnchangedFiles="true" />
+  </Target>
+</Project>

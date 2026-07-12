@@ -1,0 +1,8 @@
+.vs/
+bin/
+obj/
+**/x64/
+**/Debug/
+**/Release/
+execution_plan.txt
+work_graph.dot
