@@ -63,6 +63,20 @@ namespace sge::compiler
         gpu::QueueClass waitQueue = gpu::QueueClass::Direct;
     };
 
+    // Describes the state handoff required when the same execution plan is
+    // repeated. The last queue releases the resource to the neutral COMMON
+    // state so that the first queue of the next frame can acquire it legally.
+    struct FrameBoundaryTransition
+    {
+        gpu::ResourceId resource;
+        std::size_t afterScheduledWork = 0;
+        gpu::QueueClass releaseQueue = gpu::QueueClass::Direct;
+        gpu::AbstractState from = gpu::AbstractState::Undefined;
+        gpu::AbstractState to = gpu::AbstractState::Undefined;
+        gpu::QueueClass nextFrameQueue = gpu::QueueClass::Direct;
+        gpu::AbstractState nextFrameState = gpu::AbstractState::Undefined;
+    };
+
     struct ExecutionPlan
     {
         std::size_t structureHash = 0;
@@ -72,6 +86,7 @@ namespace sge::compiler
         std::vector<StateTransition> transitions;
         std::vector<ExecutableKey> executables;
         std::vector<QueueSynchronization> queueSynchronizations;
+        std::vector<FrameBoundaryTransition> frameBoundaryTransitions;
     };
 
     struct CompileResult
@@ -141,6 +156,10 @@ namespace sge::compiler
             const std::vector<DependencyEdge>& dependencies,
             const std::vector<std::size_t>& schedule,
             const std::vector<ScheduledWork>& works);
+
+        static std::vector<FrameBoundaryTransition>
+            PlanFrameBoundaryTransitions(
+                const std::vector<ScheduledWork>& works);
 
         std::shared_ptr<const ISchedulingPolicy> schedulingPolicy_;
     };

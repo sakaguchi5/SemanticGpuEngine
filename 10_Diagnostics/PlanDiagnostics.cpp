@@ -29,8 +29,6 @@ namespace sge::diagnostics
             const auto& work = module.works.at(scheduled.sourceWorkIndex);
 
             output << index << ": " << work.name << "\n";
-            output << "  queue "
-                   << static_cast<int>(scheduled.queue) << "\n";
             for (const auto& state : scheduled.requiredStates)
             {
                 output << "  resource "
@@ -39,16 +37,6 @@ namespace sge::diagnostics
                        << gpu::ToString(state.state)
                        << "\n";
             }
-        }
-
-        output << "\n[Queue synchronization]\n";
-        for (const auto& synchronization : plan.queueSynchronizations)
-        {
-            output << synchronization.signalScheduledWork
-                   << " -> " << synchronization.waitScheduledWork
-                   << " (queue " << static_cast<int>(synchronization.signalQueue)
-                   << " -> " << static_cast<int>(synchronization.waitQueue)
-                   << ")\n";
         }
 
         output << "\n[Dependencies]\n";
@@ -88,6 +76,25 @@ namespace sge::diagnostics
                    << "\n";
         }
 
+        output << "\n[Frame-boundary transitions]\n";
+        for (const auto& transition : plan.frameBoundaryTransitions)
+        {
+            output << module.Resource(transition.resource).name
+                   << ": "
+                   << gpu::ToString(transition.from)
+                   << " -> "
+                   << gpu::ToString(transition.to)
+                   << " after scheduled work "
+                   << transition.afterScheduledWork
+                   << ", release queue "
+                   << static_cast<int>(transition.releaseQueue)
+                   << ", next-frame queue "
+                   << static_cast<int>(transition.nextFrameQueue)
+                   << " requires "
+                   << gpu::ToString(transition.nextFrameState)
+                   << "\n";
+        }
+
         output << "\n[Normalized executables]\n";
         for (const auto& executable : plan.executables)
         {
@@ -98,7 +105,6 @@ namespace sge::diagnostics
                    << static_cast<int>(executable.rasterState.composition)
                    << ", depth="
                    << static_cast<int>(executable.rasterState.depth)
-                   << ", compute=" << executable.compute
                    << "\n";
         }
     }

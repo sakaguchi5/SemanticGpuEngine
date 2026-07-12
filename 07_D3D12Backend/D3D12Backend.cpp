@@ -208,6 +208,24 @@ namespace sge::d3d12::detail
                     "D3D12 backend received an unsupported work domain.");
             }
 
+            // Apply compiler-planned releases on the queue that performed the
+            // final use. This closes the cyclic edge from this frame's last use
+            // to the next frame's first use without issuing an illegal barrier
+            // on the consumer queue. AbstractState::Undefined maps to COMMON.
+            for (const auto& boundary : plan.frameBoundaryTransitions)
+            {
+                if (boundary.afterScheduledWork != scheduledIndex)
+                {
+                    continue;
+                }
+                if (boundary.releaseQueue != scheduled.queue)
+                {
+                    throw std::runtime_error(
+                        "Frame-boundary transition is assigned to the wrong queue.");
+                }
+                Transition(boundary.resource, boundary.to);
+            }
+
             ThrowIfFailed(commandList_->Close(),
                 "Close per-work command list");
             ID3D12CommandList* lists[] = {commandList_.Get()};

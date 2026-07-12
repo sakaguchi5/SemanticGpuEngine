@@ -234,6 +234,66 @@ namespace
         assert(result.plan.scheduledWorks[2].queue == gpu::QueueClass::Direct);
         assert(result.plan.queueSynchronizations.size() == 2);
         assert(result.plan.dependencies.size() == 3);
+
+        const auto copiedBoundary = std::find_if(
+            result.plan.frameBoundaryTransitions.begin(),
+            result.plan.frameBoundaryTransitions.end(),
+            [&](const compiler::FrameBoundaryTransition& transition)
+            {
+                return transition.resource == copied;
+            });
+        assert(copiedBoundary != result.plan.frameBoundaryTransitions.end());
+        assert(copiedBoundary->afterScheduledWork == 2);
+        assert(copiedBoundary->releaseQueue == gpu::QueueClass::Direct);
+        assert(copiedBoundary->from == gpu::AbstractState::VertexRead);
+        assert(copiedBoundary->to == gpu::AbstractState::Undefined);
+        assert(copiedBoundary->nextFrameQueue == gpu::QueueClass::Copy);
+        assert(copiedBoundary->nextFrameState
+            == gpu::AbstractState::TransferWrite);
+    }
+
+    void TestSingleQueuePlanNeedsNoFrameBoundaryRelease()
+    {
+        using namespace sge;
+        constexpr gpu::ResourceId data{0};
+
+        ir::SemanticModule module;
+        module.resources.push_back({
+            .id = data,
+            .name = "SingleQueueData",
+            .memoryClass = gpu::MemoryClass::Transient,
+            .description = ir::BufferDescription{
+                .sizeBytes = 64,
+                .usage = ir::BufferUsage::Storage
+            }
+        });
+        module.programs.push_back({
+            .id = gpu::ProgramId{0},
+            .name = "SingleQueueCompute",
+            .computeEntry = "CSMain",
+            .parameters = {{
+                .name = "Output",
+                .kind = gpu::ProgramParameterKind::UnorderedAccess,
+                .stage = gpu::ProgramStage::Compute
+            }}
+        });
+        module.works.push_back({
+            .id = gpu::WorkId{0},
+            .name = "Write",
+            .accesses = {{data, gpu::AccessMode::Write,
+                gpu::ResourceRole::ProgramOutput}},
+            .payload = ir::ComputeWork{
+                .program = gpu::ProgramId{0},
+                .bindings = {{0, data}}
+            }
+        });
+
+        gpu::DeviceCapabilities capabilities;
+        capabilities.computeExecution = true;
+        capabilities.concurrentCompute = false;
+        const auto result = compiler::RenderCompiler{}.Compile(
+            module, capabilities);
+        assert(result.plan.frameBoundaryTransitions.empty());
     }
 
     void TestTransientTextureAliasingPlan()
@@ -474,6 +534,21 @@ namespace
                 return edge.before == 1 && edge.after == 5;
             });
         assert(copyToRaster != result.plan.dependencies.end());
+
+        const auto copiedBoundary = std::find_if(
+            result.plan.frameBoundaryTransitions.begin(),
+            result.plan.frameBoundaryTransitions.end(),
+            [&](const compiler::FrameBoundaryTransition& transition)
+            {
+                return module.Resource(transition.resource).name
+                    == "ComputeGeneratedVertexBuffer";
+            });
+        assert(copiedBoundary != result.plan.frameBoundaryTransitions.end());
+        assert(copiedBoundary->releaseQueue == gpu::QueueClass::Direct);
+        assert(copiedBoundary->nextFrameQueue == gpu::QueueClass::Copy);
+        assert(copiedBoundary->from == gpu::AbstractState::VertexRead);
+        assert(copiedBoundary->nextFrameState
+            == gpu::AbstractState::TransferWrite);
     }
 }
 
@@ -485,6 +560,7 @@ int main()
         TestUnsupportedWorkFails();
         TestPayloadAccessMismatchFails();
         TestComputeCopyRasterAndQueues();
+        TestSingleQueuePlanNeedsNoFrameBoundaryRelease();
         TestTransientTextureAliasingPlan();
         TestAliasingChecksWholeAllocationSlot();
         TestCrossQueueUnorderedResourcesDoNotAlias();

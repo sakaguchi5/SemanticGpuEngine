@@ -233,6 +233,8 @@ namespace sge::compiler
         result.plan.transitions = PlanTransitions(result.plan.scheduledWorks);
         result.plan.queueSynchronizations = PlanQueueSynchronization(
             result.plan.dependencies, schedule, result.plan.scheduledWorks);
+        result.plan.frameBoundaryTransitions =
+            PlanFrameBoundaryTransitions(result.plan.scheduledWorks);
 
         for (const auto& scheduled : result.plan.scheduledWorks)
         {
@@ -261,7 +263,9 @@ namespace sge::compiler
             + std::to_string(result.plan.dependencies.size())
             + " dependencies, "
             + std::to_string(result.plan.transitions.size())
-            + " abstract transitions.");
+            + " abstract transitions, "
+            + std::to_string(result.plan.frameBoundaryTransitions.size())
+            + " frame-boundary releases.");
         result.diagnostics.push_back(
             std::string("Scheduling policy: ") + schedulingPolicy_->Name());
         result.diagnostics.push_back(
@@ -863,6 +867,95 @@ namespace sge::compiler
         }
 
         return transitions;
+    }
+
+    std::vector<FrameBoundaryTransition>
+        RenderCompiler::PlanFrameBoundaryTransitions(
+            const std::vector<ScheduledWork>& works)
+    {
+        struct RepeatedUse
+        {
+            gpu::ResourceId resource;
+            std::size_t firstScheduledWork = 0;
+            gpu::QueueClass firstQueue = gpu::QueueClass::Direct;
+            gpu::AbstractState firstState = gpu::AbstractState::Undefined;
+            std::size_t lastScheduledWork = 0;
+            gpu::QueueClass lastQueue = gpu::QueueClass::Direct;
+            gpu::AbstractState lastState = gpu::AbstractState::Undefined;
+        };
+
+        std::vector<RepeatedUse> uses;
+        std::unordered_map<
+            gpu::ResourceId,
+            std::size_t,
+            foundation::StrongIdHash<gpu::ResourceTag>> useIndices;
+
+        for (std::size_t scheduledIndex = 0;
+             scheduledIndex < works.size();
+             ++scheduledIndex)
+        {
+            const auto& scheduled = works[scheduledIndex];
+            for (const auto& requirement : scheduled.requiredStates)
+            {
+                const auto found = useIndices.find(requirement.resource);
+                if (found == useIndices.end())
+                {
+                    useIndices.emplace(requirement.resource, uses.size());
+                    uses.push_back({
+                        .resource = requirement.resource,
+                        .firstScheduledWork = scheduledIndex,
+                        .firstQueue = scheduled.queue,
+                        .firstState = requirement.state,
+                        .lastScheduledWork = scheduledIndex,
+                        .lastQueue = scheduled.queue,
+                        .lastState = requirement.state
+                    });
+                    continue;
+                }
+
+                auto& use = uses[found->second];
+                use.lastScheduledWork = scheduledIndex;
+                use.lastQueue = scheduled.queue;
+                use.lastState = requirement.state;
+            }
+        }
+
+        std::vector<FrameBoundaryTransition> result;
+        for (const auto& use : uses)
+        {
+            // A repeated plan is cyclic: the last use is followed by the first
+            // use of the next frame. A queue change requires the producer queue
+            // to release the resource to COMMON before that cycle edge.
+            if (use.lastQueue == use.firstQueue)
+            {
+                continue;
+            }
+
+            result.push_back({
+                .resource = use.resource,
+                .afterScheduledWork = use.lastScheduledWork,
+                .releaseQueue = use.lastQueue,
+                .from = use.lastState,
+                .to = gpu::AbstractState::Undefined,
+                .nextFrameQueue = use.firstQueue,
+                .nextFrameState = use.firstState
+            });
+        }
+
+        std::sort(
+            result.begin(),
+            result.end(),
+            [](const FrameBoundaryTransition& left,
+               const FrameBoundaryTransition& right)
+            {
+                if (left.afterScheduledWork != right.afterScheduledWork)
+                {
+                    return left.afterScheduledWork < right.afterScheduledWork;
+                }
+                return left.resource.Value() < right.resource.Value();
+            });
+
+        return result;
     }
 
     std::vector<QueueSynchronization> RenderCompiler::PlanQueueSynchronization(
