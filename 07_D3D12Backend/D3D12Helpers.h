@@ -19,6 +19,14 @@ namespace sge::d3d12::detail
     [[nodiscard]] D3D12_RESOURCE_DESC BufferDescription(
         UINT64 size) noexcept;
 
+    [[nodiscard]] DXGI_FORMAT NativeFormat(
+        gpu::ResourceFormat format) noexcept;
+
+    [[nodiscard]] D3D12_RESOURCE_DESC TextureDescription(
+        const ir::TextureDescription& texture,
+        UINT fallbackWidth,
+        UINT fallbackHeight) noexcept;
+
     [[nodiscard]] D3D12_RASTERIZER_DESC RasterizerDescription() noexcept;
 
     [[nodiscard]] D3D12_BLEND_DESC BlendDescription(

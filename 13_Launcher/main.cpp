@@ -4,6 +4,7 @@
 #include "12_CubeLab/CubeExperiment.h"
 
 #include <exception>
+#include <fstream>
 #include <utility>
 #include <windows.h>
 
@@ -61,6 +62,8 @@ int WINAPI wWinMain(
     }
     catch (const std::exception& error)
     {
+        std::ofstream("semantic_gpu_error.txt", std::ios::trunc)
+            << error.what() << '\n';
         MessageBoxA(
             nullptr,
             error.what(),

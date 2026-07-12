@@ -29,6 +29,8 @@ namespace sge::diagnostics
             const auto& work = module.works.at(scheduled.sourceWorkIndex);
 
             output << index << ": " << work.name << "\n";
+            output << "  queue "
+                   << static_cast<int>(scheduled.queue) << "\n";
             for (const auto& state : scheduled.requiredStates)
             {
                 output << "  resource "
@@ -37,6 +39,16 @@ namespace sge::diagnostics
                        << gpu::ToString(state.state)
                        << "\n";
             }
+        }
+
+        output << "\n[Queue synchronization]\n";
+        for (const auto& synchronization : plan.queueSynchronizations)
+        {
+            output << synchronization.signalScheduledWork
+                   << " -> " << synchronization.waitScheduledWork
+                   << " (queue " << static_cast<int>(synchronization.signalQueue)
+                   << " -> " << static_cast<int>(synchronization.waitQueue)
+                   << ")\n";
         }
 
         output << "\n[Dependencies]\n";
@@ -86,6 +98,7 @@ namespace sge::diagnostics
                    << static_cast<int>(executable.rasterState.composition)
                    << ", depth="
                    << static_cast<int>(executable.rasterState.depth)
+                   << ", compute=" << executable.compute
                    << "\n";
         }
     }

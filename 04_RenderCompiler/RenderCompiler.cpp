@@ -25,6 +25,21 @@ namespace
 
 namespace sge::compiler
 {
+    RenderCompiler::RenderCompiler()
+        : RenderCompiler(std::make_shared<StableDeclarationOrderPolicy>())
+    {
+    }
+
+    RenderCompiler::RenderCompiler(
+        std::shared_ptr<const ISchedulingPolicy> policy)
+        : schedulingPolicy_(std::move(policy))
+    {
+        if (!schedulingPolicy_)
+        {
+            throw std::invalid_argument("Scheduling policy must not be null.");
+        }
+    }
+
     CompileResult RenderCompiler::Compile(
         const ir::SemanticModule& module,
         const gpu::DeviceCapabilities& capabilities) const
@@ -35,18 +50,22 @@ namespace sge::compiler
         Validate(module, capabilities, result.diagnostics);
         result.plan.dependencies = AnalyzeDependencies(module);
 
-        const auto schedule = Schedule(
-            module.works.size(),
-            result.plan.dependencies);
+        const auto schedule = schedulingPolicy_->Schedule(
+            module, result.plan.dependencies);
 
-        result.plan.lifetimes = AnalyzeLifetimes(module, schedule);
-        result.plan.scheduledWorks = BuildScheduledWorks(module, schedule);
+        result.plan.lifetimes = AnalyzeLifetimes(
+            module, schedule, capabilities.resourceAliasing);
+        result.plan.scheduledWorks = BuildScheduledWorks(
+            module, schedule, capabilities);
         result.plan.transitions = PlanTransitions(result.plan.scheduledWorks);
+        result.plan.queueSynchronizations = PlanQueueSynchronization(
+            result.plan.dependencies, schedule, result.plan.scheduledWorks);
 
         for (const auto& scheduled : result.plan.scheduledWorks)
         {
             const auto& source = module.works.at(scheduled.sourceWorkIndex);
-            if (source.domain != gpu::ExecutionDomain::Raster)
+            if (source.Domain() != gpu::ExecutionDomain::Raster
+                && source.Domain() != gpu::ExecutionDomain::Compute)
             {
                 continue;
             }
@@ -70,6 +89,8 @@ namespace sge::compiler
             + " dependencies, "
             + std::to_string(result.plan.transitions.size())
             + " abstract transitions.");
+        result.diagnostics.push_back(
+            std::string("Scheduling policy: ") + schedulingPolicy_->Name());
 
         return result;
     }
@@ -92,17 +113,17 @@ namespace sge::compiler
                     "Semantic validation failed: invalid or duplicate resource ID.");
             }
 
-            if (resource.kind == gpu::ResourceKind::Buffer
+            if (resource.Kind() == gpu::ResourceKind::Buffer
                 && resource.memoryClass != gpu::MemoryClass::DynamicPerFrame
                 && resource.memoryClass != gpu::MemoryClass::External
-                && resource.sizeBytes == 0)
+                && resource.SizeBytes() == 0)
             {
                 throw std::runtime_error(
                     "Semantic validation failed: non-dynamic buffer has zero size.");
             }
 
             if (resource.memoryClass == gpu::MemoryClass::Static
-                && resource.data.size() != resource.sizeBytes)
+                && resource.data.size() != resource.SizeBytes())
             {
                 throw std::runtime_error(
                     "Semantic validation failed: static resource data size mismatch.");
@@ -128,7 +149,9 @@ namespace sge::compiler
                     "Semantic validation failed: invalid or duplicate work ID.");
             }
 
-            if (work.domain == gpu::ExecutionDomain::Raster)
+            const auto domain = work.Domain();
+
+            if (domain == gpu::ExecutionDomain::Raster)
             {
                 if (!capabilities.rasterExecution)
                 {
@@ -136,30 +159,63 @@ namespace sge::compiler
                         "Semantic validation failed: raster execution is unavailable.");
                 }
 
-                if (!programIds.contains(work.program.Value()))
+                const auto& raster = std::get<ir::RasterWork>(work.payload);
+                if (!programIds.contains(raster.program.Value()))
                 {
                     throw std::runtime_error(
                         "Semantic validation failed: raster work references an unknown program.");
                 }
 
-                if (!resourceIds.contains(work.vertexResource.Value()))
+                if (!resourceIds.contains(raster.vertexResource.Value()))
                 {
                     throw std::runtime_error(
                         "Semantic validation failed: raster work has no valid vertex resource.");
                 }
 
-                if (!resourceIds.contains(work.constantResource.Value()))
+                if (raster.attachments.colors.empty())
                 {
                     throw std::runtime_error(
-                        "Semantic validation failed: raster work has no valid constant resource.");
+                        "Semantic validation failed: raster work has no color attachment.");
                 }
             }
 
-            if (work.domain == gpu::ExecutionDomain::Compute
-                && !capabilities.computeExecution)
+            if (domain == gpu::ExecutionDomain::Compute)
+            {
+                if (!capabilities.computeExecution)
+                {
+                    throw std::runtime_error(
+                        "Semantic validation failed: compute execution is unavailable.");
+                }
+                const auto& compute = std::get<ir::ComputeWork>(work.payload);
+                if (!programIds.contains(compute.program.Value()))
+                {
+                    throw std::runtime_error(
+                        "Semantic validation failed: compute work references an unknown program.");
+                }
+                if (compute.groupCountX == 0 || compute.groupCountY == 0
+                    || compute.groupCountZ == 0)
+                {
+                    throw std::runtime_error(
+                        "Semantic validation failed: compute group count is zero.");
+                }
+            }
+
+            if (domain == gpu::ExecutionDomain::Copy
+                && !capabilities.copyExecution)
             {
                 throw std::runtime_error(
-                    "Semantic validation failed: compute execution is unavailable.");
+                    "Semantic validation failed: copy execution is unavailable.");
+            }
+            if (domain == gpu::ExecutionDomain::Copy)
+            {
+                const auto& copy = std::get<ir::CopyWork>(work.payload);
+                if (!resourceIds.contains(copy.source.Value())
+                    || !resourceIds.contains(copy.destination.Value())
+                    || copy.source == copy.destination)
+                {
+                    throw std::runtime_error(
+                        "Semantic validation failed: invalid copy resources.");
+                }
             }
 
             for (const auto& access : work.accesses)
@@ -169,6 +225,52 @@ namespace sge::compiler
                     throw std::runtime_error(
                         "Semantic validation failed: work references an unknown resource.");
                 }
+            }
+
+            const auto validateBindings = [&](const auto& bindings,
+                                              gpu::ProgramId programId)
+            {
+                const auto& program = module.Program(programId);
+                std::unordered_set<std::uint32_t> bound;
+                for (const auto& binding : bindings)
+                {
+                    if (binding.parameterIndex >= program.parameters.size()
+                        || !resourceIds.contains(binding.resource.Value())
+                        || !bound.insert(binding.parameterIndex).second)
+                    {
+                        throw std::runtime_error(
+                            "Semantic validation failed: invalid or duplicate program binding.");
+                    }
+                    if (program.parameters[binding.parameterIndex].kind
+                        == gpu::ProgramParameterKind::Sampler)
+                    {
+                        throw std::runtime_error(
+                            "Semantic validation failed: static samplers must not have resource bindings.");
+                    }
+                }
+                const auto requiredBindings = static_cast<std::size_t>(std::count_if(
+                    program.parameters.begin(), program.parameters.end(),
+                    [](const gpu::ProgramParameter& parameter)
+                    {
+                        return parameter.kind
+                            != gpu::ProgramParameterKind::Sampler;
+                    }));
+                if (bound.size() != requiredBindings)
+                {
+                    throw std::runtime_error(
+                        "Semantic validation failed: not all program parameters are bound.");
+                }
+            };
+
+            if (domain == gpu::ExecutionDomain::Raster)
+            {
+                const auto& raster = std::get<ir::RasterWork>(work.payload);
+                validateBindings(raster.bindings, raster.program);
+            }
+            else if (domain == gpu::ExecutionDomain::Compute)
+            {
+                const auto& compute = std::get<ir::ComputeWork>(work.payload);
+                validateBindings(compute.bindings, compute.program);
             }
         }
 
@@ -251,7 +353,7 @@ namespace sge::compiler
         return edges;
     }
 
-    std::vector<std::size_t> RenderCompiler::Schedule(
+    std::vector<std::size_t> RenderCompiler::StableSchedule(
         std::size_t workCount,
         const std::vector<DependencyEdge>& dependencies)
     {
@@ -305,9 +407,22 @@ namespace sge::compiler
         return result;
     }
 
+    std::vector<std::size_t> StableDeclarationOrderPolicy::Schedule(
+        const ir::SemanticModule& module,
+        const std::vector<DependencyEdge>& dependencies) const
+    {
+        return RenderCompiler::StableSchedule(module.works.size(), dependencies);
+    }
+
+    const char* StableDeclarationOrderPolicy::Name() const noexcept
+    {
+        return "StableDeclarationOrder";
+    }
+
     std::vector<ResourceLifetime> RenderCompiler::AnalyzeLifetimes(
         const ir::SemanticModule& module,
-        const std::vector<std::size_t>& schedule)
+        const std::vector<std::size_t>& schedule,
+        bool allowAliasing)
     {
         struct Range
         {
@@ -348,7 +463,8 @@ namespace sge::compiler
 
             gpu::PhysicalAllocationId allocation{nextAllocation++};
 
-            if (resource.memoryClass == gpu::MemoryClass::Transient)
+            if (allowAliasing
+                && resource.memoryClass == gpu::MemoryClass::Transient)
             {
                 for (const auto& existing : lifetimes)
                 {
@@ -358,9 +474,9 @@ namespace sge::compiler
                     const bool compatible =
                         existingResource.memoryClass
                             == gpu::MemoryClass::Transient
-                        && existingResource.kind == resource.kind
-                        && existingResource.format == resource.format
-                        && existingResource.sizeBytes >= resource.sizeBytes;
+                        && existingResource.Kind() == resource.Kind()
+                        && existingResource.Format() == resource.Format()
+                        && existingResource.description == resource.description;
 
                     const bool disjoint =
                         existing.lastUse < range->second.first
@@ -387,7 +503,8 @@ namespace sge::compiler
 
     std::vector<ScheduledWork> RenderCompiler::BuildScheduledWorks(
         const ir::SemanticModule& module,
-        const std::vector<std::size_t>& schedule)
+        const std::vector<std::size_t>& schedule,
+        const gpu::DeviceCapabilities& capabilities)
     {
         std::vector<ScheduledWork> result;
         result.reserve(schedule.size());
@@ -398,10 +515,42 @@ namespace sge::compiler
 
             ScheduledWork scheduled;
             scheduled.sourceWorkIndex = sourceIndex;
-            scheduled.executable = {
-                .program = source.program,
-                .rasterState = source.rasterState
-            };
+
+            switch (source.Domain())
+            {
+            case gpu::ExecutionDomain::Raster:
+            {
+                const auto& raster = std::get<ir::RasterWork>(source.payload);
+                scheduled.executable = {
+                    .program = raster.program,
+                    .rasterState = raster.rasterState,
+                    .compute = false
+                };
+                scheduled.queue = gpu::QueueClass::Direct;
+                break;
+            }
+            case gpu::ExecutionDomain::Compute:
+            {
+                const auto& compute = std::get<ir::ComputeWork>(source.payload);
+                scheduled.executable = {
+                    .program = compute.program,
+                    .rasterState = {},
+                    .compute = true
+                };
+                scheduled.queue = capabilities.concurrentCompute
+                    ? gpu::QueueClass::Compute
+                    : gpu::QueueClass::Direct;
+                break;
+            }
+            case gpu::ExecutionDomain::Copy:
+                scheduled.queue = capabilities.dedicatedCopyQueue
+                    ? gpu::QueueClass::Copy
+                    : gpu::QueueClass::Direct;
+                break;
+            case gpu::ExecutionDomain::Present:
+                scheduled.queue = gpu::QueueClass::Direct;
+                break;
+            }
 
             for (const auto& access : source.accesses)
             {
@@ -467,5 +616,34 @@ namespace sge::compiler
         }
 
         return transitions;
+    }
+
+    std::vector<QueueSynchronization> RenderCompiler::PlanQueueSynchronization(
+        const std::vector<DependencyEdge>& dependencies,
+        const std::vector<std::size_t>& schedule,
+        const std::vector<ScheduledWork>& works)
+    {
+        std::vector<std::size_t> scheduledPosition(schedule.size());
+        for (std::size_t index = 0; index < schedule.size(); ++index)
+        {
+            scheduledPosition.at(schedule[index]) = index;
+        }
+
+        std::vector<QueueSynchronization> result;
+        for (const auto& dependency : dependencies)
+        {
+            const auto before = scheduledPosition.at(dependency.before);
+            const auto after = scheduledPosition.at(dependency.after);
+            if (works.at(before).queue != works.at(after).queue)
+            {
+                result.push_back({
+                    .signalScheduledWork = before,
+                    .waitScheduledWork = after,
+                    .signalQueue = works.at(before).queue,
+                    .waitQueue = works.at(after).queue
+                });
+            }
+        }
+        return result;
     }
 }

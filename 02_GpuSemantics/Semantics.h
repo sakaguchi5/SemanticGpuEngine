@@ -3,6 +3,7 @@
 #include "00_Foundation/StrongId.h"
 
 #include <cstdint>
+#include <string>
 
 namespace sge::gpu
 {
@@ -19,7 +20,9 @@ namespace sge::gpu
     enum class ResourceKind
     {
         Buffer,
+        Texture1D,
         Texture2D,
+        Texture3D,
         Presentation
     };
 
@@ -112,7 +115,15 @@ namespace sge::gpu
     {
         Vertex,
         Pixel,
+        Compute,
         AllGraphics
+    };
+
+    enum class QueueClass
+    {
+        Direct,
+        Compute,
+        Copy
     };
 
     struct ResourceAccess
@@ -124,6 +135,7 @@ namespace sge::gpu
 
     struct ProgramParameter
     {
+        std::string name;
         ProgramParameterKind kind = ProgramParameterKind::ConstantBuffer;
         ProgramStage stage = ProgramStage::AllGraphics;
         std::uint32_t registerIndex = 0;
@@ -135,8 +147,11 @@ namespace sge::gpu
     struct DeviceCapabilities
     {
         bool rasterExecution = true;
-        bool computeExecution = true;
+        bool computeExecution = false;
+        bool copyExecution = false;
         bool concurrentCompute = false;
+        bool dedicatedCopyQueue = false;
+        bool resourceAliasing = false;
         bool rayExecution = false;
         std::uint32_t constantDataAlignment = 256;
         std::uint64_t localMemoryBudget = 0;

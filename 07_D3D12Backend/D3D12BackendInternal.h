@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <optional>
 #include <unordered_map>
+#include <vector>
 
 namespace sge::d3d12::detail
 {
@@ -24,7 +25,9 @@ namespace sge::d3d12::detail
     {
         shader::CompiledShader vertex;
         shader::CompiledShader pixel;
+        shader::CompiledShader compute;
         Microsoft::WRL::ComPtr<ID3D12RootSignature> rootSignature;
+        std::vector<UINT> rootParameterIndices;
     };
 
     struct ResourceRecord
@@ -32,6 +35,12 @@ namespace sge::d3d12::detail
         Microsoft::WRL::ComPtr<ID3D12Resource> resource;
         D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
         D3D12_VERTEX_BUFFER_VIEW vertexView{};
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv{};
+        D3D12_CPU_DESCRIPTOR_HANDLE dsv{};
+        D3D12_GPU_DESCRIPTOR_HANDLE shaderDescriptor{};
+        bool hasRtv = false;
+        bool hasDsv = false;
+        bool hasShaderDescriptor = false;
     };
 
     struct FrameContext
@@ -67,6 +76,10 @@ namespace sge::d3d12::detail
         void CreateRenderTargets();
         void CreateDepthBuffer();
         void ResizeIfNeeded();
+        [[nodiscard]] ID3D12CommandQueue* QueueFor(
+            gpu::QueueClass queue) const noexcept;
+        [[nodiscard]] static D3D12_COMMAND_LIST_TYPE CommandListType(
+            gpu::QueueClass queue) noexcept;
 
         void EnsureCompiled(
             const ir::SemanticModule& module,
@@ -75,12 +88,17 @@ namespace sge::d3d12::detail
         [[nodiscard]] ResourceRecord CreateStaticBuffer(
             const ir::ResourceDeclaration& declaration);
 
+        [[nodiscard]] ResourceRecord CreateTexture(
+            const ir::ResourceDeclaration& declaration,
+            ID3D12Heap* aliasHeap = nullptr);
+
         [[nodiscard]] ProgramRecord CreateProgram(
             const ir::ProgramDeclaration& declaration);
 
         [[nodiscard]] Microsoft::WRL::ComPtr<ID3D12RootSignature>
             CreateRootSignature(
-                const ir::ProgramDeclaration& declaration);
+                const ir::ProgramDeclaration& declaration,
+                std::vector<UINT>& rootParameterIndices);
 
         [[nodiscard]] Microsoft::WRL::ComPtr<ID3D12PipelineState>
             CreatePipeline(const compiler::ExecutableKey& executable);
@@ -96,9 +114,27 @@ namespace sge::d3d12::detail
             const ir::WorkDeclaration& work,
             FrameContext& frame);
 
+        void ExecuteComputeWork(
+            const ir::SemanticModule& module,
+            const ir::WorkDeclaration& work,
+            FrameContext& frame);
+
+        void ExecuteCopyWork(
+            const ir::SemanticModule& module,
+            const ir::WorkDeclaration& work);
+
+        void BindResources(
+            const ir::SemanticModule& module,
+            gpu::ProgramId program,
+            const std::vector<ir::ResourceBinding>& bindings,
+            FrameContext& frame,
+            bool compute);
+
         void Transition(
             gpu::ResourceId resource,
             gpu::AbstractState abstractState);
+
+        void ActivateAliasedResource(gpu::ResourceId resource);
 
         HWND window_ = nullptr;
         UINT width_ = 0;
@@ -110,9 +146,17 @@ namespace sge::d3d12::detail
         Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter_;
         Microsoft::WRL::ComPtr<ID3D12Device> device_;
         Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue_;
+        Microsoft::WRL::ComPtr<ID3D12CommandQueue> computeQueue_;
+        Microsoft::WRL::ComPtr<ID3D12CommandQueue> copyQueue_;
         Microsoft::WRL::ComPtr<IDXGISwapChain3> swapChain_;
         Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> rtvHeap_;
         Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> dsvHeap_;
+        Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> shaderHeap_;
+        UINT dsvIncrement_ = 0;
+        UINT shaderIncrement_ = 0;
+        UINT nextRtvDescriptor_ = FrameCount;
+        UINT nextDsvDescriptor_ = 1;
+        UINT nextShaderDescriptor_ = 0;
 
         std::array<
             Microsoft::WRL::ComPtr<ID3D12Resource>,
@@ -132,6 +176,10 @@ namespace sge::d3d12::detail
         Microsoft::WRL::ComPtr<ID3D12Fence> fence_;
         HANDLE fenceEvent_ = nullptr;
         UINT64 nextFenceValue_ = 1;
+        std::vector<Microsoft::WRL::ComPtr<ID3D12CommandAllocator>>
+            inFlightAllocators_;
+        std::vector<Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList>>
+            inFlightLists_;
 
         shader::ShaderCompiler shaderCompiler_;
 
@@ -139,6 +187,21 @@ namespace sge::d3d12::detail
             gpu::ResourceId,
             ResourceRecord,
             foundation::StrongIdHash<gpu::ResourceTag>> staticResources_;
+
+        std::unordered_map<
+            gpu::ResourceId,
+            gpu::PhysicalAllocationId,
+            foundation::StrongIdHash<gpu::ResourceTag>> physicalAllocations_;
+
+        std::unordered_map<
+            gpu::PhysicalAllocationId,
+            Microsoft::WRL::ComPtr<ID3D12Heap>,
+            foundation::StrongIdHash<gpu::PhysicalAllocationTag>> allocationHeaps_;
+
+        std::unordered_map<
+            gpu::PhysicalAllocationId,
+            gpu::ResourceId,
+            foundation::StrongIdHash<gpu::PhysicalAllocationTag>> activeAliasedResources_;
 
         std::unordered_map<
             gpu::ProgramId,

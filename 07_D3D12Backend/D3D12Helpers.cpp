@@ -56,6 +56,54 @@ namespace sge::d3d12::detail
         return description;
     }
 
+    DXGI_FORMAT NativeFormat(gpu::ResourceFormat format) noexcept
+    {
+        switch (format)
+        {
+        case gpu::ResourceFormat::Rgba8Unorm:
+            return DXGI_FORMAT_R8G8B8A8_UNORM;
+        case gpu::ResourceFormat::Depth32Float:
+            return DXGI_FORMAT_D32_FLOAT;
+        default:
+            return DXGI_FORMAT_UNKNOWN;
+        }
+    }
+
+    D3D12_RESOURCE_DESC TextureDescription(
+        const ir::TextureDescription& texture,
+        UINT fallbackWidth,
+        UINT fallbackHeight) noexcept
+    {
+        D3D12_RESOURCE_DESC description{};
+        description.Dimension = texture.dimension == gpu::ResourceKind::Texture3D
+            ? D3D12_RESOURCE_DIMENSION_TEXTURE3D
+            : texture.dimension == gpu::ResourceKind::Texture1D
+                ? D3D12_RESOURCE_DIMENSION_TEXTURE1D
+                : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        description.Width = texture.width == 0 ? fallbackWidth : texture.width;
+        description.Height = texture.dimension == gpu::ResourceKind::Texture1D
+            ? 1u : (texture.height == 0 ? fallbackHeight : texture.height);
+        description.DepthOrArraySize = texture.depth;
+        description.MipLevels = texture.mipLevels;
+        description.Format = NativeFormat(texture.format);
+        description.SampleDesc.Count = 1;
+        description.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        const auto usage = static_cast<std::uint32_t>(texture.usage);
+        if ((usage & static_cast<std::uint32_t>(ir::TextureUsage::ColorAttachment)) != 0)
+        {
+            description.Flags |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        }
+        if ((usage & static_cast<std::uint32_t>(ir::TextureUsage::DepthAttachment)) != 0)
+        {
+            description.Flags |= D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+        }
+        if ((usage & static_cast<std::uint32_t>(ir::TextureUsage::Storage)) != 0)
+        {
+            description.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        }
+        return description;
+    }
+
     D3D12_RASTERIZER_DESC RasterizerDescription() noexcept
     {
         D3D12_RASTERIZER_DESC description{};
@@ -190,6 +238,7 @@ namespace sge::d3d12::detail
         foundation::HashEnum(seed, key.rasterState.topology);
         foundation::HashEnum(seed, key.rasterState.composition);
         foundation::HashEnum(seed, key.rasterState.depth);
+        foundation::HashCombine(seed, key.compute);
         return seed;
     }
 }

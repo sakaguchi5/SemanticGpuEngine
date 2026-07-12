@@ -61,6 +61,10 @@ namespace sge::d3d12::detail
         gpu::DeviceCapabilities capabilities;
         capabilities.rasterExecution = true;
         capabilities.computeExecution = true;
+        capabilities.copyExecution = true;
+        capabilities.resourceAliasing = true;
+        capabilities.concurrentCompute = true;
+        capabilities.dedicatedCopyQueue = true;
         capabilities.constantDataAlignment =
             D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT;
 
@@ -92,17 +96,15 @@ namespace sge::d3d12::detail
 
         EnsureCompiled(module, plan);
 
+        // Per-work command lists make queue crossings explicit. The reference
+        // backend waits for the preceding frame before recycling them; this is
+        // intentionally conservative and keeps queue synchronization correct.
+        WaitIdle();
+        inFlightAllocators_.clear();
+        inFlightLists_.clear();
+
         FrameContext& frame = frames_[frameIndex_];
-        WaitForFrame(frame);
         frame.uploadOffset = 0;
-
-        ThrowIfFailed(
-            frame.allocator->Reset(),
-            "CommandAllocator::Reset");
-
-        ThrowIfFailed(
-            commandList_->Reset(frame.allocator.Get(), nullptr),
-            "GraphicsCommandList::Reset");
 
         const D3D12_VIEWPORT viewport{
             0.0f,
@@ -120,31 +122,85 @@ namespace sge::d3d12::detail
             static_cast<LONG>(height_)
         };
 
-        commandList_->RSSetViewports(1, &viewport);
-        commandList_->RSSetScissorRects(1, &scissor);
-
-        for (const auto& scheduled : plan.scheduledWorks)
+        std::vector<UINT64> workSignals(plan.scheduledWorks.size(), 0);
+        for (std::size_t scheduledIndex = 0;
+             scheduledIndex < plan.scheduledWorks.size();
+             ++scheduledIndex)
         {
+            const auto& scheduled = plan.scheduledWorks[scheduledIndex];
             const auto& work = module.works.at(
                 scheduled.sourceWorkIndex);
 
+            auto* nativeQueue = QueueFor(scheduled.queue);
+            const auto listType = CommandListType(scheduled.queue);
+
+            for (const auto& synchronization : plan.queueSynchronizations)
+            {
+                if (synchronization.waitScheduledWork == scheduledIndex)
+                {
+                    const auto value = workSignals.at(
+                        synchronization.signalScheduledWork);
+                    ThrowIfFailed(nativeQueue->Wait(fence_.Get(), value),
+                        "Cross-queue wait");
+                }
+            }
+
+            ComPtr<ID3D12CommandAllocator> allocator;
+            ComPtr<ID3D12GraphicsCommandList> list;
+            ThrowIfFailed(device_->CreateCommandAllocator(
+                listType, IID_PPV_ARGS(&allocator)),
+                "Create per-work command allocator");
+            ThrowIfFailed(device_->CreateCommandList(
+                0, listType, allocator.Get(), nullptr,
+                IID_PPV_ARGS(&list)),
+                "Create per-work command list");
+            commandList_ = list;
+
+            if (scheduled.queue != gpu::QueueClass::Copy)
+            {
+                ID3D12DescriptorHeap* descriptorHeaps[] = {shaderHeap_.Get()};
+                commandList_->SetDescriptorHeaps(1, descriptorHeaps);
+            }
+            if (scheduled.queue == gpu::QueueClass::Direct)
+            {
+                commandList_->RSSetViewports(1, &viewport);
+                commandList_->RSSetScissorRects(1, &scissor);
+            }
+
             for (const auto& requirement : scheduled.requiredStates)
             {
+                ActivateAliasedResource(requirement.resource);
                 Transition(requirement.resource, requirement.state);
             }
 
-            if (work.domain == gpu::ExecutionDomain::Raster)
+            if (work.Domain() == gpu::ExecutionDomain::Raster)
             {
                 ExecuteRasterWork(module, work, frame);
             }
+            else if (work.Domain() == gpu::ExecutionDomain::Compute)
+            {
+                ExecuteComputeWork(module, work, frame);
+            }
+            else if (work.Domain() == gpu::ExecutionDomain::Copy)
+            {
+                ExecuteCopyWork(module, work);
+            }
+            else if (work.Domain() != gpu::ExecutionDomain::Present)
+            {
+                throw std::runtime_error(
+                    "D3D12 backend received an unsupported work domain.");
+            }
+
+            ThrowIfFailed(commandList_->Close(), "Close per-work command list");
+            ID3D12CommandList* lists[] = {commandList_.Get()};
+            nativeQueue->ExecuteCommandLists(1, lists);
+            const UINT64 signalValue = nextFenceValue_++;
+            ThrowIfFailed(nativeQueue->Signal(fence_.Get(), signalValue),
+                "Signal work completion");
+            workSignals[scheduledIndex] = signalValue;
+            inFlightAllocators_.push_back(std::move(allocator));
+            inFlightLists_.push_back(std::move(list));
         }
-
-        ThrowIfFailed(
-            commandList_->Close(),
-            "GraphicsCommandList::Close");
-
-        ID3D12CommandList* lists[] = {commandList_.Get()};
-        queue_->ExecuteCommandLists(1, lists);
 
         ThrowIfFailed(
             swapChain_->Present(1, 0),
@@ -166,18 +222,46 @@ namespace sge::d3d12::detail
             return;
         }
 
-        const UINT64 signalValue = nextFenceValue_++;
-        ThrowIfFailed(
-            queue_->Signal(fence_.Get(), signalValue),
-            "CommandQueue::Signal");
-
-        if (fence_->GetCompletedValue() < signalValue)
+        const auto waitQueue = [&](ID3D12CommandQueue* nativeQueue)
         {
-            ThrowIfFailed(
-                fence_->SetEventOnCompletion(signalValue, fenceEvent_),
-                "Fence::SetEventOnCompletion");
+            if (nativeQueue == nullptr)
+            {
+                return;
+            }
+            const UINT64 signalValue = nextFenceValue_++;
+            ThrowIfFailed(nativeQueue->Signal(fence_.Get(), signalValue),
+                "CommandQueue::Signal");
+            if (fence_->GetCompletedValue() < signalValue)
+            {
+                ThrowIfFailed(fence_->SetEventOnCompletion(
+                    signalValue, fenceEvent_), "Fence::SetEventOnCompletion");
+                WaitForSingleObject(fenceEvent_, INFINITE);
+            }
+        };
+        waitQueue(queue_.Get());
+        waitQueue(computeQueue_.Get());
+        waitQueue(copyQueue_.Get());
+    }
 
-            WaitForSingleObject(fenceEvent_, INFINITE);
+    ID3D12CommandQueue* Backend::QueueFor(
+        gpu::QueueClass queue) const noexcept
+    {
+        switch (queue)
+        {
+        case gpu::QueueClass::Compute: return computeQueue_.Get();
+        case gpu::QueueClass::Copy: return copyQueue_.Get();
+        default: return queue_.Get();
+        }
+    }
+
+    D3D12_COMMAND_LIST_TYPE Backend::CommandListType(
+        gpu::QueueClass queue) noexcept
+    {
+        switch (queue)
+        {
+        case gpu::QueueClass::Compute: return D3D12_COMMAND_LIST_TYPE_COMPUTE;
+        case gpu::QueueClass::Copy: return D3D12_COMMAND_LIST_TYPE_COPY;
+        default: return D3D12_COMMAND_LIST_TYPE_DIRECT;
         }
     }
 
@@ -269,6 +353,16 @@ namespace sge::d3d12::detail
                 &description,
                 IID_PPV_ARGS(&queue_)),
             "CreateCommandQueue");
+
+        description.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+        ThrowIfFailed(device_->CreateCommandQueue(
+            &description, IID_PPV_ARGS(&computeQueue_)),
+            "Create compute command queue");
+
+        description.Type = D3D12_COMMAND_LIST_TYPE_COPY;
+        ThrowIfFailed(device_->CreateCommandQueue(
+            &description, IID_PPV_ARGS(&copyQueue_)),
+            "Create copy command queue");
     }
 
     void Backend::CreateSwapChain()
@@ -312,7 +406,7 @@ namespace sge::d3d12::detail
     {
         D3D12_DESCRIPTOR_HEAP_DESC rtvDescription{};
         rtvDescription.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-        rtvDescription.NumDescriptors = FrameCount;
+        rtvDescription.NumDescriptors = 64;
 
         ThrowIfFailed(
             device_->CreateDescriptorHeap(
@@ -322,7 +416,7 @@ namespace sge::d3d12::detail
 
         D3D12_DESCRIPTOR_HEAP_DESC dsvDescription{};
         dsvDescription.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
-        dsvDescription.NumDescriptors = 1;
+        dsvDescription.NumDescriptors = 16;
 
         ThrowIfFailed(
             device_->CreateDescriptorHeap(
@@ -330,8 +424,22 @@ namespace sge::d3d12::detail
                 IID_PPV_ARGS(&dsvHeap_)),
             "Create DSV descriptor heap");
 
+        D3D12_DESCRIPTOR_HEAP_DESC shaderDescription{};
+        shaderDescription.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        shaderDescription.NumDescriptors = 128;
+        shaderDescription.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        ThrowIfFailed(
+            device_->CreateDescriptorHeap(
+                &shaderDescription,
+                IID_PPV_ARGS(&shaderHeap_)),
+            "Create shader descriptor heap");
+
         rtvIncrement_ = device_->GetDescriptorHandleIncrementSize(
             D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        dsvIncrement_ = device_->GetDescriptorHandleIncrementSize(
+            D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+        shaderIncrement_ = device_->GetDescriptorHandleIncrementSize(
+            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     }
 
     void Backend::CreateFrameContexts()

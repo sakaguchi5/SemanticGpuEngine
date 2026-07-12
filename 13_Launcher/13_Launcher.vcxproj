@@ -122,14 +122,24 @@
   </ItemGroup>
   <ItemGroup>
     <None Include="..\Shaders\BasicColor.hlsl" />
+    <None Include="..\Shaders\OffscreenBlit.hlsl" />
+    <None Include="..\Shaders\GenerateBuffer.hlsl" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets" />
   <Target Name="CopyShaderFiles" AfterTargets="Build">
     <Error Condition="!Exists('$(SolutionDir)Shaders\BasicColor.hlsl')" Text="Shader file not found: $(SolutionDir)Shaders\BasicColor.hlsl" />
+    <Error Condition="!Exists('$(SolutionDir)Shaders\OffscreenBlit.hlsl')" Text="Shader file not found: $(SolutionDir)Shaders\OffscreenBlit.hlsl" />
+    <Error Condition="!Exists('$(SolutionDir)Shaders\GenerateBuffer.hlsl')" Text="Shader file not found: $(SolutionDir)Shaders\GenerateBuffer.hlsl" />
     <MakeDir Directories="$(OutDir)Shaders" />
     <Copy SourceFiles="$(SolutionDir)Shaders\BasicColor.hlsl"
           DestinationFiles="$(OutDir)Shaders\BasicColor.hlsl"
+          SkipUnchangedFiles="true" />
+    <Copy SourceFiles="$(SolutionDir)Shaders\OffscreenBlit.hlsl"
+          DestinationFiles="$(OutDir)Shaders\OffscreenBlit.hlsl"
+          SkipUnchangedFiles="true" />
+    <Copy SourceFiles="$(SolutionDir)Shaders\GenerateBuffer.hlsl"
+          DestinationFiles="$(OutDir)Shaders\GenerateBuffer.hlsl"
           SkipUnchangedFiles="true" />
   </Target>
 </Project>
