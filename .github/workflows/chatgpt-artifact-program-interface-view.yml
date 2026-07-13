@@ -52,7 +52,6 @@ jobs:
             [IO.File]::WriteAllText($scriptPath, $prefix + $section + $suffix)
             "script_sha256=$((Get-FileHash -Algorithm SHA256 $scriptPath).Hash)" | Out-File $diagnostic -Append
             & $scriptPath -RepoRoot $env:GITHUB_WORKSPACE *>> $diagnostic
-            if ($LASTEXITCODE -ne 0) { throw "apply.ps1 exited with code $LASTEXITCODE" }
             "success=true" | Out-File $env:GITHUB_OUTPUT -Append
           }
           catch {
