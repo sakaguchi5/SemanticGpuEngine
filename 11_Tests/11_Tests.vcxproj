@@ -120,6 +120,7 @@
   </ItemGroup>
   <ItemGroup>
     <None Include="..\Shaders\GenerateBuffer.hlsl" />
+    <None Include="..\Shaders\IntegrationPersistentRead.hlsl" />
     <None Include="..\Shaders\IntegrationTemporalRead.hlsl" />
     <None Include="..\Shaders\IntegrationTemporalWrite.hlsl" />
   </ItemGroup>
@@ -127,6 +128,9 @@
     <MakeDir Directories="$(OutDir)Shaders" />
     <Copy SourceFiles="$(SolutionDir)Shaders\GenerateBuffer.hlsl"
           DestinationFiles="$(OutDir)Shaders\GenerateBuffer.hlsl"
+          SkipUnchangedFiles="true" />
+    <Copy SourceFiles="$(SolutionDir)Shaders\IntegrationPersistentRead.hlsl"
+          DestinationFiles="$(OutDir)Shaders\IntegrationPersistentRead.hlsl"
           SkipUnchangedFiles="true" />
     <Copy SourceFiles="$(SolutionDir)Shaders\IntegrationTemporalRead.hlsl"
           DestinationFiles="$(OutDir)Shaders\IntegrationTemporalRead.hlsl"

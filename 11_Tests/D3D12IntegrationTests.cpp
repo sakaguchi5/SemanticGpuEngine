@@ -42,6 +42,7 @@ namespace
                         * sizeof(classical::Vertex),
                     .strideBytes = sizeof(classical::Vertex),
                     .usage = ir::BufferUsage::Vertex
+                        | ir::BufferUsage::Storage
                         | ir::BufferUsage::CopyDestination},
                 .data = classical::ToBytes(fullscreenVertices)},
             {.id = history, .name = "CrossQueueTemporalHistory",
@@ -88,7 +89,17 @@ namespace
                 .pixelEntry = "PSMain",
                 .parameters = {{.name = "PreviousHistory",
                     .kind = gpu::ProgramParameterKind::ShaderResource,
-                    .stage = gpu::ProgramStage::Pixel}}}
+                    .stage = gpu::ProgramStage::Pixel}}},
+            {.id = gpu::ProgramId{3}, .name = "PersistentReader",
+                .shaderPath = "Shaders/IntegrationPersistentRead.hlsl",
+                .computeEntry = "CSMain",
+                .parameters = {
+                    {.name = "SharedVertices",
+                        .kind = gpu::ProgramParameterKind::ShaderResource,
+                        .stage = gpu::ProgramStage::Compute},
+                    {.name = "OutputBuffer",
+                        .kind = gpu::ProgramParameterKind::UnorderedAccess,
+                        .stage = gpu::ProgramStage::Compute}}}
         };
 
         module.works = {
@@ -98,12 +109,16 @@ namespace
                 .payload = ir::ComputeWork{
                     .program = gpu::ProgramId{0},
                     .bindings = {{0, history}}}},
-            {.id = gpu::WorkId{1}, .name = "UseAliasA",
-                .accesses = {{aliasA, gpu::AccessMode::Write,
-                    gpu::ResourceRole::ProgramOutput}},
+            {.id = gpu::WorkId{1},
+                .name = "ReadPersistentOnComputeAndUseAliasA",
+                .accesses = {
+                    {fullscreen, gpu::AccessMode::Read,
+                        gpu::ResourceRole::ProgramInput},
+                    {aliasA, gpu::AccessMode::Write,
+                        gpu::ResourceRole::ProgramOutput}},
                 .payload = ir::ComputeWork{
-                    .program = gpu::ProgramId{1},
-                    .bindings = {{0, aliasA}}}},
+                    .program = gpu::ProgramId{3},
+                    .bindings = {{0, fullscreen}, {1, aliasA}}}},
             {.id = gpu::WorkId{2}, .name = "UseAliasB",
                 .accesses = {{aliasB, gpu::AccessMode::Write,
                     gpu::ResourceRole::ProgramOutput}},
@@ -162,13 +177,29 @@ void RunD3D12IntegrationTests()
                 return lifetime.resource == resource;
             })->allocation;
     };
+    const auto persistent = std::find_if(
+        compiled.plan.persistentReadStates.begin(),
+        compiled.plan.persistentReadStates.end(),
+        [](const compiler::PersistentReadStatePlan& envelope)
+        {
+            return envelope.resource == gpu::ResourceId{0};
+        });
+    const bool persistentEnvelopeValid =
+        persistent != compiled.plan.persistentReadStates.end()
+        && std::find(
+            persistent->states.begin(), persistent->states.end(),
+            gpu::AbstractState::VertexRead) != persistent->states.end()
+        && std::find(
+            persistent->states.begin(), persistent->states.end(),
+            gpu::AbstractState::ProgramRead) != persistent->states.end();
     if (allocationOf(gpu::ResourceId{2})
             != allocationOf(gpu::ResourceId{3})
         || compiled.plan.temporalDependencies.size() != 1
         || compiled.plan.temporalDependencies[0].producerQueue
             != gpu::QueueClass::Compute
         || compiled.plan.temporalDependencies[0].consumerQueue
-            != gpu::QueueClass::Direct)
+            != gpu::QueueClass::Direct
+        || !persistentEnvelopeValid)
     {
         throw std::runtime_error(
             "WARP integration module does not exercise the required boundaries.");

@@ -26,6 +26,7 @@ namespace sge::d3d12::detail
 
         resources_.clear();
         resourceInstancePlans_.clear();
+        persistentReadStates_.clear();
         physicalAllocations_.clear();
         allocationHeaps_.clear();
         activeAliasedResources_.clear();
@@ -44,6 +45,23 @@ namespace sge::d3d12::detail
             {
                 temporalInstanceUsages_[instance.resource].assign(
                     instance.physicalInstanceCount, {});
+            }
+        }
+
+        for (const auto& envelope : plan.persistentReadStates)
+        {
+            UINT nativeBits = 0;
+            for (const auto state : envelope.states)
+            {
+                nativeBits |= static_cast<UINT>(NativeState(state));
+            }
+            if (nativeBits == 0
+                || !persistentReadStates_.emplace(
+                    envelope.resource,
+                    static_cast<D3D12_RESOURCE_STATES>(nativeBits)).second)
+            {
+                throw std::runtime_error(
+                    "Invalid persistent read-state envelope.");
             }
         }
 
@@ -182,6 +200,8 @@ namespace sge::d3d12::detail
             }
         }
 
+        InitializePersistentReadStates();
+
         for (const auto& program : module.programs)
         {
             programs_.emplace(program.id, CreateProgram(program));
@@ -195,6 +215,72 @@ namespace sge::d3d12::detail
         }
 
         compiledStructureHash_ = plan.structureHash;
+    }
+
+    void Backend::InitializePersistentReadStates()
+    {
+        std::vector<D3D12_RESOURCE_BARRIER> barriers;
+        std::vector<std::pair<ResourceRecord*, D3D12_RESOURCE_STATES>> updates;
+
+        for (const auto& [resource, targetState] : persistentReadStates_)
+        {
+            const auto found = resources_.find(resource);
+            if (found == resources_.end() || found->second.size() != 1)
+            {
+                throw std::runtime_error(
+                    "Persistent read-state plan has no single physical instance.");
+            }
+
+            auto& record = found->second.front();
+            if (record.state == targetState)
+            {
+                continue;
+            }
+
+            D3D12_RESOURCE_BARRIER barrier{};
+            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barrier.Transition.pResource = record.resource.Get();
+            barrier.Transition.Subresource =
+                D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            barrier.Transition.StateBefore = record.state;
+            barrier.Transition.StateAfter = targetState;
+            barriers.push_back(barrier);
+            updates.emplace_back(&record, targetState);
+        }
+
+        if (barriers.empty())
+        {
+            return;
+        }
+
+        ComPtr<ID3D12CommandAllocator> allocator;
+        ComPtr<ID3D12GraphicsCommandList> list;
+        ThrowIfFailed(device_->CreateCommandAllocator(
+            D3D12_COMMAND_LIST_TYPE_DIRECT,
+            IID_PPV_ARGS(&allocator)),
+            "Create persistent-state command allocator");
+        ThrowIfFailed(device_->CreateCommandList(
+            0,
+            D3D12_COMMAND_LIST_TYPE_DIRECT,
+            allocator.Get(),
+            nullptr,
+            IID_PPV_ARGS(&list)),
+            "Create persistent-state command list");
+
+        list->ResourceBarrier(
+            static_cast<UINT>(barriers.size()), barriers.data());
+        ThrowIfFailed(list->Close(), "Close persistent-state command list");
+        ID3D12CommandList* lists[] = {list.Get()};
+        queue_->ExecuteCommandLists(1, lists);
+
+        const UINT64 completion = SignalQueue(gpu::QueueClass::Direct);
+        WaitForCpuQueueValue(gpu::QueueClass::Direct, completion);
+        ValidateDebugLayer();
+
+        for (const auto& [record, targetState] : updates)
+        {
+            record->state = targetState;
+        }
     }
 
     ResourceRecord Backend::CreateTexture(
@@ -1032,6 +1118,18 @@ namespace sge::d3d12::detail
         gpu::AbstractState abstractState,
         std::uint32_t frameLag)
     {
+        const auto persistent = persistentReadStates_.find(resource);
+        if (persistent != persistentReadStates_.end())
+        {
+            auto* record = ResolveResource(resource, frameLag);
+            if (record == nullptr || record->state != persistent->second)
+            {
+                throw std::runtime_error(
+                    "Persistent resource escaped its compiled read-state envelope.");
+            }
+            return;
+        }
+
         const auto target = abstractState == gpu::AbstractState::ProgramRead
             && activeQueue_ == gpu::QueueClass::Compute
             ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE

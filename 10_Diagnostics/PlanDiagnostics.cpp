@@ -75,6 +75,21 @@ namespace sge::diagnostics
                    << "\n";
         }
 
+        output << "\n[Persistent read-state envelopes]\n";
+        for (const auto& envelope : plan.persistentReadStates)
+        {
+            output << module.Resource(envelope.resource).name << ": ";
+            for (std::size_t index = 0; index < envelope.states.size(); ++index)
+            {
+                if (index != 0)
+                {
+                    output << " | ";
+                }
+                output << gpu::ToString(envelope.states[index]);
+            }
+            output << "\n";
+        }
+
         output << "\n[Temporal dependencies]\n";
         for (const auto& dependency : plan.temporalDependencies)
         {

@@ -139,6 +139,7 @@ namespace sge::d3d12::detail
         void EnsureCompiled(
             const ir::SemanticModule& module,
             const compiler::ExecutionPlan& plan);
+        void InitializePersistentReadStates();
 
         [[nodiscard]] ResourceRecord CreateStaticBuffer(
             const ir::ResourceDeclaration& declaration,
@@ -252,6 +253,11 @@ namespace sge::d3d12::detail
             gpu::ResourceId,
             compiler::ResourceInstancePlan,
             foundation::StrongIdHash<gpu::ResourceTag>> resourceInstancePlans_;
+
+        std::unordered_map<
+            gpu::ResourceId,
+            D3D12_RESOURCE_STATES,
+            foundation::StrongIdHash<gpu::ResourceTag>> persistentReadStates_;
 
         std::unordered_map<
             gpu::ResourceId,

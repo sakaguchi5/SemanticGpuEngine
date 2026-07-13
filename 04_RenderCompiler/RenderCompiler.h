@@ -60,6 +60,16 @@ namespace sge::compiler
         std::uint32_t maximumFrameLag = 0;
     };
 
+    // Immutable persistent resources are initialized once into the union of
+    // every read state required by the compiled plan. Individual works keep
+    // their logical requirements, but no longer transition the physical
+    // resource between compatible read states.
+    struct PersistentReadStatePlan
+    {
+        gpu::ResourceId resource;
+        std::vector<gpu::AbstractState> states;
+    };
+
     struct TemporalDependency
     {
         gpu::ResourceId resource;
@@ -110,6 +120,7 @@ namespace sge::compiler
         std::vector<QueueSynchronization> queueSynchronizations;
         std::vector<FrameBoundaryTransition> frameBoundaryTransitions;
         std::vector<ResourceInstancePlan> resourceInstances;
+        std::vector<PersistentReadStatePlan> persistentReadStates;
         std::vector<TemporalDependency> temporalDependencies;
     };
 
@@ -174,6 +185,11 @@ namespace sge::compiler
             const gpu::DeviceCapabilities& capabilities);
 
         static std::vector<StateTransition> PlanTransitions(
+            const ir::SemanticModule& module,
+            const std::vector<ScheduledWork>& works);
+
+        static std::vector<PersistentReadStatePlan> PlanPersistentReadStates(
+            const ir::SemanticModule& module,
             const std::vector<ScheduledWork>& works);
 
         static std::vector<ResourceInstancePlan> PlanResourceInstances(

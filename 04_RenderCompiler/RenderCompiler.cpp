@@ -56,6 +56,22 @@ namespace
         return false;
     }
 
+    bool IsPersistentReadState(sge::gpu::AbstractState state) noexcept
+    {
+        using sge::gpu::AbstractState;
+        switch (state)
+        {
+        case AbstractState::VertexRead:
+        case AbstractState::ConstantRead:
+        case AbstractState::ProgramRead:
+        case AbstractState::DepthRead:
+        case AbstractState::TransferRead:
+            return true;
+        default:
+            return false;
+        }
+    }
+
     std::vector<ExpectedAccess> BuildExpectedAccesses(
         const sge::ir::SemanticModule& module,
         const sge::ir::WorkDeclaration& work)
@@ -237,7 +253,10 @@ namespace sge::compiler
             result.plan.dependencies,
             result.plan.scheduledWorks,
             capabilities.resourceAliasing);
-        result.plan.transitions = PlanTransitions(result.plan.scheduledWorks);
+        result.plan.persistentReadStates = PlanPersistentReadStates(
+            module, result.plan.scheduledWorks);
+        result.plan.transitions = PlanTransitions(
+            module, result.plan.scheduledWorks);
         result.plan.queueSynchronizations = PlanQueueSynchronization(
             result.plan.dependencies, schedule, result.plan.scheduledWorks);
         result.plan.frameBoundaryTransitions =
@@ -276,7 +295,9 @@ namespace sge::compiler
             + std::to_string(result.plan.transitions.size())
             + " abstract transitions, "
             + std::to_string(result.plan.frameBoundaryTransitions.size())
-            + " frame-boundary releases.");
+            + " frame-boundary releases, "
+            + std::to_string(result.plan.persistentReadStates.size())
+            + " persistent read-state envelopes.");
         result.diagnostics.push_back(
             std::string("Scheduling policy: ") + schedulingPolicy_->Name());
         result.diagnostics.push_back(
@@ -893,6 +914,7 @@ namespace sge::compiler
     }
 
     std::vector<StateTransition> RenderCompiler::PlanTransitions(
+        const ir::SemanticModule& module,
         const std::vector<ScheduledWork>& works)
     {
         std::unordered_map<
@@ -907,6 +929,12 @@ namespace sge::compiler
         {
             for (const auto& requirement : works[workIndex].requiredStates)
             {
+                if (module.Resource(requirement.resource).lifetime
+                    == gpu::ResourceLifetimeClass::Persistent)
+                {
+                    continue;
+                }
+
                 const auto key =
                     (static_cast<std::uint64_t>(requirement.resource.Value()) << 32u)
                     | requirement.frameLag;
@@ -931,6 +959,102 @@ namespace sge::compiler
         }
 
         return transitions;
+    }
+
+    std::vector<PersistentReadStatePlan>
+        RenderCompiler::PlanPersistentReadStates(
+            const ir::SemanticModule& module,
+            const std::vector<ScheduledWork>& works)
+    {
+        struct AccumulatedPlan
+        {
+            PersistentReadStatePlan plan;
+            bool usesCopyQueue = false;
+            bool usesNonCopyQueue = false;
+        };
+
+        std::vector<AccumulatedPlan> accumulated;
+        std::unordered_map<
+            gpu::ResourceId,
+            std::size_t,
+            foundation::StrongIdHash<gpu::ResourceTag>> indices;
+
+        for (const auto& work : works)
+        {
+            for (const auto& requirement : work.requiredStates)
+            {
+                const auto& resource = module.Resource(requirement.resource);
+                if (resource.lifetime
+                    != gpu::ResourceLifetimeClass::Persistent)
+                {
+                    continue;
+                }
+                if (requirement.frameLag != 0
+                    || !IsPersistentReadState(requirement.state))
+                {
+                    throw std::runtime_error(
+                        "Persistent resource '" + resource.name
+                        + "' has a non-read state requirement.");
+                }
+
+                auto found = indices.find(requirement.resource);
+                if (found == indices.end())
+                {
+                    found = indices.emplace(
+                        requirement.resource, accumulated.size()).first;
+                    accumulated.push_back({
+                        .plan = {.resource = requirement.resource}
+                    });
+                }
+
+                auto& entry = accumulated.at(found->second);
+                entry.usesCopyQueue = entry.usesCopyQueue
+                    || work.queue == gpu::QueueClass::Copy;
+                entry.usesNonCopyQueue = entry.usesNonCopyQueue
+                    || work.queue != gpu::QueueClass::Copy;
+
+                if (std::find(
+                        entry.plan.states.begin(),
+                        entry.plan.states.end(),
+                        requirement.state) == entry.plan.states.end())
+                {
+                    entry.plan.states.push_back(requirement.state);
+                }
+            }
+        }
+
+        std::vector<PersistentReadStatePlan> result;
+        result.reserve(accumulated.size());
+        for (auto& entry : accumulated)
+        {
+            if (entry.usesCopyQueue && entry.usesNonCopyQueue)
+            {
+                throw std::runtime_error(
+                    "Persistent resource '"
+                    + module.Resource(entry.plan.resource).name
+                    + "' cannot be shared between Copy and non-Copy queues "
+                      "until explicit Copy-queue handoff planning is added.");
+            }
+            std::sort(
+                entry.plan.states.begin(),
+                entry.plan.states.end(),
+                [](gpu::AbstractState left, gpu::AbstractState right)
+                {
+                    return static_cast<std::uint32_t>(left)
+                        < static_cast<std::uint32_t>(right);
+                });
+            result.push_back(std::move(entry.plan));
+        }
+
+        std::sort(
+            result.begin(),
+            result.end(),
+            [](const PersistentReadStatePlan& left,
+               const PersistentReadStatePlan& right)
+            {
+                return left.resource.Value() < right.resource.Value();
+            });
+        return result;
     }
 
     std::vector<ResourceInstancePlan> RenderCompiler::PlanResourceInstances(
@@ -1050,98 +1174,13 @@ namespace sge::compiler
             const ir::SemanticModule& module,
             const std::vector<ScheduledWork>& works)
     {
-        struct RepeatedUse
-        {
-            gpu::ResourceId resource;
-            std::size_t firstScheduledWork = 0;
-            gpu::QueueClass firstQueue = gpu::QueueClass::Direct;
-            gpu::AbstractState firstState = gpu::AbstractState::Undefined;
-            std::size_t lastScheduledWork = 0;
-            gpu::QueueClass lastQueue = gpu::QueueClass::Direct;
-            gpu::AbstractState lastState = gpu::AbstractState::Undefined;
-        };
-
-        std::vector<RepeatedUse> uses;
-        std::unordered_map<
-            gpu::ResourceId,
-            std::size_t,
-            foundation::StrongIdHash<gpu::ResourceTag>> useIndices;
-
-        for (std::size_t scheduledIndex = 0;
-             scheduledIndex < works.size();
-             ++scheduledIndex)
-        {
-            const auto& scheduled = works[scheduledIndex];
-            for (const auto& requirement : scheduled.requiredStates)
-            {
-                if (requirement.frameLag > 0)
-                {
-                    continue;
-                }
-                const auto found = useIndices.find(requirement.resource);
-                if (found == useIndices.end())
-                {
-                    useIndices.emplace(requirement.resource, uses.size());
-                    uses.push_back({
-                        .resource = requirement.resource,
-                        .firstScheduledWork = scheduledIndex,
-                        .firstQueue = scheduled.queue,
-                        .firstState = requirement.state,
-                        .lastScheduledWork = scheduledIndex,
-                        .lastQueue = scheduled.queue,
-                        .lastState = requirement.state
-                    });
-                    continue;
-                }
-
-                auto& use = uses[found->second];
-                use.lastScheduledWork = scheduledIndex;
-                use.lastQueue = scheduled.queue;
-                use.lastState = requirement.state;
-            }
-        }
-
-        std::vector<FrameBoundaryTransition> result;
-        for (const auto& use : uses)
-        {
-            if (module.Resource(use.resource).lifetime
-                != gpu::ResourceLifetimeClass::Persistent)
-            {
-                continue;
-            }
-            // A repeated plan is cyclic: the last use is followed by the first
-            // use of the next frame. A queue change requires the producer queue
-            // to release the resource to COMMON before that cycle edge.
-            if (use.lastQueue == use.firstQueue)
-            {
-                continue;
-            }
-
-            result.push_back({
-                .resource = use.resource,
-                .afterScheduledWork = use.lastScheduledWork,
-                .releaseQueue = use.lastQueue,
-                .from = use.lastState,
-                .to = gpu::AbstractState::Undefined,
-                .nextFrameQueue = use.firstQueue,
-                .nextFrameState = use.firstState
-            });
-        }
-
-        std::sort(
-            result.begin(),
-            result.end(),
-            [](const FrameBoundaryTransition& left,
-               const FrameBoundaryTransition& right)
-            {
-                if (left.afterScheduledWork != right.afterScheduledWork)
-                {
-                    return left.afterScheduledWork < right.afterScheduledWork;
-                }
-                return left.resource.Value() < right.resource.Value();
-            });
-
-        return result;
+        // Persistent resources are immutable and remain in a compiled union of
+        // compatible read states. Frame-local and temporal resources use
+        // separate physical instances, so no cyclic frame-boundary release is
+        // required by the current lifetime model.
+        (void)module;
+        (void)works;
+        return {};
     }
 
     std::vector<QueueSynchronization> RenderCompiler::PlanQueueSynchronization(

@@ -739,6 +739,139 @@ namespace
         expectFailure(written);
     }
 
+    void TestPersistentReadStateEnvelope()
+    {
+        using namespace sge;
+        constexpr gpu::ResourceId shared{0};
+        constexpr gpu::ResourceId scratch{1};
+        constexpr gpu::ResourceId presentation{2};
+        constexpr gpu::ResourceId copyDestination{3};
+
+        ir::SemanticModule module;
+        module.resources = {
+            {.id = shared, .name = "SharedPersistentBuffer",
+                .lifetime = gpu::ResourceLifetimeClass::Persistent,
+                .update = gpu::ResourceUpdateClass::Immutable,
+                .description = ir::BufferDescription{
+                    .sizeBytes = 28,
+                    .strideBytes = 28,
+                    .usage = ir::BufferUsage::Vertex
+                        | ir::BufferUsage::Storage
+                        | ir::BufferUsage::CopyDestination},
+                .data = std::vector<std::byte>(28)},
+            {.id = scratch, .name = "PersistentReadScratch",
+                .lifetime = gpu::ResourceLifetimeClass::FrameLocal,
+                .update = gpu::ResourceUpdateClass::GpuProduced,
+                .description = ir::BufferDescription{
+                    .sizeBytes = 16,
+                    .usage = ir::BufferUsage::Storage}},
+            {.id = presentation, .name = "PersistentReadPresentation",
+                .lifetime = gpu::ResourceLifetimeClass::External,
+                .update = gpu::ResourceUpdateClass::Imported,
+                .description = ir::PresentationDescription{}}
+        };
+        module.programs = {
+            {.id = gpu::ProgramId{0}, .name = "ReadPersistentOnCompute",
+                .computeEntry = "CSMain",
+                .parameters = {
+                    {.name = "Input",
+                        .kind = gpu::ProgramParameterKind::ShaderResource,
+                        .stage = gpu::ProgramStage::Compute},
+                    {.name = "Output",
+                        .kind = gpu::ProgramParameterKind::UnorderedAccess,
+                        .stage = gpu::ProgramStage::Compute}}},
+            {.id = gpu::ProgramId{1}, .name = "ReadPersistentOnDirect",
+                .vertexEntry = "VSMain", .pixelEntry = "PSMain"}
+        };
+        module.works = {
+            {.id = gpu::WorkId{0}, .name = "ComputePersistentRead",
+                .accesses = {
+                    {shared, gpu::AccessMode::Read,
+                        gpu::ResourceRole::ProgramInput},
+                    {scratch, gpu::AccessMode::Write,
+                        gpu::ResourceRole::ProgramOutput}},
+                .payload = ir::ComputeWork{
+                    .program = gpu::ProgramId{0},
+                    .bindings = {{0, shared}, {1, scratch}}}},
+            {.id = gpu::WorkId{1}, .name = "DirectPersistentRead",
+                .accesses = {
+                    {shared, gpu::AccessMode::Read,
+                        gpu::ResourceRole::VertexInput},
+                    {presentation, gpu::AccessMode::Write,
+                        gpu::ResourceRole::ColorOutput}},
+                .payload = ir::RasterWork{
+                    .program = gpu::ProgramId{1},
+                    .vertexResource = shared,
+                    .attachments = {{presentation}, {}},
+                    .vertexCount = 1,
+                    .rasterState = {.depth = gpu::DepthMode::Disabled}}}
+        };
+
+        gpu::DeviceCapabilities capabilities;
+        capabilities.computeExecution = true;
+        capabilities.concurrentCompute = true;
+        const auto result = compiler::RenderCompiler{}.Compile(
+            module, capabilities);
+
+        assert(result.plan.scheduledWorks[0].queue
+            == gpu::QueueClass::Compute);
+        assert(result.plan.scheduledWorks[1].queue
+            == gpu::QueueClass::Direct);
+        assert(result.plan.persistentReadStates.size() == 1);
+        const auto& envelope = result.plan.persistentReadStates.front();
+        const auto contains = [&](gpu::AbstractState state)
+        {
+            return std::find(
+                envelope.states.begin(), envelope.states.end(), state)
+                != envelope.states.end();
+        };
+        assert(envelope.resource == shared);
+        assert(contains(gpu::AbstractState::VertexRead));
+        assert(contains(gpu::AbstractState::ProgramRead));
+        assert(std::none_of(
+            result.plan.transitions.begin(), result.plan.transitions.end(),
+            [&](const compiler::StateTransition& transition)
+            {
+                return transition.resource == shared;
+            }));
+        assert(result.plan.frameBoundaryTransitions.empty());
+
+        auto rejected = module;
+        rejected.resources.push_back({
+            .id = copyDestination,
+            .name = "PersistentCopyDestination",
+            .lifetime = gpu::ResourceLifetimeClass::FrameLocal,
+            .update = gpu::ResourceUpdateClass::GpuProduced,
+            .description = ir::BufferDescription{
+                .sizeBytes = 28,
+                .usage = ir::BufferUsage::CopyDestination}});
+        rejected.works.push_back({
+            .id = gpu::WorkId{2},
+            .name = "CopyPersistentWhileSharedWithDirectAndCompute",
+            .accesses = {
+                {shared, gpu::AccessMode::Read,
+                    gpu::ResourceRole::TransferSource},
+                {copyDestination, gpu::AccessMode::Write,
+                    gpu::ResourceRole::TransferDestination}},
+            .payload = ir::CopyWork{
+                .source = shared,
+                .destination = copyDestination,
+                .sizeBytes = 28}});
+
+        capabilities.copyExecution = true;
+        capabilities.dedicatedCopyQueue = true;
+        bool rejectedCopyMix = false;
+        try
+        {
+            (void)compiler::RenderCompiler{}.Compile(rejected, capabilities);
+        }
+        catch (const std::runtime_error&)
+        {
+            rejectedCopyMix = true;
+        }
+        assert(rejectedCopyMix);
+    }
+
     void TestCubePlan()
     {
         using namespace sge;
@@ -820,6 +953,7 @@ int main()
         TestTemporalResourcePlan();
         TestTemporalLagDeterminesRingCapacity();
         TestPersistentResourcesAreImmutableAndReadOnly();
+        TestPersistentReadStateEnvelope();
         TestPgaAndSdfModels();
         TestCubePlan();
         TestSdfFrontendPlan();
