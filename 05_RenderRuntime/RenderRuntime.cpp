@@ -75,28 +75,30 @@ namespace sge::runtime
                         : diagnostics_.front());
             }
 
-            cachedPackage_ = std::move(result.package);
-
             if (!configuration_.planDiagnosticsPath.empty())
             {
                 diagnostics::WriteExecutionPlan(
-                    cachedPackage_->canonicalModule,
-                    cachedPackage_->plan,
+                    result.report.canonicalModule,
+                    result.report.analysisPlan,
                     configuration_.planDiagnosticsPath);
             }
             if (!configuration_.graphDiagnosticsPath.empty())
             {
                 diagnostics::WriteDependencyGraphDot(
-                    cachedPackage_->canonicalModule,
-                    cachedPackage_->plan,
+                    result.report.canonicalModule,
+                    result.report.analysisPlan,
                     configuration_.graphDiagnosticsPath);
             }
             if (!configuration_.packageDiagnosticsPath.empty())
             {
                 diagnostics::WriteCompiledPackageJson(
-                    *cachedPackage_,
+                    result.package,
+                    result.report,
+                    result.diagnostics,
                     configuration_.packageDiagnosticsPath);
             }
+
+            cachedPackage_ = std::move(result.package);
         }
 
         FrameInvocation resolved = invocation;

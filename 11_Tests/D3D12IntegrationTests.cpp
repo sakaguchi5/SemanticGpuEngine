@@ -647,8 +647,8 @@ void RunD3D12IntegrationTests()
     const auto copyQueuePackage = compiler::RenderPackageCompiler{}.Compile(
         copyQueueModule, backend->Capabilities());
     const auto copyHandoff = std::find_if(
-        copyQueuePackage.package.queueHandoffs.begin(),
-        copyQueuePackage.package.queueHandoffs.end(),
+        copyQueuePackage.report.queueHandoffs.begin(),
+        copyQueuePackage.report.queueHandoffs.end(),
         [](const compiler::QueueHandoffPlan& handoff)
         {
             return handoff.releaseQueue == gpu::QueueClass::Copy
@@ -659,8 +659,8 @@ void RunD3D12IntegrationTests()
                     == gpu::AbstractState::VertexRead;
         });
     const auto cyclicCopyReuse = std::find_if(
-        copyQueuePackage.package.cyclicFrameHandoffs.begin(),
-        copyQueuePackage.package.cyclicFrameHandoffs.end(),
+        copyQueuePackage.report.cyclicFrameHandoffs.begin(),
+        copyQueuePackage.report.cyclicFrameHandoffs.end(),
         [](const compiler::CyclicFrameHandoffPlan& handoff)
         {
             return handoff.resource == gpu::ResourceId{1}
@@ -668,13 +668,32 @@ void RunD3D12IntegrationTests()
                 && handoff.acquireQueue == gpu::QueueClass::Copy
                 && handoff.requiresCommonRelease;
         });
+    const bool operationStreamHasQueueWait = std::any_of(
+        copyQueuePackage.package.operations.begin(),
+        copyQueuePackage.package.operations.end(),
+        [](const compiler::CompiledOperation& operation)
+        {
+            return std::holds_alternative<
+                compiler::WaitForWorkOperation>(operation);
+        });
+    const bool operationStreamHasCyclicReuse = std::any_of(
+        copyQueuePackage.package.operations.begin(),
+        copyQueuePackage.package.operations.end(),
+        [](const compiler::CompiledOperation& operation)
+        {
+            const auto* common = std::get_if<
+                compiler::RequireCommonOperation>(&operation);
+            return common != nullptr && common->cyclicReuse;
+        });
     if (!copyQueuePackage.Succeeded()
-        || copyHandoff == copyQueuePackage.package.queueHandoffs.end()
+        || copyHandoff == copyQueuePackage.report.queueHandoffs.end()
         || !copyHandoff->crossesCopyQueue
         || copyHandoff->releaseView.resource != gpu::ResourceId{1}
         || copyHandoff->acquireView.resource != gpu::ResourceId{1}
         || cyclicCopyReuse
-            == copyQueuePackage.package.cyclicFrameHandoffs.end())
+            == copyQueuePackage.report.cyclicFrameHandoffs.end()
+        || !operationStreamHasQueueWait
+        || !operationStreamHasCyclicReuse)
     {
         throw std::runtime_error(
             "Copy queue package did not compile exact intra-frame and cyclic handoffs.");
@@ -687,7 +706,8 @@ void RunD3D12IntegrationTests()
         || !advancedPackage.package.requirements.multipleVertexStreams
         || !advancedPackage.package.requirements.indexedDraw
         || !advancedPackage.package.requirements.instancedDraw
-        || advancedPackage.package.legacyExecutable)
+        || advancedPackage.package.executables.empty()
+        || advancedPackage.package.operations.empty())
     {
         throw std::runtime_error(
             "Advanced package integration module was not compiled natively.");

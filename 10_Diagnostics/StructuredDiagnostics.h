@@ -10,6 +10,8 @@ namespace sge::diagnostics
 {
     void WriteCompiledPackageJson(
         const compiler::CompiledRenderPackage& package,
+        const compiler::CompilationReport& report,
+        std::span<const compiler::Diagnostic> diagnostics,
         const std::filesystem::path& outputPath);
 
     [[nodiscard]] std::string DiagnosticToJson(

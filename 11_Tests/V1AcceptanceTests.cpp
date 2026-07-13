@@ -1,6 +1,7 @@
 #include "11_Tests/V1AcceptanceTests.h"
 
 #include "04_RenderCompiler/CompiledRenderPackage.h"
+#include "05_RenderRuntime/RenderRuntime.h"
 #include "12_CubeLab/ExperimentHarness.h"
 
 #include <algorithm>
@@ -42,6 +43,111 @@ namespace
             throw std::runtime_error(message);
         }
     }
+
+    void ValidateBackendOperationStream(
+        const compiler::CompiledRenderPackage& package)
+    {
+        bool open = false;
+        gpu::QueueClass queue = gpu::QueueClass::Direct;
+        std::size_t currentWork = 0;
+        std::size_t beginCount = 0;
+        std::size_t executeCount = 0;
+        std::size_t submitCount = 0;
+
+        for (const auto& operation : package.operations)
+        {
+            std::visit([&](const auto& value)
+            {
+                using T = std::decay_t<decltype(value)>;
+                if constexpr (std::is_same_v<T,
+                    compiler::WaitForWorkOperation>
+                    || std::is_same_v<T,
+                        compiler::WaitForTemporalOperation>)
+                {
+                    Require(!open,
+                        "A compiled wait was emitted inside a work command list.");
+                }
+                else if constexpr (std::is_same_v<T,
+                    compiler::BeginWorkOperation>)
+                {
+                    Require(!open,
+                        "A compiled work began before the previous submit.");
+                    open = true;
+                    queue = value.queue;
+                    currentWork = value.workIndex;
+                    ++beginCount;
+                }
+                else if constexpr (std::is_same_v<T,
+                    compiler::RequireCommonOperation>)
+                {
+                    Require(value.cyclicReuse ? !open : open,
+                        "RequireCommon has the wrong work-boundary placement.");
+                    if (!value.cyclicReuse)
+                    {
+                        Require(queue == gpu::QueueClass::Copy,
+                            "Copy COMMON requirement was emitted on a non-Copy work.");
+                    }
+                }
+                else if constexpr (std::is_same_v<T,
+                    compiler::TransitionOperation>)
+                {
+                    Require(open && queue != gpu::QueueClass::Copy,
+                        "Transition was emitted outside a non-Copy work.");
+                }
+                else if constexpr (std::is_same_v<T,
+                    compiler::ActivateAliasOperation>)
+                {
+                    Require(open,
+                        "Alias activation was emitted outside a work.");
+                }
+                else if constexpr (std::is_same_v<T,
+                    compiler::ExecuteCommandOperation>)
+                {
+                    Require(open,
+                        "Command execution was emitted outside a work.");
+                    ++executeCount;
+                }
+                else if constexpr (std::is_same_v<T,
+                    compiler::SubmitWorkOperation>)
+                {
+                    Require(open
+                            && value.workIndex == currentWork
+                            && value.queue == queue,
+                        "SubmitWork does not close the active work.");
+                    open = false;
+                    ++submitCount;
+                }
+            }, operation);
+        }
+
+        Require(!open, "Operation stream ended with an open work.");
+        Require(beginCount == package.statistics.workCount
+                && executeCount == package.statistics.workCount
+                && submitCount == package.statistics.workCount,
+            "Operation stream does not contain one begin/execute/submit per work.");
+    }
+
+    class PackageOnlyBackend final : public runtime::IRenderBackend
+    {
+    public:
+        [[nodiscard]] gpu::DeviceCapabilities Capabilities() const override
+        {
+            return FullCapabilities();
+        }
+
+        void Execute(
+            const compiler::CompiledRenderPackage&,
+            const runtime::FrameInvocation&) override
+        {
+            executed = true;
+        }
+
+        void WaitIdle() override
+        {
+        }
+
+        bool executed = false;
+    };
 
     ir::ResourceDeclaration StorageBuffer(
         gpu::ResourceId id,
@@ -416,11 +522,23 @@ namespace
         const auto result = compiler::RenderPackageCompiler{}.Compile(
             module, capabilities);
         Require(result.Succeeded(), "Legacy ProgramInterface canonicalization failed.");
-        Require(result.package.canonicalModule.programs[0].parameters.empty(),
+        Require(result.report.canonicalModule.programs[0].parameters.empty(),
             "Canonical package retained legacy program parameters.");
-        Require(!result.package.canonicalModule.programs[0]
+        Require(!result.report.canonicalModule.programs[0]
                 .programInterface.parameters.empty(),
             "Canonical package lost program parameters.");
+        Require(result.package.programs[0].declaration.parameters.empty()
+                && !result.package.programs[0].parameters.empty(),
+            "Backend program blueprint retained a legacy parameter path.");
+        Require(!result.package.resources.empty()
+                && !result.package.programs.empty()
+                && !result.package.operations.empty(),
+            "Backend-ready package did not retain its native blueprints.");
+        ValidateBackendOperationStream(result.package);
+        PackageOnlyBackend backend;
+        backend.Execute(result.package, {});
+        Require(backend.executed,
+            "A package-only backend could not implement IRenderBackend.");
     }
 
     void TestTextureRangeStateModel()
@@ -432,8 +550,9 @@ namespace
             "Non-overlapping texture mip read/write was rejected.");
         Require(separated.package.requirements.textureSubresourceViews,
             "Texture subresource requirement was not recorded.");
-        Require(!separated.package.legacyExecutable,
-            "Texture subresource package was marked legacy executable.");
+        Require(!separated.package.operations.empty(),
+            "Texture subresource package has no backend operation stream.");
+        ValidateBackendOperationStream(separated.package);
 
         const auto overlapping = compiler::RenderPackageCompiler{}.Compile(
             TwoViewTextureModule(true), capabilities);
@@ -464,7 +583,7 @@ namespace
         Require(depthSlices.Succeeded(),
             "Texture3D depth-slice view compilation failed.");
         const auto& compute = std::get<compiler::CompiledComputeCommand>(
-            depthSlices.package.works.front().command);
+            depthSlices.report.works.front().command);
         Require(compute.bindings.front().view.textureRange.firstDepthSlice == 2
                 && compute.bindings.front().view.textureRange.depthSliceCount == 3,
             "Texture3D depth-slice range was not preserved in the package.");
@@ -481,8 +600,22 @@ namespace
             "Indexed draw was not recorded.");
         Require(result.package.requirements.instancedDraw,
             "Instanced draw was not recorded.");
-        Require(!result.package.legacyExecutable,
-            "Generalized raster package was marked legacy executable.");
+        Require(!result.package.executables.empty(),
+            "Generalized raster package has no executable blueprint.");
+        const bool hasRasterExecute = std::any_of(
+            result.package.operations.begin(),
+            result.package.operations.end(),
+            [](const compiler::CompiledOperation& operation)
+            {
+                const auto* execute = std::get_if<
+                    compiler::ExecuteCommandOperation>(&operation);
+                return execute != nullptr
+                    && std::holds_alternative<
+                        compiler::CompiledRasterCommand>(execute->command);
+            });
+        Require(hasRasterExecute,
+            "Generalized raster command was not lowered into the operation stream.");
+        ValidateBackendOperationStream(result.package);
 
         auto limited = FullCapabilities();
         limited.multipleVertexStreams = false;
@@ -498,11 +631,11 @@ namespace
         const auto handoff = compiler::RenderPackageCompiler{}.Compile(
             CopyHandoffModule(), capabilities);
         Require(handoff.Succeeded(), "Copy handoff package failed.");
-        Require(!handoff.package.queueHandoffs.empty(),
+        Require(!handoff.report.queueHandoffs.empty(),
             "Copy handoff was not materialized in the package.");
         const auto exact = std::find_if(
-            handoff.package.queueHandoffs.begin(),
-            handoff.package.queueHandoffs.end(),
+            handoff.report.queueHandoffs.begin(),
+            handoff.report.queueHandoffs.end(),
             [](const compiler::QueueHandoffPlan& plan)
             {
                 return plan.releaseQueue == gpu::QueueClass::Copy
@@ -515,11 +648,11 @@ namespace
                     && plan.acquireView.resource == gpu::ResourceId{1}
                     && plan.crossesCopyQueue;
             });
-        Require(exact != handoff.package.queueHandoffs.end(),
+        Require(exact != handoff.report.queueHandoffs.end(),
             "Copy handoff lost its exact release/acquire views or states.");
         const auto persistentRead = std::find_if(
-            handoff.package.queueHandoffs.begin(),
-            handoff.package.queueHandoffs.end(),
+            handoff.report.queueHandoffs.begin(),
+            handoff.report.queueHandoffs.end(),
             [](const compiler::QueueHandoffPlan& plan)
             {
                 return plan.releaseQueue == gpu::QueueClass::Copy
@@ -532,13 +665,13 @@ namespace
                     && plan.acquireView.resource == gpu::ResourceId{0}
                     && plan.crossesCopyQueue;
             });
-        Require(persistentRead != handoff.package.queueHandoffs.end(),
+        Require(persistentRead != handoff.report.queueHandoffs.end(),
             "Persistent read-only use incorrectly skipped a Copy-queue handoff.");
         Require(handoff.package.requirements.explicitCopyQueueHandoffs,
             "Copy handoff capability requirement was not recorded.");
         const auto cyclic = std::find_if(
-            handoff.package.cyclicFrameHandoffs.begin(),
-            handoff.package.cyclicFrameHandoffs.end(),
+            handoff.report.cyclicFrameHandoffs.begin(),
+            handoff.report.cyclicFrameHandoffs.end(),
             [](const compiler::CyclicFrameHandoffPlan& plan)
             {
                 return plan.resource == gpu::ResourceId{1}
@@ -552,18 +685,56 @@ namespace
                         == gpu::AbstractState::TransferWrite
                     && plan.requiresCommonRelease;
             });
-        Require(cyclic != handoff.package.cyclicFrameHandoffs.end(),
+        Require(cyclic != handoff.report.cyclicFrameHandoffs.end(),
             "FrameLocal Copy-first slot reuse has no cyclic COMMON release.");
 
         const bool persistentCyclic = std::any_of(
-            handoff.package.cyclicFrameHandoffs.begin(),
-            handoff.package.cyclicFrameHandoffs.end(),
+            handoff.report.cyclicFrameHandoffs.begin(),
+            handoff.report.cyclicFrameHandoffs.end(),
             [](const compiler::CyclicFrameHandoffPlan& plan)
             {
                 return plan.resource == gpu::ResourceId{0};
             });
         Require(!persistentCyclic,
             "Persistent resource was incorrectly assigned a FrameLocal cyclic handoff.");
+
+        const bool hasQueueWait = std::any_of(
+            handoff.package.operations.begin(),
+            handoff.package.operations.end(),
+            [](const compiler::CompiledOperation& operation)
+            {
+                return std::holds_alternative<
+                    compiler::WaitForWorkOperation>(operation);
+            });
+        const bool hasCyclicCommon = std::any_of(
+            handoff.package.operations.begin(),
+            handoff.package.operations.end(),
+            [](const compiler::CompiledOperation& operation)
+            {
+                const auto* common = std::get_if<
+                    compiler::RequireCommonOperation>(&operation);
+                return common != nullptr && common->cyclicReuse;
+            });
+        const bool hasCopyCommon = std::any_of(
+            handoff.package.operations.begin(),
+            handoff.package.operations.end(),
+            [](const compiler::CompiledOperation& operation)
+            {
+                const auto* common = std::get_if<
+                    compiler::RequireCommonOperation>(&operation);
+                return common != nullptr
+                    && !common->cyclicReuse
+                    && (common->implicitCopyState
+                            == gpu::AbstractState::TransferRead
+                        || common->implicitCopyState
+                            == gpu::AbstractState::TransferWrite);
+            });
+        Require(hasQueueWait && hasCyclicCommon && hasCopyCommon,
+            "Queue, cyclic, or Copy state semantics were not unified into operations.");
+        Require(handoff.package.statistics.operationCount
+                == handoff.package.operations.size(),
+            "Package operation statistics do not match the backend stream.");
+        ValidateBackendOperationStream(handoff.package);
 
         auto module = SimpleComputeModule(1);
         capabilities.localMemoryBudget = 128;
@@ -585,18 +756,28 @@ namespace
                 "Deterministic graph package compilation failed.");
             Require(first.package.packageHash == second.package.packageHash,
                 "Package hash is not deterministic.");
-            Require(first.package.plan.dependencies.size()
-                    == second.package.plan.dependencies.size(),
+            Require(first.report.analysisPlan.dependencies.size()
+                    == second.report.analysisPlan.dependencies.size(),
                 "Dependency planning size is not deterministic.");
             for (std::size_t edge = 0;
-                 edge < first.package.plan.dependencies.size(); ++edge)
+                 edge < first.report.analysisPlan.dependencies.size(); ++edge)
             {
-                const auto& left = first.package.plan.dependencies[edge];
-                const auto& right = second.package.plan.dependencies[edge];
+                const auto& left = first.report.analysisPlan.dependencies[edge];
+                const auto& right = second.report.analysisPlan.dependencies[edge];
                 Require(left.before == right.before
                         && left.after == right.after
                         && left.resource == right.resource,
                     "Dependency planning is not deterministic.");
+            }
+            Require(first.package.operations.size()
+                    == second.package.operations.size(),
+                "Operation stream size is not deterministic.");
+            for (std::size_t operation = 0;
+                 operation < first.package.operations.size(); ++operation)
+            {
+                Require(first.package.operations[operation].index()
+                        == second.package.operations[operation].index(),
+                    "Operation stream kind ordering is not deterministic.");
             }
         }
 

@@ -4,6 +4,7 @@
 #include <iomanip>
 #include <sstream>
 #include <stdexcept>
+#include <type_traits>
 
 namespace
 {
@@ -57,6 +58,7 @@ namespace
         first = false;
         output << '"' << name << "\":" << value->Value();
     }
+
     void WriteNormalizedView(
         std::ostream& output,
         const sge::compiler::NormalizedResourceView& view)
@@ -86,6 +88,89 @@ namespace
                << "\"}";
     }
 
+    void WriteOperation(
+        std::ostream& output,
+        const sge::compiler::CompiledOperation& operation)
+    {
+        using namespace sge;
+        output << "{\"type\":\""
+               << compiler::ToString(operation) << '"';
+        std::visit([&](const auto& value)
+        {
+            using T = std::decay_t<decltype(value)>;
+            if constexpr (std::is_same_v<T,
+                compiler::BeginWorkOperation>)
+            {
+                output << ",\"workIndex\":" << value.workIndex
+                       << ",\"work\":" << value.work.Value()
+                       << ",\"name\":\""
+                       << EscapeJson(value.name) << '"'
+                       << ",\"queue\":"
+                       << static_cast<unsigned>(value.queue);
+            }
+            else if constexpr (std::is_same_v<T,
+                compiler::WaitForWorkOperation>)
+            {
+                output << ",\"waitingQueue\":"
+                       << static_cast<unsigned>(value.waitingQueue)
+                       << ",\"signalWork\":"
+                       << value.signalWorkIndex
+                       << ",\"signalQueue\":"
+                       << static_cast<unsigned>(value.signalQueue);
+            }
+            else if constexpr (std::is_same_v<T,
+                compiler::WaitForTemporalOperation>)
+            {
+                output << ",\"waitingQueue\":"
+                       << static_cast<unsigned>(value.waitingQueue)
+                       << ",\"resource\":"
+                       << value.access.resource.Value()
+                       << ",\"frameLag\":" << value.access.frameLag;
+            }
+            else if constexpr (std::is_same_v<T,
+                compiler::ActivateAliasOperation>)
+            {
+                output << ",\"resource\":" << value.resource.Value()
+                       << ",\"frameLag\":" << value.frameLag;
+            }
+            else if constexpr (std::is_same_v<T,
+                compiler::TransitionOperation>)
+            {
+                output << ",\"view\":";
+                WriteNormalizedView(output, value.view);
+                output << ",\"state\":\""
+                       << gpu::ToString(value.state) << '"'
+                       << ",\"frameLag\":" << value.frameLag;
+            }
+            else if constexpr (std::is_same_v<T,
+                compiler::RequireCommonOperation>)
+            {
+                output << ",\"view\":";
+                WriteNormalizedView(output, value.view);
+                output << ",\"frameLag\":" << value.frameLag
+                       << ",\"implicitCopyState\":\""
+                       << gpu::ToString(value.implicitCopyState) << '"'
+                       << ",\"cyclicReuse\":"
+                       << (value.cyclicReuse ? "true" : "false");
+            }
+            else if constexpr (std::is_same_v<T,
+                compiler::ExecuteCommandOperation>)
+            {
+                output << ",\"commandKind\":"
+                       << value.command.index();
+            }
+            else if constexpr (std::is_same_v<T,
+                compiler::SubmitWorkOperation>)
+            {
+                output << ",\"workIndex\":" << value.workIndex
+                       << ",\"queue\":"
+                       << static_cast<unsigned>(value.queue)
+                       << ",\"temporalAccesses\":"
+                       << value.temporalAccesses.size();
+            }
+        }, operation);
+        output << '}';
+    }
 }
 
 namespace sge::diagnostics
@@ -149,6 +234,8 @@ namespace sge::diagnostics
 
     void WriteCompiledPackageJson(
         const compiler::CompiledRenderPackage& package,
+        const compiler::CompilationReport& report,
+        std::span<const compiler::Diagnostic> diagnostics,
         const std::filesystem::path& outputPath)
     {
         std::ofstream output(outputPath, std::ios::trunc);
@@ -162,8 +249,10 @@ namespace sge::diagnostics
         output << "{\n"
                << "  \"sourceHash\": " << package.sourceHash << ",\n"
                << "  \"packageHash\": " << package.packageHash << ",\n"
-               << "  \"legacyExecutable\": "
-               << (package.legacyExecutable ? "true" : "false") << ",\n"
+               << "  \"backendReady\": true,\n"
+               << "  \"planningUsedCompatibilitySnapshot\": "
+               << (report.planningUsedCompatibilitySnapshot
+                    ? "true" : "false") << ",\n"
                << "  \"statistics\": {\n"
                << "    \"logicalResources\": "
                << statistics.logicalResourceCount << ",\n"
@@ -174,6 +263,8 @@ namespace sge::diagnostics
                << statistics.executableCount << ",\n"
                << "    \"descriptorViews\": "
                << statistics.descriptorViewCount << ",\n"
+               << "    \"operations\": "
+               << statistics.operationCount << ",\n"
                << "    \"barriers\": " << statistics.barrierCount << ",\n"
                << "    \"queueWaits\": "
                << statistics.queueWaitCount << ",\n"
@@ -182,98 +273,58 @@ namespace sge::diagnostics
                << "  },\n"
                << "  \"requirements\": {\n"
                << "    \"textureSubresourceViews\": "
-               << (package.requirements.textureSubresourceViews ? "true" : "false")
-               << ",\n"
+               << (package.requirements.textureSubresourceViews
+                    ? "true" : "false") << ",\n"
                << "    \"multipleVertexStreams\": "
-               << (package.requirements.multipleVertexStreams ? "true" : "false")
-               << ",\n"
+               << (package.requirements.multipleVertexStreams
+                    ? "true" : "false") << ",\n"
                << "    \"indexedDraw\": "
-               << (package.requirements.indexedDraw ? "true" : "false")
-               << ",\n"
+               << (package.requirements.indexedDraw
+                    ? "true" : "false") << ",\n"
                << "    \"instancedDraw\": "
-               << (package.requirements.instancedDraw ? "true" : "false")
-               << ",\n"
+               << (package.requirements.instancedDraw
+                    ? "true" : "false") << ",\n"
                << "    \"explicitCopyQueueHandoffs\": "
                << (package.requirements.explicitCopyQueueHandoffs
-                    ? "true" : "false")
-               << ",\n"
+                    ? "true" : "false") << ",\n"
+               << "    \"dynamicDescriptorGrowth\": "
+               << (package.requirements.dynamicDescriptorGrowth
+                    ? "true" : "false") << ",\n"
                << "    \"advancedRasterState\": "
                << (package.requirements.advancedRasterState
-                    ? "true" : "false")
-               << ",\n"
+                    ? "true" : "false") << ",\n"
                << "    \"customViewportScissor\": "
                << (package.requirements.customViewportScissor
-                    ? "true" : "false")
-               << ",\n"
+                    ? "true" : "false") << ",\n"
                << "    \"expandedResourceFormats\": "
                << (package.requirements.expandedResourceFormats
-                    ? "true" : "false")
-               << "\n"
+                    ? "true" : "false") << "\n"
                << "  },\n"
-               << "  \"queueHandoffs\": [\n";
+               << "  \"operations\": [\n";
 
         for (std::size_t index = 0;
-             index < package.queueHandoffs.size(); ++index)
+             index < package.operations.size(); ++index)
         {
-            const auto& handoff = package.queueHandoffs[index];
-            output << "    {\"releaseWork\":"
-                   << handoff.releaseScheduledWork
-                   << ",\"acquireWork\":"
-                   << handoff.acquireScheduledWork
-                   << ",\"resource\":" << handoff.resource.Value()
-                   << ",\"frameLag\":" << handoff.frameLag
-                   << ",\"releaseQueue\":"
-                   << static_cast<unsigned>(handoff.releaseQueue)
-                   << ",\"acquireQueue\":"
-                   << static_cast<unsigned>(handoff.acquireQueue)
-                   << ",\"releaseState\":\""
-                   << gpu::ToString(handoff.releaseState)
-                   << "\",\"acquireState\":\""
-                   << gpu::ToString(handoff.acquireState)
-                   << "\",\"releaseView\":";
-            WriteNormalizedView(output, handoff.releaseView);
-            output << ",\"acquireView\":";
-            WriteNormalizedView(output, handoff.acquireView);
-            output << ",\"crossesCopyQueue\":"
-                   << (handoff.crossesCopyQueue ? "true" : "false") << '}';
-            output << (index + 1 == package.queueHandoffs.size() ? "\n" : ",\n");
-        }
-
-        output << "  ],\n  \"cyclicFrameHandoffs\": [\n";
-        for (std::size_t index = 0;
-             index < package.cyclicFrameHandoffs.size(); ++index)
-        {
-            const auto& handoff = package.cyclicFrameHandoffs[index];
-            output << "    {\"releaseWork\":"
-                   << handoff.releaseScheduledWork
-                   << ",\"acquireWork\":"
-                   << handoff.acquireScheduledWork
-                   << ",\"resource\":" << handoff.resource.Value()
-                   << ",\"releaseQueue\":"
-                   << static_cast<unsigned>(handoff.releaseQueue)
-                   << ",\"acquireQueue\":"
-                   << static_cast<unsigned>(handoff.acquireQueue)
-                   << ",\"releaseState\":\""
-                   << gpu::ToString(handoff.releaseState)
-                   << "\",\"acquireState\":\""
-                   << gpu::ToString(handoff.acquireState)
-                   << "\",\"releaseView\":";
-            WriteNormalizedView(output, handoff.releaseView);
-            output << ",\"acquireView\":";
-            WriteNormalizedView(output, handoff.acquireView);
-            output << ",\"requiresCommonRelease\":"
-                   << (handoff.requiresCommonRelease ? "true" : "false")
-                   << '}';
-            output << (index + 1 == package.cyclicFrameHandoffs.size()
+            output << "    ";
+            WriteOperation(output, package.operations[index]);
+            output << (index + 1 == package.operations.size()
                 ? "\n" : ",\n");
         }
 
-        output << "  ],\n  \"diagnostics\": [\n";
-        for (std::size_t index = 0;
-             index < package.diagnostics.size(); ++index)
+        output << "  ],\n  \"analysis\": {\n"
+               << "    \"dependencies\": "
+               << report.analysisPlan.dependencies.size() << ",\n"
+               << "    \"queueHandoffs\": "
+               << report.queueHandoffs.size() << ",\n"
+               << "    \"cyclicFrameHandoffs\": "
+               << report.cyclicFrameHandoffs.size() << "\n"
+               << "  },\n"
+               << "  \"diagnostics\": [\n";
+        for (std::size_t index = 0; index < diagnostics.size(); ++index)
         {
-            output << "    " << DiagnosticToJson(package.diagnostics[index]);
-            output << (index + 1 == package.diagnostics.size() ? "\n" : ",\n");
+            output << "    " << DiagnosticToJson(diagnostics[index]);
+            output << (index + 1 == diagnostics.size()
+                ? "\n" : ",\n");
         }
         output << "  ]\n}\n";
     }

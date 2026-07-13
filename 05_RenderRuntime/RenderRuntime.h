@@ -2,14 +2,11 @@
 
 #include "04_RenderCompiler/CompiledRenderPackage.h"
 
-#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <optional>
-#include <span>
-#include <stdexcept>
 #include <unordered_map>
 #include <vector>
 
@@ -35,44 +32,11 @@ namespace sge::runtime
 
         [[nodiscard]] virtual gpu::DeviceCapabilities Capabilities() const = 0;
 
-        // Package execution is the primary runtime boundary. Backends may
-        // override this method directly. The compatibility implementation is
-        // intentionally confined here and only accepts packages proven to be
-        // representable by the legacy D3D12 command path.
+        // The backend boundary is package-only. Source SemanticModule and the
+        // compiler's analysis ExecutionPlan never cross this interface.
         virtual void Execute(
             const compiler::CompiledRenderPackage& package,
-            const FrameInvocation& invocation)
-        {
-            (void)invocation;
-            if (!package.legacyExecutable)
-            {
-                throw std::runtime_error(
-                    "Backend requires native CompiledRenderPackage support for this package.");
-            }
-            auto frameModule = package.legacyModule;
-            for (const auto& [resourceId, bytes] :
-                 invocation.dynamicResourceData)
-            {
-                const auto found = std::find_if(
-                    frameModule.resources.begin(),
-                    frameModule.resources.end(),
-                    [&](const ir::ResourceDeclaration& resource)
-                    {
-                        return resource.id == resourceId;
-                    });
-                if (found != frameModule.resources.end())
-                {
-                    found->data = bytes;
-                }
-            }
-            Execute(frameModule, package.plan);
-        }
-
-        // Transitional compatibility boundary. New backends should override
-        // package execution and may leave this path unused.
-        virtual void Execute(
-            const ir::SemanticModule& module,
-            const compiler::ExecutionPlan& plan) = 0;
+            const FrameInvocation& invocation) = 0;
 
         virtual void WaitIdle() = 0;
     };

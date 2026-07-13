@@ -138,13 +138,15 @@ namespace sge::d3d12::detail
             const compiler::CompiledRenderPackage& package,
             const runtime::FrameInvocation& invocation) override;
 
-        void Execute(
-            const ir::SemanticModule& module,
-            const compiler::ExecutionPlan& plan) override;
-
         void WaitIdle() override;
 
     private:
+        // Unreachable regression implementation retained while old compiler
+        // tests are phased out. RenderRuntime cannot call this overload.
+        void Execute(
+            const ir::SemanticModule& module,
+            const compiler::ExecutionPlan& plan);
+
         void EnableDebugLayer();
         void ValidateDebugLayer();
         void CreateDeviceAndQueue();
@@ -280,7 +282,9 @@ namespace sge::d3d12::detail
             gpu::AbstractState abstractState,
             std::uint32_t frameLag = 0);
         void ValidateCopyQueueRequirement(
-            const compiler::RangeStateRequirement& requirement);
+            const compiler::NormalizedResourceView& view,
+            gpu::AbstractState state,
+            std::uint32_t frameLag);
         [[nodiscard]] bool PackageRangeIsCommon(
             const compiler::NormalizedResourceView& view,
             std::uint32_t frameLag = 0) const;

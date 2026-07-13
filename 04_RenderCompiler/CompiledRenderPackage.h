@@ -2,6 +2,7 @@
 
 #include "04_RenderCompiler/RenderCompiler.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -32,8 +33,7 @@ namespace sge::compiler
         UnsupportedCapability,
         MemoryBudgetExceeded,
         QueueHandoffRequired,
-        ShaderInterfaceMismatch,
-        PackageNotLegacyExecutable
+        ShaderInterfaceMismatch
     };
 
     struct DiagnosticLocation
@@ -88,6 +88,8 @@ namespace sge::compiler
         bool writeCapable = false;
     };
 
+    // These records are compiler-report structures. Backend execution does not
+    // reinterpret them; their effects are lowered into CompiledOperation.
     struct QueueHandoffPlan
     {
         std::size_t releaseScheduledWork = 0;
@@ -114,10 +116,6 @@ namespace sge::compiler
         gpu::QueueClass acquireQueue = gpu::QueueClass::Direct;
         gpu::AbstractState releaseState = gpu::AbstractState::Undefined;
         gpu::AbstractState acquireState = gpu::AbstractState::Undefined;
-
-        // True when the next reuse begins on the Copy queue. In that case the
-        // previous non-Copy user must explicitly release the physical state
-        // cell to COMMON before the frame slot can be recycled.
         bool requiresCommonRelease = false;
     };
 
@@ -202,10 +200,23 @@ namespace sge::compiler
         CompiledCommand command = CompiledPresentCommand{};
     };
 
+    struct CompiledOptimizedClearValue
+    {
+        gpu::ResourceFormat format = gpu::ResourceFormat::Unknown;
+        bool depthStencil = false;
+        std::array<float, 4> color{};
+        float depth = 1.0f;
+        std::uint8_t stencil = 0;
+    };
+
     struct CompiledResourceBlueprint
     {
         ir::ResourceDeclaration declaration;
         ResourceInstancePlan instances;
+        std::optional<gpu::PhysicalAllocationId> allocation;
+        std::vector<gpu::AbstractState> persistentReadStates;
+        std::optional<CompiledOptimizedClearValue> optimizedClear;
+        bool requiresTypelessResource = false;
         std::uint64_t estimatedCommittedBytes = 0;
     };
 
@@ -237,36 +248,109 @@ namespace sge::compiler
         std::size_t descriptorViewCount = 0;
         std::size_t barrierCount = 0;
         std::size_t queueWaitCount = 0;
+        std::size_t operationCount = 0;
         std::uint64_t estimatedCommittedBytes = 0;
     };
 
+    // Backend-ready operation stream. Queue ownership, barriers, cyclic slot
+    // reuse, temporal ordering and command execution are all explicit here.
+    struct BeginWorkOperation
+    {
+        std::size_t workIndex = 0;
+        gpu::WorkId work;
+        std::string name;
+        gpu::QueueClass queue = gpu::QueueClass::Direct;
+    };
+
+    struct WaitForWorkOperation
+    {
+        gpu::QueueClass waitingQueue = gpu::QueueClass::Direct;
+        std::size_t signalWorkIndex = 0;
+        gpu::QueueClass signalQueue = gpu::QueueClass::Direct;
+    };
+
+    struct WaitForTemporalOperation
+    {
+        gpu::QueueClass waitingQueue = gpu::QueueClass::Direct;
+        gpu::ResourceAccess access;
+    };
+
+    struct ActivateAliasOperation
+    {
+        gpu::ResourceId resource;
+        std::uint32_t frameLag = 0;
+    };
+
+    struct TransitionOperation
+    {
+        NormalizedResourceView view;
+        gpu::AbstractState state = gpu::AbstractState::Undefined;
+        std::uint32_t frameLag = 0;
+    };
+
+    struct RequireCommonOperation
+    {
+        NormalizedResourceView view;
+        std::uint32_t frameLag = 0;
+        gpu::AbstractState implicitCopyState = gpu::AbstractState::Undefined;
+        bool cyclicReuse = false;
+    };
+
+    struct ExecuteCommandOperation
+    {
+        CompiledCommand command = CompiledPresentCommand{};
+    };
+
+    struct SubmitWorkOperation
+    {
+        std::size_t workIndex = 0;
+        gpu::QueueClass queue = gpu::QueueClass::Direct;
+        std::vector<gpu::ResourceAccess> temporalAccesses;
+    };
+
+    using CompiledOperation = std::variant<
+        BeginWorkOperation,
+        WaitForWorkOperation,
+        WaitForTemporalOperation,
+        ActivateAliasOperation,
+        TransitionOperation,
+        RequireCommonOperation,
+        ExecuteCommandOperation,
+        SubmitWorkOperation>;
+
     struct CompiledRenderPackage
     {
-        // canonicalModule is a self-contained immutable snapshot. Legacy source
-        // fields are removed during canonicalization.
-        ir::SemanticModule canonicalModule;
-
-        // legacyModule is only used by the compatibility backend adapter. It is
-        // deliberately absent from backend-native package execution.
-        ir::SemanticModule legacyModule;
-        ExecutionPlan plan;
-
         std::vector<CompiledResourceBlueprint> resources;
         std::vector<CompiledProgramBlueprint> programs;
+        std::vector<ExecutableKey> executables;
+        std::vector<CompiledOperation> operations;
+        BackendFeatureRequirements requirements;
+        PackageStatistics statistics;
+        std::size_t sourceHash = 0;
+        std::size_t packageHash = 0;
+
+        [[nodiscard]] const CompiledResourceBlueprint& Resource(
+            gpu::ResourceId id) const;
+        [[nodiscard]] const CompiledProgramBlueprint& Program(
+            gpu::ProgramId id) const;
+    };
+
+    // Human/source-facing compiler data is deliberately separated from the
+    // backend package. The backend never receives or reads this report.
+    struct CompilationReport
+    {
+        ir::SemanticModule canonicalModule;
+        ExecutionPlan analysisPlan;
         std::vector<CompiledWork> works;
         std::vector<QueueHandoffPlan> queueHandoffs;
         std::vector<CyclicFrameHandoffPlan> cyclicFrameHandoffs;
-        BackendFeatureRequirements requirements;
-        PackageStatistics statistics;
-        std::vector<Diagnostic> diagnostics;
-        std::size_t sourceHash = 0;
-        std::size_t packageHash = 0;
-        bool legacyExecutable = true;
+        bool planningUsedCompatibilitySnapshot = false;
     };
 
     struct PackageCompileResult
     {
         CompiledRenderPackage package;
+        CompilationReport report;
         std::vector<Diagnostic> diagnostics;
 
         [[nodiscard]] bool Succeeded() const noexcept;
@@ -293,4 +377,5 @@ namespace sge::compiler
 
     [[nodiscard]] const char* ToString(DiagnosticCode code) noexcept;
     [[nodiscard]] const char* ToString(DiagnosticSeverity severity) noexcept;
+    [[nodiscard]] const char* ToString(const CompiledOperation& operation) noexcept;
 }

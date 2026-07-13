@@ -56,7 +56,8 @@ namespace sge::cube_lab
         }
         output << "mode,lowering_ms,compile_ms,logical_resources,"
                   "physical_instances,works,executables,descriptor_views,"
-                  "barriers,queue_waits,estimated_bytes,diagnostics,succeeded\n";
+                  "operations,barriers,queue_waits,estimated_bytes,"
+                  "diagnostics,succeeded\n";
         const auto write = [&](const char* name, const ExperimentMetrics& value)
         {
             output << name << ','
@@ -67,6 +68,7 @@ namespace sge::cube_lab
                    << value.package.workCount << ','
                    << value.package.executableCount << ','
                    << value.package.descriptorViewCount << ','
+                   << value.package.operationCount << ','
                    << value.package.barrierCount << ','
                    << value.package.queueWaitCount << ','
                    << value.package.estimatedCommittedBytes << ','

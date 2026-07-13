@@ -3,6 +3,7 @@
 #include "00_Foundation/Hash.h"
 
 #include <algorithm>
+#include <bit>
 #include <limits>
 #include <map>
 #include <set>
@@ -793,7 +794,7 @@ namespace
         return result;
     }
 
-    ir::ResourceView LegacyView(const ir::ResourceView& view)
+    ir::ResourceView PlanningView(const ir::ResourceView& view)
     {
         if (view.IsTextureRange())
         {
@@ -806,9 +807,9 @@ namespace
             view.strideBytes};
     }
 
-    ir::SemanticModule BuildLegacyModule(
+    ir::SemanticModule BuildPlanningSnapshot(
         const ir::SemanticModule& canonical,
-        bool& legacyExecutable)
+        bool& preservesNativeShape)
     {
         ir::SemanticModule result = canonical;
         for (auto& work : result.works)
@@ -819,28 +820,28 @@ namespace
                 {
                     if (binding.resource.IsTextureRange())
                     {
-                        legacyExecutable = false;
+                        preservesNativeShape = false;
                     }
-                    binding.resource = LegacyView(binding.resource);
+                    binding.resource = PlanningView(binding.resource);
                 }
                 for (auto& color : raster->attachments.colors)
                 {
                     if (color.IsTextureRange())
                     {
-                        legacyExecutable = false;
+                        preservesNativeShape = false;
                     }
-                    color = LegacyView(color);
+                    color = PlanningView(color);
                 }
                 if (raster->attachments.depth.IsTextureRange())
                 {
-                    legacyExecutable = false;
+                    preservesNativeShape = false;
                 }
-                raster->attachments.depth = LegacyView(
+                raster->attachments.depth = PlanningView(
                     raster->attachments.depth);
 
                 if (!raster->vertexStreams.empty())
                 {
-                    legacyExecutable = legacyExecutable
+                    preservesNativeShape = preservesNativeShape
                         && raster->vertexStreams.size() == 1
                         && raster->vertexStreams.front().inputSlot == 0;
                     const auto slotZero = std::find_if(
@@ -852,13 +853,13 @@ namespace
                         });
                     if (slotZero != raster->vertexStreams.end())
                     {
-                        raster->vertexResource = LegacyView(slotZero->resource);
+                        raster->vertexResource = PlanningView(slotZero->resource);
                     }
                     raster->vertexStreams.clear();
                 }
                 if (raster->indexBinding)
                 {
-                    legacyExecutable = false;
+                    preservesNativeShape = false;
                     // The core compiler still requires a non-indexed draw
                     // shape. Preserve a harmless representative count only for
                     // its scheduling/lifetime passes; package-native execution
@@ -870,15 +871,15 @@ namespace
                 }
                 if (raster->instanceCount != 1 || raster->firstInstance != 0)
                 {
-                    legacyExecutable = false;
+                    preservesNativeShape = false;
                     raster->instanceCount = 1;
                     raster->firstInstance = 0;
                 }
 
                 const auto& parameters = result.Program(
                     raster->program).BindingParameters();
-                std::vector<gpu::ResourceAccess> legacyAccesses;
-                legacyAccesses.push_back({
+                std::vector<gpu::ResourceAccess> planningAccesses;
+                planningAccesses.push_back({
                     raster->vertexResource.resource,
                     gpu::AccessMode::Read,
                     gpu::ResourceRole::VertexInput,
@@ -894,7 +895,7 @@ namespace
                     {
                         continue;
                     }
-                    legacyAccesses.push_back({
+                    planningAccesses.push_back({
                         binding.resource.resource,
                         kind == gpu::ProgramParameterKind::UnorderedAccess
                             ? gpu::AccessMode::Write
@@ -904,7 +905,7 @@ namespace
                 }
                 for (const auto& color : raster->attachments.colors)
                 {
-                    legacyAccesses.push_back({
+                    planningAccesses.push_back({
                         color.resource,
                         gpu::AccessMode::Write,
                         gpu::ResourceRole::ColorOutput,
@@ -912,7 +913,7 @@ namespace
                 }
                 if (raster->attachments.depth.IsValid())
                 {
-                    legacyAccesses.push_back({
+                    planningAccesses.push_back({
                         raster->attachments.depth.resource,
                         raster->rasterState.depth == gpu::DepthMode::ReadOnly
                             ? gpu::AccessMode::Read
@@ -920,7 +921,7 @@ namespace
                         gpu::ResourceRole::DepthOutput,
                         0});
                 }
-                work.accesses = std::move(legacyAccesses);
+                work.accesses = std::move(planningAccesses);
             }
             else if (auto* compute = std::get_if<ir::ComputeWork>(
                 &work.payload))
@@ -929,14 +930,14 @@ namespace
                 {
                     if (binding.resource.IsTextureRange())
                     {
-                        legacyExecutable = false;
+                        preservesNativeShape = false;
                     }
-                    binding.resource = LegacyView(binding.resource);
+                    binding.resource = PlanningView(binding.resource);
                 }
             }
         }
 
-        // The legacy core rejects one immutable Persistent resource shared by
+        // The established scheduling core rejects one immutable Persistent resource shared by
         // Copy and non-Copy queues because its old fixed read envelope cannot
         // express release/acquire ownership. The package layer does express
         // that handoff. Mark only the compatibility snapshot FrameLocal so the
@@ -971,11 +972,11 @@ namespace
             if (copyUse && nonCopyUse)
             {
                 resource.lifetime = gpu::ResourceLifetimeClass::FrameLocal;
-                legacyExecutable = false;
+                preservesNativeShape = false;
             }
         }
 
-        // The core compiler presently enforces one vertex stream. Preserve
+        // The scheduling analysis presently assumes one vertex stream. Preserve
         // one representative stream in the compatibility module even when the
         // package-native declaration starts at a non-zero input slot.
         for (auto& program : result.programs)
@@ -1013,7 +1014,7 @@ namespace
             if (oldSize != program.programInterface.vertexInputs.size()
                 || selectedSlot != 0)
             {
-                legacyExecutable = false;
+                preservesNativeShape = false;
             }
         }
         return result;
@@ -1117,6 +1118,40 @@ namespace sge::compiler
     bool PackageCompileResult::Succeeded() const noexcept
     {
         return !HasErrors(diagnostics);
+    }
+
+    const CompiledResourceBlueprint& CompiledRenderPackage::Resource(
+        gpu::ResourceId id) const
+    {
+        const auto found = std::find_if(
+            resources.begin(), resources.end(),
+            [&](const CompiledResourceBlueprint& resource)
+            {
+                return resource.declaration.id == id;
+            });
+        if (found == resources.end())
+        {
+            throw std::runtime_error(
+                "CompiledRenderPackage: resource blueprint not found.");
+        }
+        return *found;
+    }
+
+    const CompiledProgramBlueprint& CompiledRenderPackage::Program(
+        gpu::ProgramId id) const
+    {
+        const auto found = std::find_if(
+            programs.begin(), programs.end(),
+            [&](const CompiledProgramBlueprint& program)
+            {
+                return program.declaration.id == id;
+            });
+        if (found == programs.end())
+        {
+            throw std::runtime_error(
+                "CompiledRenderPackage: program blueprint not found.");
+        }
+        return *found;
     }
 
     RenderPackageCompiler::RenderPackageCompiler() = default;
@@ -1667,21 +1702,24 @@ namespace sge::compiler
         }
 
         result.package.sourceHash = module.StructureHash();
-        result.package.canonicalModule = Canonicalize(
+        result.report.canonicalModule = Canonicalize(
             module, result.diagnostics);
-        result.package.legacyExecutable = true;
-        result.package.legacyModule = BuildLegacyModule(
-            result.package.canonicalModule,
-            result.package.legacyExecutable);
 
-        // Reuse the proven core passes with the real queue capabilities. The
-        // package layer then makes every cross-queue edge explicit as a typed
-        // handoff record without changing the established execution order.
+        // The established dependency/scheduling passes remain an internal
+        // compiler implementation detail. Their compatibility snapshot and
+        // ExecutionPlan are retained only in CompilationReport; neither is
+        // embedded in nor visible to the backend-ready package.
+        bool planningSnapshotIsNative = true;
+        auto planningModule = BuildPlanningSnapshot(
+            result.report.canonicalModule,
+            planningSnapshotIsNative);
+        result.report.planningUsedCompatibilitySnapshot =
+            !planningSnapshotIsNative;
+
         CompileResult core;
         try
         {
-            core = coreCompiler_.Compile(
-                result.package.legacyModule, capabilities);
+            core = coreCompiler_.Compile(planningModule, capabilities);
         }
         catch (const std::exception& error)
         {
@@ -1689,22 +1727,21 @@ namespace sge::compiler
                 result.diagnostics,
                 DiagnosticCode::InvalidWork,
                 DiagnosticSeverity::Error,
-                std::string("Compatibility planning failed: ")
+                std::string("Internal scheduling analysis failed: ")
                     + error.what());
-            result.package.diagnostics = result.diagnostics;
             return result;
         }
-        result.package.plan = std::move(core.plan);
+        result.report.analysisPlan = std::move(core.plan);
 
         // Physical instance selection belongs to the canonical resource
         // lifetime, not to the compatibility module used by the old core.
         // Rebuild every entry so generalized streams/index resources omitted
         // from the compatibility payload are still materialized correctly.
-        result.package.plan.resourceInstances.clear();
+        result.report.analysisPlan.resourceInstances.clear();
         const auto frameCount = std::max(
             1u, capabilities.maxFramesInFlight);
         for (const auto& resource :
-             result.package.canonicalModule.resources)
+             result.report.canonicalModule.resources)
         {
             ResourceInstancePlan instance;
             instance.resource = resource.id;
@@ -1724,7 +1761,7 @@ namespace sge::compiler
             {
                 std::uint32_t maximumFrameLag = 0;
                 for (const auto& work :
-                     result.package.canonicalModule.works)
+                     result.report.canonicalModule.works)
                 {
                     for (const auto& access : work.accesses)
                     {
@@ -1748,7 +1785,7 @@ namespace sge::compiler
                 instance.physicalInstanceCount = 0;
                 break;
             }
-            result.package.plan.resourceInstances.push_back(instance);
+            result.report.analysisPlan.resourceInstances.push_back(instance);
         }
 
         for (auto& text : core.diagnostics)
@@ -1760,17 +1797,17 @@ namespace sge::compiler
                 std::move(text));
         }
 
-        for (const auto& resource : result.package.canonicalModule.resources)
+        for (const auto& resource : result.report.canonicalModule.resources)
         {
             const auto instance = std::find_if(
-                result.package.plan.resourceInstances.begin(),
-                result.package.plan.resourceInstances.end(),
+                result.report.analysisPlan.resourceInstances.begin(),
+                result.report.analysisPlan.resourceInstances.end(),
                 [&](const ResourceInstancePlan& value)
                 {
                     return value.resource == resource.id;
                 });
             ResourceInstancePlan instancePlan;
-            if (instance != result.package.plan.resourceInstances.end())
+            if (instance != result.report.analysisPlan.resourceInstances.end())
             {
                 instancePlan = *instance;
             }
@@ -1781,9 +1818,24 @@ namespace sge::compiler
             }
             const auto bytes = EstimateResourceBytes(
                 resource, instancePlan.physicalInstanceCount);
+            std::optional<gpu::PhysicalAllocationId> allocation;
+            const auto lifetime = std::find_if(
+                result.report.analysisPlan.lifetimes.begin(),
+                result.report.analysisPlan.lifetimes.end(),
+                [&](const ResourceLifetime& value)
+                {
+                    return value.resource == resource.id;
+                });
+            if (lifetime != result.report.analysisPlan.lifetimes.end()
+                && resource.lifetime == gpu::ResourceLifetimeClass::FrameLocal
+                && resource.update == gpu::ResourceUpdateClass::GpuProduced)
+            {
+                allocation = lifetime->allocation;
+            }
             result.package.resources.push_back({
                 .declaration = resource,
                 .instances = instancePlan,
+                .allocation = allocation,
                 .estimatedCommittedBytes = bytes
             });
             result.package.statistics.estimatedCommittedBytes += bytes;
@@ -1791,7 +1843,7 @@ namespace sge::compiler
                 instancePlan.physicalInstanceCount;
         }
 
-        for (const auto& resource : result.package.canonicalModule.resources)
+        for (const auto& resource : result.report.canonicalModule.resources)
         {
             const auto format = resource.Format();
             if (format != gpu::ResourceFormat::Unknown
@@ -1802,7 +1854,7 @@ namespace sge::compiler
             }
         }
 
-        for (const auto& program : result.package.canonicalModule.programs)
+        for (const auto& program : result.report.canonicalModule.programs)
         {
             result.package.programs.push_back({
                 .declaration = program,
@@ -1810,17 +1862,17 @@ namespace sge::compiler
             });
         }
 
-        result.package.works.resize(
-            result.package.plan.scheduledWorks.size());
+        result.report.works.resize(
+            result.report.analysisPlan.scheduledWorks.size());
         for (std::size_t scheduledIndex = 0;
-             scheduledIndex < result.package.plan.scheduledWorks.size();
+             scheduledIndex < result.report.analysisPlan.scheduledWorks.size();
              ++scheduledIndex)
         {
             const auto& scheduled =
-                result.package.plan.scheduledWorks[scheduledIndex];
-            const auto& source = result.package.canonicalModule.works.at(
+                result.report.analysisPlan.scheduledWorks[scheduledIndex];
+            const auto& source = result.report.canonicalModule.works.at(
                 scheduled.sourceWorkIndex);
-            auto& compiled = result.package.works[scheduledIndex];
+            auto& compiled = result.report.works[scheduledIndex];
             compiled.id = source.id;
             compiled.name = source.name;
             compiled.accesses = source.accesses;
@@ -1833,7 +1885,7 @@ namespace sge::compiler
                     : gpu::QueueClass::Direct;
 
             const auto viewUses = CollectViewUses(
-                result.package.canonicalModule, source,
+                result.report.canonicalModule, source,
                 result.diagnostics);
             for (const auto& use : viewUses)
             {
@@ -1848,7 +1900,7 @@ namespace sge::compiler
                 if (use.view.kind != gpu::ResourceKind::Buffer
                     && use.view.kind != gpu::ResourceKind::Presentation)
                 {
-                    const auto& declaration = result.package.canonicalModule.Resource(
+                    const auto& declaration = result.report.canonicalModule.Resource(
                         use.view.resource);
                     const auto& texture = std::get<ir::TextureDescription>(
                         declaration.description);
@@ -1881,15 +1933,15 @@ namespace sge::compiler
                     CompiledRasterCommand command;
                     command.program = payload.program;
                     command.executable = RasterExecutable(
-                        result.package.canonicalModule, payload);
+                        result.report.canonicalModule, payload);
                     command.bindings = CompileBindings(
-                        result.package.canonicalModule,
+                        result.report.canonicalModule,
                         payload.program, payload.bindings,
                         result.diagnostics, source.id);
                     if (payload.vertexStreams.empty())
                     {
                         if (const auto view = NormalizeView(
-                            result.package.canonicalModule,
+                            result.report.canonicalModule,
                             payload.vertexResource,
                             result.diagnostics, source.id))
                         {
@@ -1901,7 +1953,7 @@ namespace sge::compiler
                         for (const auto& stream : payload.vertexStreams)
                         {
                             if (const auto view = NormalizeView(
-                                result.package.canonicalModule,
+                                result.report.canonicalModule,
                                 stream.resource,
                                 result.diagnostics, source.id))
                             {
@@ -1917,7 +1969,7 @@ namespace sge::compiler
                     if (payload.indexBinding)
                     {
                         if (const auto view = NormalizeView(
-                            result.package.canonicalModule,
+                            result.report.canonicalModule,
                             payload.indexBinding->resource,
                             result.diagnostics, source.id))
                         {
@@ -1974,7 +2026,7 @@ namespace sge::compiler
                     for (const auto& color : payload.attachments.colors)
                     {
                         if (const auto view = NormalizeView(
-                            result.package.canonicalModule,
+                            result.report.canonicalModule,
                             color, result.diagnostics, source.id))
                         {
                             command.colorAttachments.push_back(*view);
@@ -1983,7 +2035,7 @@ namespace sge::compiler
                     if (payload.attachments.depth.IsValid())
                     {
                         command.depthAttachment = NormalizeView(
-                            result.package.canonicalModule,
+                            result.report.canonicalModule,
                             payload.attachments.depth,
                             result.diagnostics, source.id);
                     }
@@ -1996,7 +2048,7 @@ namespace sge::compiler
                     command.executable.program = payload.program;
                     command.executable.compute = true;
                     command.bindings = CompileBindings(
-                        result.package.canonicalModule,
+                        result.report.canonicalModule,
                         payload.program, payload.bindings,
                         result.diagnostics, source.id);
                     command.groupCountX = payload.groupCountX;
@@ -2007,9 +2059,9 @@ namespace sge::compiler
                 else if constexpr (std::is_same_v<T, ir::CopyWork>)
                 {
                     const auto* sourceResource = TryResource(
-                        result.package.canonicalModule, payload.source);
+                        result.report.canonicalModule, payload.source);
                     const auto* destinationResource = TryResource(
-                        result.package.canonicalModule, payload.destination);
+                        result.report.canonicalModule, payload.destination);
                     const auto makeCopyView = [&](const ir::ResourceDeclaration* resource,
                                                   gpu::ResourceId id,
                                                   std::uint64_t offset)
@@ -2025,12 +2077,12 @@ namespace sge::compiler
                         return ir::ResourceView{id, offset, size};
                     };
                     const auto sourceView = NormalizeView(
-                        result.package.canonicalModule,
+                        result.report.canonicalModule,
                         makeCopyView(sourceResource, payload.source,
                             payload.sourceOffset),
                         result.diagnostics, source.id);
                     const auto destinationView = NormalizeView(
-                        result.package.canonicalModule,
+                        result.report.canonicalModule,
                         makeCopyView(destinationResource, payload.destination,
                             payload.destinationOffset),
                         result.diagnostics, source.id);
@@ -2053,9 +2105,9 @@ namespace sge::compiler
         // Recompute immutable Persistent read envelopes from package-native
         // range states. Resources touching the Copy queue deliberately remain
         // outside a fixed union state and use explicit handoffs instead.
-        result.package.plan.persistentReadStates.clear();
+        result.report.analysisPlan.persistentReadStates.clear();
         for (const auto& resource :
-             result.package.canonicalModule.resources)
+             result.report.canonicalModule.resources)
         {
             if (resource.lifetime
                 != gpu::ResourceLifetimeClass::Persistent)
@@ -2066,7 +2118,7 @@ namespace sge::compiler
             envelope.resource = resource.id;
             bool copyUse = false;
             bool writeUse = false;
-            for (const auto& work : result.package.works)
+            for (const auto& work : result.report.works)
             {
                 for (const auto& requirement : work.rangeStates)
                 {
@@ -2095,8 +2147,24 @@ namespace sge::compiler
                         return static_cast<std::uint32_t>(left)
                             < static_cast<std::uint32_t>(right);
                     });
-                result.package.plan.persistentReadStates.push_back(
+                result.report.analysisPlan.persistentReadStates.push_back(
                     std::move(envelope));
+            }
+        }
+
+        for (const auto& envelope :
+             result.report.analysisPlan.persistentReadStates)
+        {
+            const auto blueprint = std::find_if(
+                result.package.resources.begin(),
+                result.package.resources.end(),
+                [&](const CompiledResourceBlueprint& value)
+                {
+                    return value.declaration.id == envelope.resource;
+                });
+            if (blueprint != result.package.resources.end())
+            {
+                blueprint->persistentReadStates = envelope.states;
             }
         }
 
@@ -2106,8 +2174,8 @@ namespace sge::compiler
                                                   const RangeStateRequirement& acquire)
         {
             return std::any_of(
-                result.package.queueHandoffs.begin(),
-                result.package.queueHandoffs.end(),
+                result.report.queueHandoffs.begin(),
+                result.report.queueHandoffs.end(),
                 [&](const QueueHandoffPlan& handoff)
                 {
                     return handoff.releaseScheduledWork == releaseWork
@@ -2125,9 +2193,9 @@ namespace sge::compiler
                                     const RangeStateRequirement& acquire)
         {
             const auto releaseQueue =
-                result.package.works.at(releaseWork).queue;
+                result.report.works.at(releaseWork).queue;
             const auto acquireQueue =
-                result.package.works.at(acquireWork).queue;
+                result.report.works.at(acquireWork).queue;
             if (releaseQueue == acquireQueue
                 || release.view.resource != acquire.view.resource
                 || release.frameLag != acquire.frameLag
@@ -2139,7 +2207,7 @@ namespace sge::compiler
 
             const bool copy = releaseQueue == gpu::QueueClass::Copy
                 || acquireQueue == gpu::QueueClass::Copy;
-            result.package.queueHandoffs.push_back({
+            result.report.queueHandoffs.push_back({
                 .releaseScheduledWork = releaseWork,
                 .acquireScheduledWork = acquireWork,
                 .resource = acquire.view.resource,
@@ -2196,7 +2264,7 @@ namespace sge::compiler
             }
 
             const auto& texture = std::get<ir::TextureDescription>(
-                result.package.canonicalModule.Resource(
+                result.report.canonicalModule.Resource(
                     requirement.view.resource).description);
             const auto& range = requirement.view.textureRange;
             cells.reserve(static_cast<std::size_t>(range.mipCount)
@@ -2260,13 +2328,13 @@ namespace sge::compiler
         std::unordered_map<StateCellKey, LastQueueUse, StateCellHash>
             lastFrameLocalUses;
         for (std::size_t workIndex = 0;
-             workIndex < result.package.works.size(); ++workIndex)
+             workIndex < result.report.works.size(); ++workIndex)
         {
-            const auto& work = result.package.works[workIndex];
+            const auto& work = result.report.works[workIndex];
             for (const auto& requirement : work.rangeStates)
             {
                 const auto& declaration =
-                    result.package.canonicalModule.Resource(
+                    result.report.canonicalModule.Resource(
                         requirement.view.resource);
                 for (auto [key, cell] : stateCells(requirement))
                 {
@@ -2324,7 +2392,7 @@ namespace sge::compiler
                 continue;
             }
 
-            result.package.cyclicFrameHandoffs.push_back({
+            result.report.cyclicFrameHandoffs.push_back({
                 .releaseScheduledWork = last->second.work,
                 .acquireScheduledWork = first.work,
                 .resource = key.resource,
@@ -2339,8 +2407,8 @@ namespace sge::compiler
             result.package.requirements.explicitCopyQueueHandoffs = true;
         }
         std::sort(
-            result.package.cyclicFrameHandoffs.begin(),
-            result.package.cyclicFrameHandoffs.end(),
+            result.report.cyclicFrameHandoffs.begin(),
+            result.report.cyclicFrameHandoffs.end(),
             [](const CyclicFrameHandoffPlan& left,
                const CyclicFrameHandoffPlan& right)
             {
@@ -2367,9 +2435,297 @@ namespace sge::compiler
                 return left.acquireView < right.acquireView;
             });
 
+        const auto resourceBlueprint = [&](gpu::ResourceId id)
+            -> CompiledResourceBlueprint*
+        {
+            const auto found = std::find_if(
+                result.package.resources.begin(),
+                result.package.resources.end(),
+                [&](const CompiledResourceBlueprint& value)
+                {
+                    return value.declaration.id == id;
+                });
+            return found == result.package.resources.end()
+                ? nullptr : &*found;
+        };
+
+        // Backend resource creation must not rediscover typeless requirements
+        // or optimized clear values by walking source works. Freeze both into
+        // the resource blueprint before the operation stream is emitted.
+        for (const auto& work : result.report.works)
+        {
+            for (const auto& requirement : work.rangeStates)
+            {
+                auto* blueprint = resourceBlueprint(
+                    requirement.view.resource);
+                if (blueprint == nullptr
+                    || requirement.view.kind == gpu::ResourceKind::Buffer
+                    || requirement.view.kind
+                        == gpu::ResourceKind::Presentation)
+                {
+                    continue;
+                }
+                if (requirement.view.format
+                    != blueprint->declaration.Format())
+                {
+                    blueprint->requiresTypelessResource = true;
+                }
+            }
+        }
+
+        std::unordered_set<gpu::ResourceId,
+            foundation::StrongIdHash<gpu::ResourceTag>> clearConflicts;
+        const auto sameOptimizedClear = [](
+            const CompiledOptimizedClearValue& left,
+            const CompiledOptimizedClearValue& right)
+        {
+            return left.format == right.format
+                && left.depthStencil == right.depthStencil
+                && left.color == right.color
+                && left.depth == right.depth
+                && left.stencil == right.stencil;
+        };
+        const auto recordOptimizedClear = [&] (
+            const NormalizedResourceView& view,
+            const ir::ClearDescription& clear,
+            bool depthStencil)
+        {
+            auto* blueprint = resourceBlueprint(view.resource);
+            if (blueprint == nullptr
+                || blueprint->declaration.lifetime
+                    == gpu::ResourceLifetimeClass::External)
+            {
+                return;
+            }
+            CompiledOptimizedClearValue candidate;
+            candidate.format = view.format;
+            candidate.depthStencil = depthStencil;
+            candidate.color = clear.color;
+            candidate.depth = clear.depth;
+            if (!blueprint->optimizedClear)
+            {
+                blueprint->optimizedClear = candidate;
+            }
+            else if (!sameOptimizedClear(
+                *blueprint->optimizedClear, candidate))
+            {
+                clearConflicts.insert(view.resource);
+            }
+        };
+        for (const auto& work : result.report.works)
+        {
+            const auto* raster = std::get_if<CompiledRasterCommand>(
+                &work.command);
+            if (raster == nullptr)
+            {
+                continue;
+            }
+            if (raster->clear.clearColor
+                || raster->clear.colorLoad
+                    == ir::AttachmentLoadOperation::Clear)
+            {
+                for (const auto& color : raster->colorAttachments)
+                {
+                    recordOptimizedClear(color, raster->clear, false);
+                }
+            }
+            if (raster->depthAttachment
+                && (raster->clear.clearDepth
+                    || raster->clear.depthLoad
+                        == ir::AttachmentLoadOperation::Clear))
+            {
+                recordOptimizedClear(
+                    *raster->depthAttachment, raster->clear, true);
+            }
+        }
+        for (auto& blueprint : result.package.resources)
+        {
+            if (blueprint.requiresTypelessResource
+                || clearConflicts.contains(blueprint.declaration.id))
+            {
+                blueprint.optimizedClear.reset();
+            }
+        }
+
+        // Lower every execution-side decision to one linear operation stream.
+        // Backend execution no longer scans works, handoff tables, temporal
+        // dependencies, cyclic edges or an ExecutionPlan.
+        result.package.operations.clear();
+        for (std::size_t workIndex = 0;
+             workIndex < result.report.works.size(); ++workIndex)
+        {
+            const auto& work = result.report.works[workIndex];
+            for (const auto& access : work.accesses)
+            {
+                const auto* blueprint = resourceBlueprint(access.resource);
+                if (blueprint != nullptr
+                    && blueprint->instances.lifetime
+                        == gpu::ResourceLifetimeClass::Temporal)
+                {
+                    result.package.operations.push_back(
+                        WaitForTemporalOperation{
+                            .waitingQueue = work.queue,
+                            .access = access});
+                }
+            }
+
+            std::unordered_set<std::uint64_t> waitedWorks;
+            for (const auto& handoff : result.report.queueHandoffs)
+            {
+                if (handoff.acquireScheduledWork != workIndex)
+                {
+                    continue;
+                }
+                const auto key =
+                    (static_cast<std::uint64_t>(
+                        handoff.releaseScheduledWork) << 8u)
+                    | static_cast<std::uint64_t>(handoff.releaseQueue);
+                if (waitedWorks.insert(key).second)
+                {
+                    result.package.operations.push_back(
+                        WaitForWorkOperation{
+                            .waitingQueue = handoff.acquireQueue,
+                            .signalWorkIndex = handoff.releaseScheduledWork,
+                            .signalQueue = handoff.releaseQueue});
+                }
+            }
+            for (const auto& handoff : result.report.cyclicFrameHandoffs)
+            {
+                if (handoff.acquireScheduledWork == workIndex
+                    && handoff.requiresCommonRelease)
+                {
+                    result.package.operations.push_back(
+                        RequireCommonOperation{
+                            .view = handoff.acquireView,
+                            .frameLag = 0,
+                            .implicitCopyState = handoff.acquireState,
+                            .cyclicReuse = true});
+                }
+            }
+
+            result.package.operations.push_back(BeginWorkOperation{
+                .workIndex = workIndex,
+                .work = work.id,
+                .name = work.name,
+                .queue = work.queue});
+
+            for (const auto& requirement : work.rangeStates)
+            {
+                result.package.operations.push_back(
+                    ActivateAliasOperation{
+                        .resource = requirement.view.resource,
+                        .frameLag = requirement.frameLag});
+                if (work.queue == gpu::QueueClass::Copy)
+                {
+                    result.package.operations.push_back(
+                        RequireCommonOperation{
+                            .view = requirement.view,
+                            .frameLag = requirement.frameLag,
+                            .implicitCopyState = requirement.state,
+                            .cyclicReuse = false});
+                }
+                else
+                {
+                    result.package.operations.push_back(
+                        TransitionOperation{
+                            .view = requirement.view,
+                            .state = requirement.state,
+                            .frameLag = requirement.frameLag});
+                }
+            }
+
+            result.package.operations.push_back(
+                ExecuteCommandOperation{work.command});
+
+            for (const auto& handoff : result.report.queueHandoffs)
+            {
+                if (handoff.releaseScheduledWork != workIndex)
+                {
+                    continue;
+                }
+                if (work.queue == gpu::QueueClass::Copy)
+                {
+                    result.package.operations.push_back(
+                        RequireCommonOperation{
+                            .view = handoff.releaseView,
+                            .frameLag = handoff.frameLag,
+                            .implicitCopyState = handoff.releaseState,
+                            .cyclicReuse = false});
+                }
+                else
+                {
+                    result.package.operations.push_back(
+                        TransitionOperation{
+                            .view = handoff.releaseView,
+                            .state = gpu::AbstractState::Undefined,
+                            .frameLag = handoff.frameLag});
+                }
+            }
+            for (const auto& handoff : result.report.cyclicFrameHandoffs)
+            {
+                if (handoff.releaseScheduledWork != workIndex
+                    || !handoff.requiresCommonRelease)
+                {
+                    continue;
+                }
+                if (work.queue == gpu::QueueClass::Copy)
+                {
+                    result.package.operations.push_back(
+                        RequireCommonOperation{
+                            .view = handoff.releaseView,
+                            .frameLag = 0,
+                            .implicitCopyState = handoff.releaseState,
+                            .cyclicReuse = true});
+                }
+                else
+                {
+                    result.package.operations.push_back(
+                        TransitionOperation{
+                            .view = handoff.releaseView,
+                            .state = gpu::AbstractState::Undefined,
+                            .frameLag = 0});
+                }
+            }
+
+            if (work.queue != gpu::QueueClass::Copy)
+            {
+                for (const auto& requirement : work.rangeStates)
+                {
+                    const auto* blueprint = resourceBlueprint(
+                        requirement.view.resource);
+                    if (blueprint != nullptr
+                        && blueprint->instances.lifetime
+                            == gpu::ResourceLifetimeClass::Temporal)
+                    {
+                        result.package.operations.push_back(
+                            TransitionOperation{
+                                .view = requirement.view,
+                                .state = gpu::AbstractState::Undefined,
+                                .frameLag = requirement.frameLag});
+                    }
+                }
+            }
+
+            std::vector<gpu::ResourceAccess> temporalAccesses;
+            for (const auto& access : work.accesses)
+            {
+                const auto* blueprint = resourceBlueprint(access.resource);
+                if (blueprint != nullptr
+                    && blueprint->instances.lifetime
+                        == gpu::ResourceLifetimeClass::Temporal)
+                {
+                    temporalAccesses.push_back(access);
+                }
+            }
+            result.package.operations.push_back(SubmitWorkOperation{
+                .workIndex = workIndex,
+                .queue = work.queue,
+                .temporalAccesses = std::move(temporalAccesses)});
+        }
+
         result.package.requirements.dynamicDescriptorGrowth =
             result.package.requirements.textureSubresourceViews
-            || result.package.works.size() > 128;
+            || result.report.works.size() > 128;
 
         const auto& requirements = result.package.requirements;
         const bool unsupported =
@@ -2391,7 +2747,6 @@ namespace sge::compiler
                 && !capabilities.expandedResourceFormats);
         if (unsupported)
         {
-            result.package.legacyExecutable = false;
             AddDiagnostic(
                 result.diagnostics,
                 DiagnosticCode::UnsupportedCapability,
@@ -2401,12 +2756,10 @@ namespace sge::compiler
 
         result.package.statistics.logicalResourceCount =
             result.package.resources.size();
-        result.package.statistics.workCount = result.package.works.size();
-        std::vector<ExecutableKey> packageExecutables;
-        std::size_t rangeBarrierUpperBound = 0;
-        for (const auto& work : result.package.works)
+        result.package.statistics.workCount = result.report.works.size();
+        result.package.executables.clear();
+        for (const auto& work : result.report.works)
         {
-            rangeBarrierUpperBound += work.rangeStates.size();
             std::visit([&](const auto& command)
             {
                 using T = std::decay_t<decltype(command)>;
@@ -2414,25 +2767,16 @@ namespace sge::compiler
                     || std::is_same_v<T, CompiledComputeCommand>)
                 {
                     if (std::find(
-                            packageExecutables.begin(),
-                            packageExecutables.end(),
-                            command.executable) == packageExecutables.end())
+                            result.package.executables.begin(),
+                            result.package.executables.end(),
+                            command.executable)
+                        == result.package.executables.end())
                     {
-                        packageExecutables.push_back(command.executable);
+                        result.package.executables.push_back(
+                            command.executable);
                     }
                 }
             }, work.command);
-        }
-        result.package.statistics.executableCount =
-            packageExecutables.size();
-        result.package.statistics.barrierCount =
-            rangeBarrierUpperBound
-            + result.package.queueHandoffs.size()
-            + result.package.cyclicFrameHandoffs.size();
-        result.package.statistics.queueWaitCount =
-            result.package.queueHandoffs.size();
-        for (const auto& work : result.package.works)
-        {
             result.package.statistics.descriptorViewCount +=
                 std::visit([](const auto& command) -> std::size_t
                 {
@@ -2451,6 +2795,30 @@ namespace sge::compiler
                     return 0;
                 }, work.command);
         }
+        result.package.statistics.executableCount =
+            result.package.executables.size();
+        result.package.statistics.operationCount =
+            result.package.operations.size();
+        result.package.statistics.barrierCount = static_cast<std::size_t>(
+            std::count_if(
+                result.package.operations.begin(),
+                result.package.operations.end(),
+                [](const CompiledOperation& operation)
+                {
+                    return std::holds_alternative<TransitionOperation>(
+                        operation);
+                }));
+        result.package.statistics.queueWaitCount = static_cast<std::size_t>(
+            std::count_if(
+                result.package.operations.begin(),
+                result.package.operations.end(),
+                [](const CompiledOperation& operation)
+                {
+                    return std::holds_alternative<WaitForWorkOperation>(
+                            operation)
+                        || std::holds_alternative<WaitForTemporalOperation>(
+                            operation);
+                }));
 
         if (capabilities.localMemoryBudget != 0
             && result.package.statistics.estimatedCommittedBytes
@@ -2469,7 +2837,7 @@ namespace sge::compiler
         }
 
         std::size_t packageHash =
-            result.package.canonicalModule.StructureHash();
+            result.report.canonicalModule.StructureHash();
         foundation::HashCombine(packageHash, capabilities.concurrentCompute);
         foundation::HashCombine(packageHash, capabilities.dedicatedCopyQueue);
         foundation::HashCombine(packageHash, capabilities.maxFramesInFlight);
@@ -2497,30 +2865,31 @@ namespace sge::compiler
                 packageHash, view.textureRange.depthSliceCount);
             foundation::HashEnum(packageHash, view.format);
         };
-        for (const auto& work : result.package.works)
+        const auto hashAccess = [&](const gpu::ResourceAccess& access)
         {
-            foundation::HashCombine(packageHash, work.id.Value());
-            foundation::HashEnum(packageHash, work.queue);
-            for (const auto& range : work.rangeStates)
-            {
-                hashView(range.view);
-                foundation::HashEnum(packageHash, range.state);
-                foundation::HashCombine(packageHash, range.frameLag);
-                foundation::HashCombine(packageHash, range.writeCapable);
-            }
+            foundation::HashCombine(packageHash, access.resource.Value());
+            foundation::HashEnum(packageHash, access.access);
+            foundation::HashEnum(packageHash, access.role);
+            foundation::HashCombine(packageHash, access.frameLag);
+        };
+        const auto hashCommand = [&](const CompiledCommand& compiledCommand)
+        {
             std::visit([&](const auto& command)
             {
                 using T = std::decay_t<decltype(command)>;
                 if constexpr (std::is_same_v<T, CompiledRasterCommand>)
                 {
-                    foundation::HashCombine(packageHash, command.program.Value());
+                    foundation::HashCombine(
+                        packageHash, command.program.Value());
                     foundation::HashCombine(packageHash, command.vertexCount);
+                    foundation::HashCombine(packageHash, command.firstVertex);
                     foundation::HashCombine(packageHash, command.indexCount);
                     foundation::HashCombine(packageHash, command.instanceCount);
                     foundation::HashCombine(packageHash, command.firstInstance);
                     for (const auto& stream : command.vertexStreams)
                     {
-                        foundation::HashCombine(packageHash, stream.inputSlot);
+                        foundation::HashCombine(
+                            packageHash, stream.inputSlot);
                         hashView(stream.view);
                     }
                     if (command.indexStream)
@@ -2535,13 +2904,40 @@ namespace sge::compiler
                             static_cast<std::size_t>(
                                 command.indexStream->baseVertex));
                     }
+                    for (const auto& binding : command.bindings)
+                    {
+                        foundation::HashCombine(
+                            packageHash, binding.parameterIndex);
+                        foundation::HashEnum(packageHash, binding.kind);
+                        hashView(binding.view);
+                        foundation::HashCombine(
+                            packageHash, binding.frameLag);
+                    }
+                    for (const auto& attachment : command.colorAttachments)
+                    {
+                        hashView(attachment);
+                    }
+                    if (command.depthAttachment)
+                    {
+                        hashView(*command.depthAttachment);
+                    }
                 }
                 else if constexpr (std::is_same_v<T, CompiledComputeCommand>)
                 {
-                    foundation::HashCombine(packageHash, command.program.Value());
+                    foundation::HashCombine(
+                        packageHash, command.program.Value());
                     foundation::HashCombine(packageHash, command.groupCountX);
                     foundation::HashCombine(packageHash, command.groupCountY);
                     foundation::HashCombine(packageHash, command.groupCountZ);
+                    for (const auto& binding : command.bindings)
+                    {
+                        foundation::HashCombine(
+                            packageHash, binding.parameterIndex);
+                        foundation::HashEnum(packageHash, binding.kind);
+                        hashView(binding.view);
+                        foundation::HashCombine(
+                            packageHash, binding.frameLag);
+                    }
                 }
                 else if constexpr (std::is_same_v<T, CompiledCopyCommand>)
                 {
@@ -2554,45 +2950,118 @@ namespace sge::compiler
                 }
                 else
                 {
-                    foundation::HashCombine(packageHash, command.source.Value());
+                    foundation::HashCombine(
+                        packageHash, command.source.Value());
                 }
-            }, work.command);
-        }
-        for (const auto& handoff : result.package.queueHandoffs)
+            }, compiledCommand);
+        };
+
+        for (const auto& resource : result.package.resources)
         {
             foundation::HashCombine(
-                packageHash, handoff.releaseScheduledWork);
+                packageHash, resource.declaration.id.Value());
             foundation::HashCombine(
-                packageHash, handoff.acquireScheduledWork);
-            foundation::HashCombine(packageHash, handoff.resource.Value());
-            foundation::HashCombine(packageHash, handoff.frameLag);
-            hashView(handoff.releaseView);
-            hashView(handoff.acquireView);
-            foundation::HashEnum(packageHash, handoff.releaseQueue);
-            foundation::HashEnum(packageHash, handoff.acquireQueue);
-            foundation::HashEnum(packageHash, handoff.releaseState);
-            foundation::HashEnum(packageHash, handoff.acquireState);
-            foundation::HashCombine(packageHash, handoff.crossesCopyQueue);
+                packageHash, resource.instances.physicalInstanceCount);
+            foundation::HashCombine(
+                packageHash, resource.instances.maximumFrameLag);
+            if (resource.allocation)
+            {
+                foundation::HashCombine(
+                    packageHash, resource.allocation->Value());
+            }
+            foundation::HashCombine(
+                packageHash, resource.requiresTypelessResource);
+            for (const auto state : resource.persistentReadStates)
+            {
+                foundation::HashEnum(packageHash, state);
+            }
+            if (resource.optimizedClear)
+            {
+                foundation::HashEnum(
+                    packageHash, resource.optimizedClear->format);
+                foundation::HashCombine(
+                    packageHash, resource.optimizedClear->depthStencil);
+                for (const auto component : resource.optimizedClear->color)
+                {
+                    foundation::HashCombine(
+                        packageHash, std::bit_cast<std::uint32_t>(component));
+                }
+                foundation::HashCombine(
+                    packageHash,
+                    std::bit_cast<std::uint32_t>(
+                        resource.optimizedClear->depth));
+                foundation::HashCombine(
+                    packageHash, resource.optimizedClear->stencil);
+            }
         }
-        for (const auto& handoff : result.package.cyclicFrameHandoffs)
+
+        for (const auto& operation : result.package.operations)
         {
-            foundation::HashCombine(
-                packageHash, handoff.releaseScheduledWork);
-            foundation::HashCombine(
-                packageHash, handoff.acquireScheduledWork);
-            foundation::HashCombine(packageHash, handoff.resource.Value());
-            hashView(handoff.releaseView);
-            hashView(handoff.acquireView);
-            foundation::HashEnum(packageHash, handoff.releaseQueue);
-            foundation::HashEnum(packageHash, handoff.acquireQueue);
-            foundation::HashEnum(packageHash, handoff.releaseState);
-            foundation::HashEnum(packageHash, handoff.acquireState);
-            foundation::HashCombine(
-                packageHash, handoff.requiresCommonRelease);
+            foundation::HashCombine(packageHash, operation.index());
+            std::visit([&](const auto& value)
+            {
+                using T = std::decay_t<decltype(value)>;
+                if constexpr (std::is_same_v<T, BeginWorkOperation>)
+                {
+                    foundation::HashCombine(packageHash, value.workIndex);
+                    foundation::HashCombine(packageHash, value.work.Value());
+                    foundation::HashCombine(
+                        packageHash, foundation::HashString(value.name));
+                    foundation::HashEnum(packageHash, value.queue);
+                }
+                else if constexpr (std::is_same_v<T, WaitForWorkOperation>)
+                {
+                    foundation::HashEnum(packageHash, value.waitingQueue);
+                    foundation::HashCombine(
+                        packageHash, value.signalWorkIndex);
+                    foundation::HashEnum(packageHash, value.signalQueue);
+                }
+                else if constexpr (
+                    std::is_same_v<T, WaitForTemporalOperation>)
+                {
+                    foundation::HashEnum(packageHash, value.waitingQueue);
+                    hashAccess(value.access);
+                }
+                else if constexpr (
+                    std::is_same_v<T, ActivateAliasOperation>)
+                {
+                    foundation::HashCombine(
+                        packageHash, value.resource.Value());
+                    foundation::HashCombine(packageHash, value.frameLag);
+                }
+                else if constexpr (std::is_same_v<T, TransitionOperation>)
+                {
+                    hashView(value.view);
+                    foundation::HashEnum(packageHash, value.state);
+                    foundation::HashCombine(packageHash, value.frameLag);
+                }
+                else if constexpr (std::is_same_v<T, RequireCommonOperation>)
+                {
+                    hashView(value.view);
+                    foundation::HashCombine(packageHash, value.frameLag);
+                    foundation::HashEnum(
+                        packageHash, value.implicitCopyState);
+                    foundation::HashCombine(
+                        packageHash, value.cyclicReuse);
+                }
+                else if constexpr (
+                    std::is_same_v<T, ExecuteCommandOperation>)
+                {
+                    hashCommand(value.command);
+                }
+                else if constexpr (std::is_same_v<T, SubmitWorkOperation>)
+                {
+                    foundation::HashCombine(packageHash, value.workIndex);
+                    foundation::HashEnum(packageHash, value.queue);
+                    for (const auto& access : value.temporalAccesses)
+                    {
+                        hashAccess(access);
+                    }
+                }
+            }, operation);
         }
         result.package.packageHash = packageHash;
-        result.package.plan.structureHash = packageHash;
-        result.package.diagnostics = result.diagnostics;
+        result.report.analysisPlan.structureHash = packageHash;
         return result;
     }
 
@@ -2621,8 +3090,6 @@ namespace sge::compiler
             return "QueueHandoffRequired";
         case DiagnosticCode::ShaderInterfaceMismatch:
             return "ShaderInterfaceMismatch";
-        case DiagnosticCode::PackageNotLegacyExecutable:
-            return "PackageNotLegacyExecutable";
         }
         return "Unknown";
     }
@@ -2636,5 +3103,30 @@ namespace sge::compiler
         case DiagnosticSeverity::Error: return "error";
         }
         return "unknown";
+    }
+
+    const char* ToString(const CompiledOperation& operation) noexcept
+    {
+        return std::visit([](const auto& value) -> const char*
+        {
+            using T = std::decay_t<decltype(value)>;
+            if constexpr (std::is_same_v<T, BeginWorkOperation>)
+                return "BeginWork";
+            if constexpr (std::is_same_v<T, WaitForWorkOperation>)
+                return "WaitForWork";
+            if constexpr (std::is_same_v<T, WaitForTemporalOperation>)
+                return "WaitForTemporal";
+            if constexpr (std::is_same_v<T, ActivateAliasOperation>)
+                return "ActivateAlias";
+            if constexpr (std::is_same_v<T, TransitionOperation>)
+                return "Transition";
+            if constexpr (std::is_same_v<T, RequireCommonOperation>)
+                return "RequireCommon";
+            if constexpr (std::is_same_v<T, ExecuteCommandOperation>)
+                return "ExecuteCommand";
+            if constexpr (std::is_same_v<T, SubmitWorkOperation>)
+                return "SubmitWork";
+            return "Unknown";
+        }, operation);
     }
 }
