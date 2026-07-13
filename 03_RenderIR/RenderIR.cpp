@@ -2,8 +2,89 @@
 
 #include "00_Foundation/Hash.h"
 
+#include <optional>
 #include <stdexcept>
 #include <type_traits>
+#include <unordered_map>
+
+namespace
+{
+    struct ResourceInstanceStateSummary
+    {
+        std::optional<sge::gpu::AbstractState> readState;
+        std::size_t readAccessCount = 0;
+        std::size_t writeAccessCount = 0;
+    };
+
+    std::uint64_t ResourceInstanceKey(
+        sge::gpu::ResourceId resource,
+        std::uint32_t frameLag) noexcept
+    {
+        return (static_cast<std::uint64_t>(resource.Value()) << 32u)
+            | static_cast<std::uint64_t>(frameLag);
+    }
+
+    void ValidateWorkResourceInstanceStates(
+        const sge::ir::SemanticModule& module,
+        const sge::ir::WorkDeclaration& work)
+    {
+        std::unordered_map<std::uint64_t, ResourceInstanceStateSummary>
+            summaries;
+
+        for (const auto& access : work.accesses)
+        {
+            auto& summary = summaries[ResourceInstanceKey(
+                access.resource, access.frameLag)];
+            const auto state = sge::gpu::RequiredState(access);
+            const bool writeCapable =
+                access.access != sge::gpu::AccessMode::Read;
+
+            if (writeCapable)
+            {
+                if (summary.readAccessCount != 0)
+                {
+                    throw std::runtime_error(
+                        "Semantic validation failed: work '" + work.name
+                        + "' mixes read and write states for the same "
+                          "resource instance.");
+                }
+                if (summary.writeAccessCount != 0)
+                {
+                    throw std::runtime_error(
+                        "Semantic validation failed: work '" + work.name
+                        + "' declares multiple write-capable accesses for "
+                          "the same resource instance.");
+                }
+                summary.writeAccessCount = 1;
+                continue;
+            }
+
+            if (summary.writeAccessCount != 0)
+            {
+                throw std::runtime_error(
+                    "Semantic validation failed: work '" + work.name
+                    + "' mixes read and write states for the same "
+                      "resource instance.");
+            }
+
+            if (summary.readState && *summary.readState != state
+                && module.Resource(access.resource).lifetime
+                    != sge::gpu::ResourceLifetimeClass::Persistent)
+            {
+                throw std::runtime_error(
+                    "Semantic validation failed: work '" + work.name
+                    + "' requires multiple read states for a non-persistent "
+                      "resource instance.");
+            }
+
+            if (!summary.readState)
+            {
+                summary.readState = state;
+            }
+            ++summary.readAccessCount;
+        }
+    }
+}
 
 namespace sge::ir
 {
@@ -46,7 +127,9 @@ namespace sge::ir
     const std::vector<gpu::ProgramParameter>&
         ProgramDeclaration::BindingParameters() const noexcept
     {
-        return programInterface.parameters.empty() ? parameters : programInterface.parameters;
+        return programInterface.parameters.empty()
+            ? parameters
+            : programInterface.parameters;
     }
 
     gpu::ExecutionDomain WorkDeclaration::Domain() const noexcept
@@ -128,7 +211,9 @@ namespace sge::ir
                 using T = std::decay_t<decltype(description)>;
                 if constexpr (std::is_same_v<T, BufferDescription>)
                 {
-                    HashCombine(seed, static_cast<std::size_t>(description.sizeBytes));
+                    HashCombine(
+                        seed,
+                        static_cast<std::size_t>(description.sizeBytes));
                     HashCombine(seed, description.strideBytes);
                     HashEnum(seed, description.usage);
                 }
@@ -190,6 +275,11 @@ namespace sge::ir
 
         for (const auto& work : works)
         {
+            // Invalid work declarations do not have a stable compiler/cache
+            // identity. Validate the physical-instance state contract before
+            // incorporating the work into the structural key.
+            ValidateWorkResourceInstanceStates(*this, work);
+
             HashCombine(seed, work.id.Value());
             HashCombine(seed, HashString(work.name));
             HashEnum(seed, work.Domain());
@@ -201,8 +291,14 @@ namespace sge::ir
                 {
                     HashCombine(seed, payload.program.Value());
                     HashCombine(seed, payload.vertexResource.resource.Value());
-                    HashCombine(seed, static_cast<std::size_t>(payload.vertexResource.offsetBytes));
-                    HashCombine(seed, static_cast<std::size_t>(payload.vertexResource.sizeBytes));
+                    HashCombine(
+                        seed,
+                        static_cast<std::size_t>(
+                            payload.vertexResource.offsetBytes));
+                    HashCombine(
+                        seed,
+                        static_cast<std::size_t>(
+                            payload.vertexResource.sizeBytes));
                     HashCombine(seed, payload.vertexResource.strideBytes);
                     HashCombine(seed, payload.vertexCount);
                     HashCombine(seed, payload.firstVertex);
@@ -212,25 +308,45 @@ namespace sge::ir
                     for (const auto& binding : payload.bindings)
                     {
                         HashCombine(seed, binding.parameterIndex);
-                        HashCombine(seed, binding.resource.resource.Value());
-                        HashCombine(seed, static_cast<std::size_t>(binding.resource.offsetBytes));
-                        HashCombine(seed, static_cast<std::size_t>(binding.resource.sizeBytes));
+                        HashCombine(
+                            seed,
+                            binding.resource.resource.Value());
+                        HashCombine(
+                            seed,
+                            static_cast<std::size_t>(
+                                binding.resource.offsetBytes));
+                        HashCombine(
+                            seed,
+                            static_cast<std::size_t>(
+                                binding.resource.sizeBytes));
                         HashCombine(seed, binding.resource.strideBytes);
                         HashCombine(seed, binding.frameLag);
                     }
                     for (const auto& color : payload.attachments.colors)
                     {
                         HashCombine(seed, color.resource.Value());
-                        HashCombine(seed, static_cast<std::size_t>(color.offsetBytes));
-                        HashCombine(seed, static_cast<std::size_t>(color.sizeBytes));
+                        HashCombine(
+                            seed,
+                            static_cast<std::size_t>(color.offsetBytes));
+                        HashCombine(
+                            seed,
+                            static_cast<std::size_t>(color.sizeBytes));
                         HashCombine(seed, color.strideBytes);
                     }
-                    HashCombine(seed, payload.attachments.depth.resource.Value());
-                    HashCombine(seed, static_cast<std::size_t>(
-                        payload.attachments.depth.offsetBytes));
-                    HashCombine(seed, static_cast<std::size_t>(
-                        payload.attachments.depth.sizeBytes));
-                    HashCombine(seed, payload.attachments.depth.strideBytes);
+                    HashCombine(
+                        seed,
+                        payload.attachments.depth.resource.Value());
+                    HashCombine(
+                        seed,
+                        static_cast<std::size_t>(
+                            payload.attachments.depth.offsetBytes));
+                    HashCombine(
+                        seed,
+                        static_cast<std::size_t>(
+                            payload.attachments.depth.sizeBytes));
+                    HashCombine(
+                        seed,
+                        payload.attachments.depth.strideBytes);
                 }
                 else if constexpr (std::is_same_v<T, ComputeWork>)
                 {
@@ -241,9 +357,17 @@ namespace sge::ir
                     for (const auto& binding : payload.bindings)
                     {
                         HashCombine(seed, binding.parameterIndex);
-                        HashCombine(seed, binding.resource.resource.Value());
-                        HashCombine(seed, static_cast<std::size_t>(binding.resource.offsetBytes));
-                        HashCombine(seed, static_cast<std::size_t>(binding.resource.sizeBytes));
+                        HashCombine(
+                            seed,
+                            binding.resource.resource.Value());
+                        HashCombine(
+                            seed,
+                            static_cast<std::size_t>(
+                                binding.resource.offsetBytes));
+                        HashCombine(
+                            seed,
+                            static_cast<std::size_t>(
+                                binding.resource.sizeBytes));
                         HashCombine(seed, binding.resource.strideBytes);
                         HashCombine(seed, binding.frameLag);
                     }
@@ -252,9 +376,15 @@ namespace sge::ir
                 {
                     HashCombine(seed, payload.source.Value());
                     HashCombine(seed, payload.destination.Value());
-                    HashCombine(seed, static_cast<std::size_t>(payload.sourceOffset));
-                    HashCombine(seed, static_cast<std::size_t>(payload.destinationOffset));
-                    HashCombine(seed, static_cast<std::size_t>(payload.sizeBytes));
+                    HashCombine(
+                        seed,
+                        static_cast<std::size_t>(payload.sourceOffset));
+                    HashCombine(
+                        seed,
+                        static_cast<std::size_t>(payload.destinationOffset));
+                    HashCombine(
+                        seed,
+                        static_cast<std::size_t>(payload.sizeBytes));
                     HashCombine(seed, payload.sourceFrameLag);
                     HashCombine(seed, payload.destinationFrameLag);
                 }

@@ -6,16 +6,247 @@
 #include "07_D3D12Backend/D3D12Backend.h"
 #include "08_ClassicalRasterFrontend/ClassicalRaster.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
-#include <algorithm>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 #include <windows.h>
 
 namespace
 {
+    bool CompileFails(
+        const sge::ir::SemanticModule& module,
+        sge::gpu::DeviceCapabilities capabilities)
+    {
+        try
+        {
+            (void)sge::compiler::RenderCompiler{}.Compile(module, capabilities);
+            return false;
+        }
+        catch (const std::runtime_error&)
+        {
+            return true;
+        }
+    }
+
+    sge::ir::ResourceDeclaration StateValidationBuffer(
+        sge::gpu::ResourceId id,
+        sge::gpu::ResourceLifetimeClass lifetime)
+    {
+        using namespace sge;
+
+        ir::ResourceDeclaration result{
+            .id = id,
+            .name = "StateValidationBuffer",
+            .lifetime = lifetime,
+            .update = lifetime == gpu::ResourceLifetimeClass::Persistent
+                ? gpu::ResourceUpdateClass::Immutable
+                : gpu::ResourceUpdateClass::GpuProduced,
+            .description = ir::BufferDescription{
+                .sizeBytes = 64,
+                .strideBytes = 4,
+                .usage = ir::BufferUsage::Vertex
+                    | ir::BufferUsage::Storage
+                    | ir::BufferUsage::CopyDestination}
+        };
+        if (lifetime == gpu::ResourceLifetimeClass::Persistent)
+        {
+            result.data = std::vector<std::byte>(64);
+        }
+        return result;
+    }
+
+    sge::ir::SemanticModule BuildTwoBindingStateModule(
+        sge::gpu::ProgramParameterKind firstKind,
+        sge::gpu::ProgramParameterKind secondKind,
+        sge::gpu::AccessMode firstAccess,
+        sge::gpu::AccessMode secondAccess,
+        std::uint32_t firstFrameLag = 0,
+        std::uint32_t secondFrameLag = 0,
+        sge::gpu::ResourceLifetimeClass lifetime =
+            sge::gpu::ResourceLifetimeClass::FrameLocal)
+    {
+        using namespace sge;
+        constexpr gpu::ResourceId data{0};
+
+        ir::SemanticModule module;
+        module.resources.push_back(StateValidationBuffer(data, lifetime));
+        module.programs.push_back({
+            .id = gpu::ProgramId{0},
+            .name = "StateValidationCompute",
+            .computeEntry = "CSMain",
+            .parameters = {
+                {.name = "First",
+                    .kind = firstKind,
+                    .stage = gpu::ProgramStage::Compute,
+                    .registerIndex = 0},
+                {.name = "Second",
+                    .kind = secondKind,
+                    .stage = gpu::ProgramStage::Compute,
+                    .registerIndex = 1}}
+        });
+
+        const auto roleFor = [](gpu::ProgramParameterKind kind)
+        {
+            return kind == gpu::ProgramParameterKind::ShaderResource
+                ? gpu::ResourceRole::ProgramInput
+                : gpu::ResourceRole::ProgramOutput;
+        };
+
+        module.works.push_back({
+            .id = gpu::WorkId{0},
+            .name = "StateValidationComputeWork",
+            .accesses = {
+                {data, firstAccess, roleFor(firstKind), firstFrameLag},
+                {data, secondAccess, roleFor(secondKind), secondFrameLag}},
+            .payload = ir::ComputeWork{
+                .program = gpu::ProgramId{0},
+                .bindings = {
+                    {0, ir::ResourceView{data, 0, 32, 4}, firstFrameLag},
+                    {1, ir::ResourceView{data, 32, 32, 4}, secondFrameLag}}}
+        });
+        return module;
+    }
+
+    sge::ir::SemanticModule BuildSharedReadStateRasterModule(
+        sge::gpu::ResourceLifetimeClass lifetime)
+    {
+        using namespace sge;
+        constexpr gpu::ResourceId data{0};
+        constexpr gpu::ResourceId presentation{1};
+
+        auto shared = StateValidationBuffer(data, lifetime);
+        shared.name = "VertexAndShaderInput";
+        shared.description = ir::BufferDescription{
+            .sizeBytes = 64,
+            .strideBytes = 16,
+            .usage = ir::BufferUsage::Vertex
+                | ir::BufferUsage::Storage
+                | ir::BufferUsage::CopyDestination};
+        if (lifetime == gpu::ResourceLifetimeClass::Persistent)
+        {
+            shared.data = std::vector<std::byte>(64);
+        }
+
+        ir::SemanticModule module;
+        module.resources = {
+            std::move(shared),
+            {.id = presentation,
+                .name = "StateValidationPresentation",
+                .lifetime = gpu::ResourceLifetimeClass::External,
+                .update = gpu::ResourceUpdateClass::Imported,
+                .description = ir::PresentationDescription{}}
+        };
+        module.programs.push_back({
+            .id = gpu::ProgramId{0},
+            .name = "VertexAndShaderRead",
+            .vertexEntry = "VSMain",
+            .pixelEntry = "PSMain",
+            .programInterface = {
+                .parameters = {{.name = "Data",
+                    .kind = gpu::ProgramParameterKind::ShaderResource,
+                    .stage = gpu::ProgramStage::Pixel}},
+                .vertexInputs = {{
+                    "POSITION", 0, ir::VertexElementFormat::Float4,
+                    0, 0, ir::VertexInputRate::PerVertex, 0}},
+                .colorOutputCount = 1,
+                .depthAttachmentAllowed = false}
+        });
+        module.works.push_back({
+            .id = gpu::WorkId{0},
+            .name = "ReadOneInstanceInTwoStates",
+            .accesses = {
+                {data, gpu::AccessMode::Read,
+                    gpu::ResourceRole::VertexInput},
+                {data, gpu::AccessMode::Read,
+                    gpu::ResourceRole::ProgramInput},
+                {presentation, gpu::AccessMode::Write,
+                    gpu::ResourceRole::ColorOutput}},
+            .payload = ir::RasterWork{
+                .program = gpu::ProgramId{0},
+                .vertexResource = data,
+                .bindings = {{0, data}},
+                .attachments = {{presentation}, {}},
+                .vertexCount = 4,
+                .rasterState = {.depth = gpu::DepthMode::Disabled}}
+        });
+        return module;
+    }
+
+    void RunResourceStateValidatorTests()
+    {
+        using namespace sge;
+
+        gpu::DeviceCapabilities computeCapabilities;
+        computeCapabilities.computeExecution = true;
+
+        const auto readWrite = BuildTwoBindingStateModule(
+            gpu::ProgramParameterKind::ShaderResource,
+            gpu::ProgramParameterKind::UnorderedAccess,
+            gpu::AccessMode::Read,
+            gpu::AccessMode::Write);
+        if (!CompileFails(readWrite, computeCapabilities))
+        {
+            throw std::runtime_error(
+                "Resource-state validator accepted SRV/UAV access to one instance.");
+        }
+
+        const auto twoWrites = BuildTwoBindingStateModule(
+            gpu::ProgramParameterKind::UnorderedAccess,
+            gpu::ProgramParameterKind::UnorderedAccess,
+            gpu::AccessMode::Write,
+            gpu::AccessMode::Write);
+        if (!CompileFails(twoWrites, computeCapabilities))
+        {
+            throw std::runtime_error(
+                "Resource-state validator accepted multiple writes to one instance.");
+        }
+
+        const auto twoReads = BuildTwoBindingStateModule(
+            gpu::ProgramParameterKind::ShaderResource,
+            gpu::ProgramParameterKind::ShaderResource,
+            gpu::AccessMode::Read,
+            gpu::AccessMode::Read);
+        if (CompileFails(twoReads, computeCapabilities))
+        {
+            throw std::runtime_error(
+                "Resource-state validator rejected compatible read-only views.");
+        }
+
+        const auto temporalReadWrite = BuildTwoBindingStateModule(
+            gpu::ProgramParameterKind::ShaderResource,
+            gpu::ProgramParameterKind::UnorderedAccess,
+            gpu::AccessMode::Read,
+            gpu::AccessMode::Write,
+            1,
+            0,
+            gpu::ResourceLifetimeClass::Temporal);
+        if (CompileFails(temporalReadWrite, computeCapabilities))
+        {
+            throw std::runtime_error(
+                "Resource-state validator merged different temporal instances.");
+        }
+
+        const auto persistentReads = BuildSharedReadStateRasterModule(
+            gpu::ResourceLifetimeClass::Persistent);
+        if (CompileFails(persistentReads, gpu::DeviceCapabilities{}))
+        {
+            throw std::runtime_error(
+                "Resource-state validator rejected a persistent read envelope.");
+        }
+
+        const auto frameLocalReads = BuildSharedReadStateRasterModule(
+            gpu::ResourceLifetimeClass::FrameLocal);
+        if (!CompileFails(frameLocalReads, gpu::DeviceCapabilities{}))
+        {
+            throw std::runtime_error(
+                "Resource-state validator accepted uncombined frame-local read states.");
+        }
+    }
+
     sge::ir::SemanticModule BuildIntegrationModule()
     {
         using namespace sge;
@@ -165,6 +396,8 @@ namespace
 void RunD3D12IntegrationTests()
 {
     using namespace sge;
+
+    RunResourceStateValidatorTests();
 
     platform::Win32Application application{
         GetModuleHandleW(nullptr),
