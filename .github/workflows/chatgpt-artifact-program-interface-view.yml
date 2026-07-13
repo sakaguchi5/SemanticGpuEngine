@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - chatgpt-artifact-program-interface-view-f001aa-v2
+  pull_request:
+    branches:
+      - master
   workflow_dispatch:
 
 permissions:
