@@ -105,10 +105,16 @@ namespace sge::experimental
             .shaderPath = "Shaders/SdfRayMarch.hlsl",
             .vertexEntry = "VSMain",
             .pixelEntry = "PSMain",
-            .parameters = {{
-                .name = "SdfScene",
-                .kind = gpu::ProgramParameterKind::ConstantBuffer,
-                .stage = gpu::ProgramStage::Pixel}}
+            .programInterface = {
+                .parameters = {{
+                    .name = "SdfScene",
+                    .kind = gpu::ProgramParameterKind::ConstantBuffer,
+                    .stage = gpu::ProgramStage::Pixel}},
+                .vertexInputs = {
+                    {"POSITION", 0, ir::VertexElementFormat::Float3, 0, 0},
+                    {"COLOR", 0, ir::VertexElementFormat::Float4, 0, 12}},
+                .colorOutputCount = 1,
+                .depthAttachmentAllowed = false}
         }};
 
         module.works = {

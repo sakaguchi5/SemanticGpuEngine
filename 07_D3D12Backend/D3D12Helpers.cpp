@@ -215,6 +215,23 @@ namespace sge::d3d12::detail
         }
     }
 
+    DXGI_FORMAT NativeVertexFormat(ir::VertexElementFormat format) noexcept
+    {
+        using Format = ir::VertexElementFormat;
+        switch (format)
+        {
+        case Format::Float: return DXGI_FORMAT_R32_FLOAT;
+        case Format::Float2: return DXGI_FORMAT_R32G32_FLOAT;
+        case Format::Float3: return DXGI_FORMAT_R32G32B32_FLOAT;
+        case Format::Float4: return DXGI_FORMAT_R32G32B32A32_FLOAT;
+        case Format::Uint: return DXGI_FORMAT_R32_UINT;
+        case Format::Uint2: return DXGI_FORMAT_R32G32_UINT;
+        case Format::Uint3: return DXGI_FORMAT_R32G32B32_UINT;
+        case Format::Uint4: return DXGI_FORMAT_R32G32B32A32_UINT;
+        }
+        return DXGI_FORMAT_UNKNOWN;
+    }
+
     D3D_PRIMITIVE_TOPOLOGY NativeTopology(
         gpu::PrimitiveTopology topology) noexcept
     {
@@ -238,6 +255,21 @@ namespace sge::d3d12::detail
         foundation::HashEnum(seed, key.rasterState.topology);
         foundation::HashEnum(seed, key.rasterState.composition);
         foundation::HashEnum(seed, key.rasterState.depth);
+        for (const auto& input : key.vertexInputs)
+        {
+            foundation::HashCombine(seed, foundation::HashString(input.semanticName));
+            foundation::HashCombine(seed, input.semanticIndex);
+            foundation::HashEnum(seed, input.format);
+            foundation::HashCombine(seed, input.inputSlot);
+            foundation::HashCombine(seed, input.alignedByteOffset);
+            foundation::HashEnum(seed, input.inputRate);
+            foundation::HashCombine(seed, input.instanceStepRate);
+        }
+        for (const auto format : key.colorFormats)
+        {
+            foundation::HashEnum(seed, format);
+        }
+        foundation::HashEnum(seed, key.depthFormat);
         foundation::HashCombine(seed, key.compute);
         return seed;
     }

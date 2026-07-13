@@ -35,6 +35,55 @@ namespace sge::ir
         CopyDestination = 1u << 5u
     };
 
+    enum class VertexElementFormat
+    {
+        Float,
+        Float2,
+        Float3,
+        Float4,
+        Uint,
+        Uint2,
+        Uint3,
+        Uint4
+    };
+
+    enum class VertexInputRate
+    {
+        PerVertex,
+        PerInstance
+    };
+
+    struct VertexInputElement
+    {
+        std::string semanticName;
+        std::uint32_t semanticIndex = 0;
+        VertexElementFormat format = VertexElementFormat::Float3;
+        std::uint32_t inputSlot = 0;
+        std::uint32_t alignedByteOffset = 0;
+        VertexInputRate inputRate = VertexInputRate::PerVertex;
+        std::uint32_t instanceStepRate = 0;
+
+        auto operator<=>(const VertexInputElement&) const = default;
+    };
+
+    struct ProgramInterface
+    {
+        // New declarations should place binding parameters here. The legacy
+        // ProgramDeclaration::parameters field remains as a compatibility path
+        // while existing frontends are migrated incrementally.
+        std::vector<gpu::ProgramParameter> parameters;
+
+        // The default preserves the current interleaved Position/Color stream,
+        // but the backend no longer hardcodes it.
+        std::vector<VertexInputElement> vertexInputs{
+            {"POSITION", 0, VertexElementFormat::Float3, 0, 0},
+            {"COLOR", 0, VertexElementFormat::Float4, 0, 12}
+        };
+
+        std::uint32_t colorOutputCount = 1;
+        bool depthAttachmentAllowed = true;
+    };
+
     [[nodiscard]] constexpr BufferUsage operator|(
         BufferUsage left, BufferUsage right) noexcept
     {
@@ -107,7 +156,14 @@ namespace sge::ir
         std::string vertexEntry;
         std::string pixelEntry;
         std::string computeEntry;
+        ProgramInterface programInterface;
+
+        // Compatibility field for modules created before ProgramInterface.
+        // Declaring both this and programInterface.parameters is rejected.
         std::vector<gpu::ProgramParameter> parameters;
+
+        [[nodiscard]] const std::vector<gpu::ProgramParameter>&
+            BindingParameters() const noexcept;
     };
 
     struct RasterState
@@ -127,23 +183,81 @@ namespace sge::ir
         float depth = 1.0f;
     };
 
+    struct ResourceView
+    {
+        gpu::ResourceId resource;
+        std::uint64_t offsetBytes = 0;
+        std::uint64_t sizeBytes = 0;
+        std::uint32_t strideBytes = 0;
+
+        constexpr ResourceView() noexcept = default;
+        constexpr ResourceView(
+            gpu::ResourceId resourceId,
+            std::uint64_t offset = 0,
+            std::uint64_t size = 0,
+            std::uint32_t stride = 0) noexcept
+            : resource(resourceId),
+              offsetBytes(offset),
+              sizeBytes(size),
+              strideBytes(stride)
+        {
+        }
+
+        [[nodiscard]] constexpr bool IsWholeResource() const noexcept
+        {
+            return offsetBytes == 0 && sizeBytes == 0 && strideBytes == 0;
+        }
+
+        [[nodiscard]] constexpr bool IsValid() const noexcept
+        {
+            return resource.IsValid();
+        }
+
+        [[nodiscard]] constexpr std::uint32_t Value() const noexcept
+        {
+            return resource.Value();
+        }
+
+        [[nodiscard]] constexpr operator gpu::ResourceId() const noexcept
+        {
+            return resource;
+        }
+
+        friend constexpr bool operator==(
+            const ResourceView& view,
+            gpu::ResourceId resourceId) noexcept
+        {
+            return view.resource == resourceId;
+        }
+
+        friend constexpr bool operator==(
+            gpu::ResourceId resourceId,
+            const ResourceView& view) noexcept
+        {
+            return resourceId == view.resource;
+        }
+
+        bool operator==(const ResourceView&) const = default;
+        auto operator<=>(const ResourceView&) const = default;
+    };
+
     struct ResourceBinding
     {
         std::uint32_t parameterIndex = 0;
-        gpu::ResourceId resource;
+        ResourceView resource;
         std::uint32_t frameLag = 0;
     };
 
     struct AttachmentSet
     {
-        std::vector<gpu::ResourceId> colors;
-        gpu::ResourceId depth;
+        std::vector<ResourceView> colors;
+        ResourceView depth;
     };
 
     struct RasterWork
     {
         gpu::ProgramId program;
-        gpu::ResourceId vertexResource;
+        ResourceView vertexResource;
         std::vector<ResourceBinding> bindings;
         AttachmentSet attachments;
         std::uint32_t vertexCount = 0;

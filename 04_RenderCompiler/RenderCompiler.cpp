@@ -72,6 +72,170 @@ namespace
         }
     }
 
+    bool HasBufferUsage(
+        const sge::ir::BufferDescription& buffer,
+        sge::ir::BufferUsage usage) noexcept
+    {
+        return (static_cast<std::uint32_t>(buffer.usage)
+            & static_cast<std::uint32_t>(usage)) != 0;
+    }
+
+    bool HasTextureUsage(
+        const sge::ir::TextureDescription& texture,
+        sge::ir::TextureUsage usage) noexcept
+    {
+        return (static_cast<std::uint32_t>(texture.usage)
+            & static_cast<std::uint32_t>(usage)) != 0;
+    }
+
+    std::uint32_t VertexElementSize(
+        sge::ir::VertexElementFormat format) noexcept
+    {
+        using Format = sge::ir::VertexElementFormat;
+        switch (format)
+        {
+        case Format::Float:
+        case Format::Uint:
+            return 4;
+        case Format::Float2:
+        case Format::Uint2:
+            return 8;
+        case Format::Float3:
+        case Format::Uint3:
+            return 12;
+        case Format::Float4:
+        case Format::Uint4:
+            return 16;
+        }
+        return 0;
+    }
+
+    void ValidateViewRange(
+        const sge::ir::SemanticModule& module,
+        const sge::ir::ResourceView& view)
+    {
+        const auto& resource = module.Resource(view.resource);
+        if (resource.Kind() != sge::gpu::ResourceKind::Buffer)
+        {
+            if (!view.IsWholeResource())
+            {
+                throw std::runtime_error(
+                    "Only buffer subranges are supported by ResourceView in this stage.");
+            }
+            return;
+        }
+
+        const auto& buffer = std::get<sge::ir::BufferDescription>(
+            resource.description);
+        if (view.offsetBytes > buffer.sizeBytes)
+        {
+            throw std::runtime_error("ResourceView offset exceeds its buffer.");
+        }
+        const auto size = view.sizeBytes == 0
+            ? buffer.sizeBytes - view.offsetBytes
+            : view.sizeBytes;
+        if (size == 0 || size > buffer.sizeBytes - view.offsetBytes)
+        {
+            throw std::runtime_error("ResourceView size exceeds its buffer.");
+        }
+        const auto stride = view.strideBytes == 0
+            ? buffer.strideBytes : view.strideBytes;
+        if (stride != 0
+            && ((view.offsetBytes % stride) != 0 || (size % stride) != 0))
+        {
+            throw std::runtime_error(
+                "Structured ResourceView range must be stride aligned.");
+        }
+        if (stride == 0
+            && ((view.offsetBytes % 4) != 0 || (size % 4) != 0))
+        {
+            throw std::runtime_error(
+                "Raw ResourceView range must be four-byte aligned.");
+        }
+    }
+
+    void ValidateViewRole(
+        const sge::ir::SemanticModule& module,
+        const sge::ir::ResourceView& view,
+        sge::gpu::ResourceRole role)
+    {
+        ValidateViewRange(module, view);
+        const auto& resource = module.Resource(view.resource);
+        const auto* buffer = std::get_if<sge::ir::BufferDescription>(
+            &resource.description);
+        const auto* texture = std::get_if<sge::ir::TextureDescription>(
+            &resource.description);
+
+        switch (role)
+        {
+        case sge::gpu::ResourceRole::VertexInput:
+            if (buffer == nullptr
+                || !HasBufferUsage(*buffer, sge::ir::BufferUsage::Vertex))
+            {
+                throw std::runtime_error(
+                    "Vertex ResourceView requires a vertex buffer.");
+            }
+            return;
+        case sge::gpu::ResourceRole::ConstantInput:
+            if (buffer == nullptr
+                || !HasBufferUsage(*buffer, sge::ir::BufferUsage::Constant)
+                || !view.IsWholeResource())
+            {
+                throw std::runtime_error(
+                    "Constant ResourceView currently requires a whole constant buffer.");
+            }
+            return;
+        case sge::gpu::ResourceRole::ProgramInput:
+            if ((buffer != nullptr
+                    && HasBufferUsage(*buffer, sge::ir::BufferUsage::Storage))
+                || (texture != nullptr
+                    && HasTextureUsage(*texture, sge::ir::TextureUsage::Sampled)))
+            {
+                return;
+            }
+            throw std::runtime_error(
+                "Shader-resource view requires Storage or Sampled usage.");
+        case sge::gpu::ResourceRole::ProgramOutput:
+            if ((buffer != nullptr
+                    && HasBufferUsage(*buffer, sge::ir::BufferUsage::Storage))
+                || (texture != nullptr
+                    && HasTextureUsage(*texture, sge::ir::TextureUsage::Storage)))
+            {
+                return;
+            }
+            throw std::runtime_error(
+                "Unordered-access view requires Storage usage.");
+        case sge::gpu::ResourceRole::ColorOutput:
+            if (resource.Kind() == sge::gpu::ResourceKind::Presentation
+                || (texture != nullptr
+                    && HasTextureUsage(
+                        *texture, sge::ir::TextureUsage::ColorAttachment)))
+            {
+                return;
+            }
+            throw std::runtime_error(
+                "Color attachment view requires a color texture or presentation resource.");
+        case sge::gpu::ResourceRole::DepthOutput:
+            if (texture != nullptr
+                && HasTextureUsage(
+                    *texture, sge::ir::TextureUsage::DepthAttachment))
+            {
+                return;
+            }
+            throw std::runtime_error(
+                "Depth attachment view requires a depth texture.");
+        default:
+            return;
+        }
+    }
+
+    sge::gpu::ResourceFormat ViewFormat(
+        const sge::ir::SemanticModule& module,
+        const sge::ir::ResourceView& view)
+    {
+        return module.Resource(view.resource).Format();
+    }
+
     std::vector<ExpectedAccess> BuildExpectedAccesses(
         const sge::ir::SemanticModule& module,
         const sge::ir::WorkDeclaration& work)
@@ -83,14 +247,15 @@ namespace
                                      const std::vector<ir::ResourceBinding>& bindings)
         {
             const auto& program = module.Program(programId);
+            const auto& parameters = program.BindingParameters();
             for (const auto& binding : bindings)
             {
-                if (binding.parameterIndex >= program.parameters.size())
+                if (binding.parameterIndex >= parameters.size())
                 {
                     continue;
                 }
 
-                switch (program.parameters[binding.parameterIndex].kind)
+                switch (parameters[binding.parameterIndex].kind)
                 {
                 case gpu::ProgramParameterKind::ConstantBuffer:
                     expected.push_back({binding.resource,
@@ -363,6 +528,32 @@ namespace sge::compiler
                 throw std::runtime_error(
                     "Semantic validation failed: invalid or duplicate program ID.");
             }
+            if (!program.parameters.empty()
+                && !program.programInterface.parameters.empty())
+            {
+                throw std::runtime_error(
+                    "Semantic validation failed: use either ProgramInterface parameters "
+                    "or legacy ProgramDeclaration parameters, not both.");
+            }
+            if (program.programInterface.colorOutputCount > 8)
+            {
+                throw std::runtime_error(
+                    "Semantic validation failed: at most eight color outputs are supported.");
+            }
+            for (const auto& input : program.programInterface.vertexInputs)
+            {
+                if (input.semanticName.empty())
+                {
+                    throw std::runtime_error(
+                        "Semantic validation failed: vertex input semantic is empty.");
+                }
+                if (input.inputRate == ir::VertexInputRate::PerVertex
+                    && input.instanceStepRate != 0)
+                {
+                    throw std::runtime_error(
+                        "Semantic validation failed: per-vertex input has an instance step rate.");
+                }
+            }
         }
 
         for (const auto& work : module.works)
@@ -397,10 +588,73 @@ namespace sge::compiler
                         "Semantic validation failed: raster work has no valid vertex resource.");
                 }
 
+                const auto& program = module.Program(raster.program);
+                if (raster.attachments.colors.size()
+                    != program.programInterface.colorOutputCount)
+                {
+                    throw std::runtime_error(
+                        "Semantic validation failed: raster attachment count does not "
+                        "match ProgramInterface.");
+                }
                 if (raster.attachments.colors.empty())
                 {
                     throw std::runtime_error(
                         "Semantic validation failed: raster work has no color attachment.");
+                }
+
+                ValidateViewRole(
+                    module, raster.vertexResource, gpu::ResourceRole::VertexInput);
+                const auto& vertexBuffer = std::get<ir::BufferDescription>(
+                    module.Resource(raster.vertexResource.resource).description);
+                const auto vertexStride = raster.vertexResource.strideBytes == 0
+                    ? vertexBuffer.strideBytes
+                    : raster.vertexResource.strideBytes;
+                for (const auto& input : program.programInterface.vertexInputs)
+                {
+                    if (input.inputSlot != 0)
+                    {
+                        throw std::runtime_error(
+                            "Semantic validation failed: this stage supports one "
+                            "vertex stream; inputSlot must be zero.");
+                    }
+                    const auto elementSize = VertexElementSize(input.format);
+                    if (elementSize == 0
+                        || input.alignedByteOffset + elementSize > vertexStride)
+                    {
+                        throw std::runtime_error(
+                            "Semantic validation failed: vertex input exceeds "
+                            "the ResourceView stride.");
+                    }
+                }
+                const bool hasDepthView =
+                    raster.attachments.depth.resource.IsValid();
+                if ((raster.rasterState.depth == gpu::DepthMode::Disabled)
+                    != !hasDepthView)
+                {
+                    throw std::runtime_error(
+                        "Semantic validation failed: depth state and depth "
+                        "attachment presence disagree.");
+                }
+                for (const auto& color : raster.attachments.colors)
+                {
+                    ValidateViewRole(
+                        module, color, gpu::ResourceRole::ColorOutput);
+                    if (ViewFormat(module, color) == gpu::ResourceFormat::Unknown)
+                    {
+                        throw std::runtime_error(
+                            "Semantic validation failed: color attachment format is unknown.");
+                    }
+                }
+                if (raster.attachments.depth.resource.IsValid())
+                {
+                    if (!program.programInterface.depthAttachmentAllowed)
+                    {
+                        throw std::runtime_error(
+                            "Semantic validation failed: ProgramInterface rejects depth.");
+                    }
+                    ValidateViewRole(
+                        module, raster.attachments.depth,
+                        gpu::ResourceRole::DepthOutput);
                 }
             }
 
@@ -483,25 +737,32 @@ namespace sge::compiler
                                                gpu::ProgramId programId)
             {
                 const auto& program = module.Program(programId);
+                const auto& parameters = program.BindingParameters();
                 std::unordered_set<std::uint32_t> bound;
                 for (const auto& binding : bindings)
                 {
-                    if (binding.parameterIndex >= program.parameters.size()
+                    if (binding.parameterIndex >= parameters.size()
                         || !resourceIds.contains(binding.resource.Value())
                         || !bound.insert(binding.parameterIndex).second)
                     {
                         throw std::runtime_error(
                             "Semantic validation failed: invalid or duplicate program binding.");
                     }
-                    if (program.parameters[binding.parameterIndex].kind
-                        == gpu::ProgramParameterKind::Sampler)
+                    const auto kind = parameters[binding.parameterIndex].kind;
+                    if (kind == gpu::ProgramParameterKind::Sampler)
                     {
                         throw std::runtime_error(
                             "Semantic validation failed: static samplers must not have resource bindings.");
                     }
+                    const auto role = kind == gpu::ProgramParameterKind::ConstantBuffer
+                        ? gpu::ResourceRole::ConstantInput
+                        : kind == gpu::ProgramParameterKind::ShaderResource
+                            ? gpu::ResourceRole::ProgramInput
+                            : gpu::ResourceRole::ProgramOutput;
+                    ValidateViewRole(module, binding.resource, role);
                 }
                 const auto requiredBindings = static_cast<std::size_t>(std::count_if(
-                    program.parameters.begin(), program.parameters.end(),
+                    parameters.begin(), parameters.end(),
                     [](const gpu::ProgramParameter& parameter)
                     {
                         return parameter.kind
@@ -852,9 +1113,22 @@ namespace sge::compiler
             case gpu::ExecutionDomain::Raster:
             {
                 const auto& raster = std::get<ir::RasterWork>(source.payload);
+                const auto& program = module.Program(raster.program);
+                std::vector<gpu::ResourceFormat> colorFormats;
+                colorFormats.reserve(raster.attachments.colors.size());
+                for (const auto& color : raster.attachments.colors)
+                {
+                    colorFormats.push_back(ViewFormat(module, color));
+                }
+                const auto depthFormat = raster.attachments.depth.resource.IsValid()
+                    ? ViewFormat(module, raster.attachments.depth)
+                    : gpu::ResourceFormat::Unknown;
                 scheduled.executable = {
                     .program = raster.program,
                     .rasterState = raster.rasterState,
+                    .vertexInputs = program.programInterface.vertexInputs,
+                    .colorFormats = std::move(colorFormats),
+                    .depthFormat = depthFormat,
                     .compute = false
                 };
                 scheduled.queue = gpu::QueueClass::Direct;

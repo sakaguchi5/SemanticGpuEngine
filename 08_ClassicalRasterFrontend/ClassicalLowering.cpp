@@ -172,10 +172,16 @@ namespace sge::classical
                 .shaderPath = "Shaders/BasicColor.hlsl",
                 .vertexEntry = "VSMain",
                 .pixelEntry = "PSMain",
-                .parameters = {{
-                    .name = "Scene",
-                    .kind = gpu::ProgramParameterKind::ConstantBuffer,
-                    .stage = gpu::ProgramStage::Vertex}}
+                .programInterface = {
+                    .parameters = {{
+                        .name = "Scene",
+                        .kind = gpu::ProgramParameterKind::ConstantBuffer,
+                        .stage = gpu::ProgramStage::Vertex}},
+                    .vertexInputs = {
+                        {"POSITION", 0, ir::VertexElementFormat::Float3, 0, 0},
+                        {"COLOR", 0, ir::VertexElementFormat::Float4, 0, 12}},
+                    .colorOutputCount = 1,
+                    .depthAttachmentAllowed = true}
             },
             {
                 .id = BlitProgram,
@@ -183,34 +189,40 @@ namespace sge::classical
                 .shaderPath = "Shaders/OffscreenBlit.hlsl",
                 .vertexEntry = "VSMain",
                 .pixelEntry = "PSMain",
-                .parameters = {{
-                    .name = "SourceTexture",
-                    .kind = gpu::ProgramParameterKind::ShaderResource,
-                    .stage = gpu::ProgramStage::Pixel}}
+                .programInterface = {
+                    .parameters = {{
+                        .name = "SourceTexture",
+                        .kind = gpu::ProgramParameterKind::ShaderResource,
+                        .stage = gpu::ProgramStage::Pixel}},
+                    .vertexInputs = {
+                        {"POSITION", 0, ir::VertexElementFormat::Float3, 0, 0},
+                        {"COLOR", 0, ir::VertexElementFormat::Float4, 0, 12}},
+                    .colorOutputCount = 1,
+                    .depthAttachmentAllowed = false}
             },
             {
                 .id = GenerateProgram,
                 .name = "GenerateTriangleVertices",
                 .shaderPath = "Shaders/GenerateBuffer.hlsl",
                 .computeEntry = "CSMain",
-                .parameters = {{
+                .programInterface = {.parameters = {{
                     .name = "OutputBuffer",
                     .kind = gpu::ProgramParameterKind::UnorderedAccess,
-                    .stage = gpu::ProgramStage::Compute}}
+                    .stage = gpu::ProgramStage::Compute}}}
             },
             {
                 .id = TemporalProgram,
                 .name = "TemporalAccumulate",
                 .shaderPath = "Shaders/TemporalAccumulate.hlsl",
                 .computeEntry = "CSMain",
-                .parameters = {
+                .programInterface = {.parameters = {
                     {.name = "PreviousHistory",
                         .kind = gpu::ProgramParameterKind::ShaderResource,
                         .stage = gpu::ProgramStage::Compute},
                     {.name = "CurrentHistory",
                         .kind = gpu::ProgramParameterKind::UnorderedAccess,
                         .stage = gpu::ProgramStage::Compute}
-                }
+                }}
             }
         };
 

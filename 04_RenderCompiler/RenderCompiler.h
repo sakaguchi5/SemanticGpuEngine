@@ -37,6 +37,9 @@ namespace sge::compiler
     {
         gpu::ProgramId program;
         ir::RasterState rasterState{};
+        std::vector<ir::VertexInputElement> vertexInputs;
+        std::vector<gpu::ResourceFormat> colorFormats;
+        gpu::ResourceFormat depthFormat = gpu::ResourceFormat::Unknown;
         bool compute = false;
 
         auto operator<=>(const ExecutableKey&) const = default;

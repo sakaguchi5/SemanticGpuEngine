@@ -27,6 +27,7 @@ namespace sge::d3d12::detail
         resources_.clear();
         resourceInstancePlans_.clear();
         persistentReadStates_.clear();
+        customShaderViews_.clear();
         physicalAllocations_.clear();
         allocationHeaps_.clear();
         activeAliasedResources_.clear();
@@ -281,6 +282,120 @@ namespace sge::d3d12::detail
         {
             record->state = targetState;
         }
+    }
+
+    D3D12_GPU_DESCRIPTOR_HANDLE Backend::ResolveShaderDescriptor(
+        const ir::SemanticModule& module,
+        const ir::ResourceView& view,
+        gpu::ProgramParameterKind kind,
+        std::uint32_t frameLag)
+    {
+        auto* record = ResolveResource(view.resource, frameLag);
+        if (record == nullptr)
+        {
+            throw std::runtime_error(
+                "ResourceView references an unmaterialized resource.");
+        }
+
+        if (view.IsWholeResource())
+        {
+            if (kind == gpu::ProgramParameterKind::ShaderResource
+                && record->hasSrv)
+            {
+                return record->srvDescriptor;
+            }
+            if (kind == gpu::ProgramParameterKind::UnorderedAccess
+                && record->hasUav)
+            {
+                return record->uavDescriptor;
+            }
+            throw std::runtime_error(
+                "Whole-resource view has no compatible descriptor.");
+        }
+
+        const auto& declaration = module.Resource(view.resource);
+        if (declaration.Kind() != gpu::ResourceKind::Buffer)
+        {
+            throw std::runtime_error(
+                "Only buffer subrange shader views are currently supported.");
+        }
+        if (kind != gpu::ProgramParameterKind::ShaderResource
+            && kind != gpu::ProgramParameterKind::UnorderedAccess)
+        {
+            throw std::runtime_error(
+                "Custom ResourceView is not a shader descriptor.");
+        }
+
+        const ShaderViewKey key{view, kind};
+        auto& cached = customShaderViews_[key];
+        const auto instanceCount = resources_.at(view.resource).size();
+        if (cached.instances.size() != instanceCount)
+        {
+            cached.instances.resize(instanceCount);
+        }
+        const auto instance = ResolveInstanceIndex(view.resource, frameLag);
+        if (cached.instances.at(instance).ptr != 0)
+        {
+            return cached.instances.at(instance);
+        }
+        if (nextShaderDescriptor_ >= 128)
+        {
+            throw std::runtime_error("Shader descriptor heap exhausted.");
+        }
+
+        auto cpu = shaderHeap_->GetCPUDescriptorHandleForHeapStart();
+        auto gpu = shaderHeap_->GetGPUDescriptorHandleForHeapStart();
+        cpu.ptr += static_cast<SIZE_T>(nextShaderDescriptor_)
+            * shaderIncrement_;
+        gpu.ptr += static_cast<UINT64>(nextShaderDescriptor_++)
+            * shaderIncrement_;
+
+        const auto& buffer = std::get<ir::BufferDescription>(
+            declaration.description);
+        const auto stride = view.strideBytes == 0
+            ? buffer.strideBytes : view.strideBytes;
+        const auto size = view.sizeBytes == 0
+            ? buffer.sizeBytes - view.offsetBytes : view.sizeBytes;
+        const auto elementSize = stride == 0 ? 4u : stride;
+        const auto firstElement = static_cast<UINT64>(
+            view.offsetBytes / elementSize);
+        const auto elementCount = static_cast<UINT>(size / elementSize);
+
+        if (kind == gpu::ProgramParameterKind::ShaderResource)
+        {
+            D3D12_SHADER_RESOURCE_VIEW_DESC native{};
+            native.Format = stride == 0
+                ? DXGI_FORMAT_R32_TYPELESS : DXGI_FORMAT_UNKNOWN;
+            native.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+            native.Shader4ComponentMapping =
+                D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            native.Buffer.FirstElement = firstElement;
+            native.Buffer.NumElements = elementCount;
+            native.Buffer.StructureByteStride = stride;
+            native.Buffer.Flags = stride == 0
+                ? D3D12_BUFFER_SRV_FLAG_RAW
+                : D3D12_BUFFER_SRV_FLAG_NONE;
+            device_->CreateShaderResourceView(
+                record->resource.Get(), &native, cpu);
+        }
+        else
+        {
+            D3D12_UNORDERED_ACCESS_VIEW_DESC native{};
+            native.Format = stride == 0
+                ? DXGI_FORMAT_R32_TYPELESS : DXGI_FORMAT_UNKNOWN;
+            native.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+            native.Buffer.FirstElement = firstElement;
+            native.Buffer.NumElements = elementCount;
+            native.Buffer.StructureByteStride = stride;
+            native.Buffer.Flags = stride == 0
+                ? D3D12_BUFFER_UAV_FLAG_RAW
+                : D3D12_BUFFER_UAV_FLAG_NONE;
+            device_->CreateUnorderedAccessView(
+                record->resource.Get(), nullptr, &native, cpu);
+        }
+
+        cached.instances.at(instance) = gpu;
+        return gpu;
     }
 
     ResourceRecord Backend::CreateTexture(
@@ -620,7 +735,7 @@ namespace sge::d3d12::detail
         }
 
         shaderCompiler_.ValidateInterface(
-            declaration.parameters,
+            declaration.BindingParameters(),
             reflected);
 
         record.rootSignature = CreateRootSignature(
@@ -632,17 +747,18 @@ namespace sge::d3d12::detail
         const ir::ProgramDeclaration& declaration,
         std::vector<UINT>& rootParameterIndices)
     {
+        const auto& declaredParameters = declaration.BindingParameters();
         std::vector<D3D12_ROOT_PARAMETER> parameters;
-        std::vector<D3D12_DESCRIPTOR_RANGE> ranges(declaration.parameters.size());
+        std::vector<D3D12_DESCRIPTOR_RANGE> ranges(declaredParameters.size());
         std::vector<D3D12_STATIC_SAMPLER_DESC> samplers;
-        parameters.reserve(declaration.parameters.size());
-        rootParameterIndices.assign(declaration.parameters.size(), UINT_MAX);
+        parameters.reserve(declaredParameters.size());
+        rootParameterIndices.assign(declaredParameters.size(), UINT_MAX);
 
         for (std::size_t parameterIndex = 0;
-             parameterIndex < declaration.parameters.size();
+             parameterIndex < declaredParameters.size();
              ++parameterIndex)
         {
-            const auto& parameter = declaration.parameters[parameterIndex];
+            const auto& parameter = declaredParameters[parameterIndex];
             D3D12_ROOT_PARAMETER native{};
             if (parameter.kind == gpu::ProgramParameterKind::ConstantBuffer)
             {
@@ -781,16 +897,29 @@ namespace sge::d3d12::detail
             return pipeline;
         }
 
-        D3D12_INPUT_ELEMENT_DESC inputLayout[] = {
-            {
-                "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT,
-                0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0
-            },
-            {
-                "COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT,
-                0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0
-            }
-        };
+        if (executable.colorFormats.empty()
+            || executable.colorFormats.size() > 8)
+        {
+            throw std::runtime_error(
+                "Graphics executable requires one to eight color formats.");
+        }
+
+        std::vector<D3D12_INPUT_ELEMENT_DESC> inputLayout;
+        inputLayout.reserve(executable.vertexInputs.size());
+        for (const auto& input : executable.vertexInputs)
+        {
+            inputLayout.push_back({
+                input.semanticName.c_str(),
+                input.semanticIndex,
+                NativeVertexFormat(input.format),
+                input.inputSlot,
+                input.alignedByteOffset,
+                input.inputRate == ir::VertexInputRate::PerInstance
+                    ? D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA
+                    : D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+                input.instanceStepRate
+            });
+        }
 
         D3D12_GRAPHICS_PIPELINE_STATE_DESC description{};
         description.pRootSignature = program->second.rootSignature.Get();
@@ -809,17 +938,26 @@ namespace sge::d3d12::detail
         description.DepthStencilState = DepthDescription(
             executable.rasterState.depth);
         description.InputLayout = {
-            inputLayout,
-            static_cast<UINT>(std::size(inputLayout))
+            inputLayout.data(),
+            static_cast<UINT>(inputLayout.size())
         };
         description.PrimitiveTopologyType = NativeTopologyType(
             executable.rasterState.topology);
-        description.NumRenderTargets = 1;
-        description.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-        description.DSVFormat = executable.rasterState.depth
-                == gpu::DepthMode::Disabled
-            ? DXGI_FORMAT_UNKNOWN
-            : DXGI_FORMAT_D32_FLOAT;
+        description.NumRenderTargets = static_cast<UINT>(
+            executable.colorFormats.size());
+        for (std::size_t index = 0;
+             index < executable.colorFormats.size();
+             ++index)
+        {
+            description.RTVFormats[index] = NativeFormat(
+                executable.colorFormats[index]);
+            if (index > 0)
+            {
+                description.BlendState.RenderTarget[index] =
+                    description.BlendState.RenderTarget[0];
+            }
+        }
+        description.DSVFormat = NativeFormat(executable.depthFormat);
         description.SampleDesc.Count = 1;
 
         ComPtr<ID3D12PipelineState> pipeline;
@@ -864,6 +1002,7 @@ namespace sge::d3d12::detail
         bool compute)
     {
         const auto& declaration = module.Program(programId);
+        const auto& parameters = declaration.BindingParameters();
         const auto compiledProgram = programs_.find(programId);
         if (compiledProgram == programs_.end())
         {
@@ -872,8 +1011,7 @@ namespace sge::d3d12::detail
 
         for (const auto& binding : bindings)
         {
-            const auto& parameter = declaration.parameters.at(
-                binding.parameterIndex);
+            const auto& parameter = parameters.at(binding.parameterIndex);
             if (parameter.kind == gpu::ProgramParameterKind::Sampler)
             {
                 throw std::runtime_error(
@@ -900,33 +1038,11 @@ namespace sge::d3d12::detail
                 continue;
             }
 
-            const auto* resource = ResolveResource(
-                binding.resource, binding.frameLag);
-            if (resource == nullptr)
-            {
-                throw std::runtime_error(
-                    "Program binding references an unmaterialized resource.");
-            }
-
-            D3D12_GPU_DESCRIPTOR_HANDLE descriptor{};
-            if (parameter.kind == gpu::ProgramParameterKind::ShaderResource)
-            {
-                if (!resource->hasSrv)
-                {
-                    throw std::runtime_error(
-                        "Shader-resource binding has no SRV descriptor.");
-                }
-                descriptor = resource->srvDescriptor;
-            }
-            else
-            {
-                if (!resource->hasUav)
-                {
-                    throw std::runtime_error(
-                        "Unordered-access binding has no UAV descriptor.");
-                }
-                descriptor = resource->uavDescriptor;
-            }
+            const auto descriptor = ResolveShaderDescriptor(
+                module,
+                binding.resource,
+                parameter.kind,
+                binding.frameLag);
 
             if (compute)
             {
@@ -941,15 +1057,61 @@ namespace sge::d3d12::detail
         }
     }
 
+    D3D12_VERTEX_BUFFER_VIEW Backend::BuildVertexView(
+        const ir::SemanticModule& module,
+        const ir::ResourceView& view)
+    {
+        const auto& declaration = module.Resource(view.resource);
+        if (declaration.Kind() != gpu::ResourceKind::Buffer)
+        {
+            throw std::runtime_error("Vertex ResourceView is not a buffer.");
+        }
+        const auto* record = ResolveResource(view.resource);
+        if (record == nullptr)
+        {
+            throw std::runtime_error(
+                "Vertex ResourceView references an unmaterialized buffer.");
+        }
+        const auto& buffer = std::get<ir::BufferDescription>(
+            declaration.description);
+        const auto size = view.sizeBytes == 0
+            ? buffer.sizeBytes - view.offsetBytes : view.sizeBytes;
+        const auto stride = view.strideBytes == 0
+            ? buffer.strideBytes : view.strideBytes;
+        if (stride == 0 || size > UINT_MAX)
+        {
+            throw std::runtime_error("Vertex ResourceView has an invalid layout.");
+        }
+        return {
+            .BufferLocation = record->resource->GetGPUVirtualAddress()
+                + view.offsetBytes,
+            .SizeInBytes = static_cast<UINT>(size),
+            .StrideInBytes = stride
+        };
+    }
+
     void Backend::ExecuteRasterWork(
         const ir::SemanticModule& module,
         const ir::WorkDeclaration& work,
         FrameContext& frame)
     {
         const auto& raster = std::get<ir::RasterWork>(work.payload);
+        const auto& programDeclaration = module.Program(raster.program);
+        std::vector<gpu::ResourceFormat> colorFormats;
+        colorFormats.reserve(raster.attachments.colors.size());
+        for (const auto& color : raster.attachments.colors)
+        {
+            colorFormats.push_back(module.Resource(color.resource).Format());
+        }
+        const auto depthFormat = raster.attachments.depth.resource.IsValid()
+            ? module.Resource(raster.attachments.depth.resource).Format()
+            : gpu::ResourceFormat::Unknown;
         const compiler::ExecutableKey key{
             .program = raster.program,
             .rasterState = raster.rasterState,
+            .vertexInputs = programDeclaration.programInterface.vertexInputs,
+            .colorFormats = std::move(colorFormats),
+            .depthFormat = depthFormat,
             .compute = false
         };
 
@@ -967,33 +1129,34 @@ namespace sge::d3d12::detail
                 "Raster work has no compiled program.");
         }
 
-        const auto* geometry = ResolveResource(raster.vertexResource);
-        if (geometry == nullptr)
-        {
-            throw std::runtime_error(
-                "Raster work has no static vertex resource.");
-        }
+        const auto geometryView = BuildVertexView(
+            module, raster.vertexResource);
 
-        D3D12_CPU_DESCRIPTOR_HANDLE rtv{};
         if (raster.attachments.colors.empty())
         {
             throw std::runtime_error("Raster work has no color attachment.");
         }
-        const auto color = raster.attachments.colors.front();
-        if (presentationResource_ && color == *presentationResource_)
+        std::vector<D3D12_CPU_DESCRIPTOR_HANDLE> rtvs;
+        rtvs.reserve(raster.attachments.colors.size());
+        for (const auto& color : raster.attachments.colors)
         {
-            rtv = rtvHeap_->GetCPUDescriptorHandleForHeapStart();
-            rtv.ptr += static_cast<SIZE_T>(frameIndex_) * rtvIncrement_;
-        }
-        else
-        {
-            const auto* target = ResolveResource(color);
-            if (target == nullptr || !target->hasRtv)
+            D3D12_CPU_DESCRIPTOR_HANDLE rtv{};
+            if (presentationResource_ && color == *presentationResource_)
             {
-                throw std::runtime_error(
-                    "Raster color attachment has no RTV.");
+                rtv = rtvHeap_->GetCPUDescriptorHandleForHeapStart();
+                rtv.ptr += static_cast<SIZE_T>(frameIndex_) * rtvIncrement_;
             }
-            rtv = target->rtv;
+            else
+            {
+                const auto* target = ResolveResource(color);
+                if (target == nullptr || !target->hasRtv)
+                {
+                    throw std::runtime_error(
+                        "Raster color attachment has no RTV.");
+                }
+                rtv = target->rtv;
+            }
+            rtvs.push_back(rtv);
         }
 
         const bool hasDepth = raster.attachments.depth.IsValid();
@@ -1009,12 +1172,18 @@ namespace sge::d3d12::detail
             dsv = depth->dsv;
         }
         commandList_->OMSetRenderTargets(
-            1, &rtv, FALSE, hasDepth ? &dsv : nullptr);
+            static_cast<UINT>(rtvs.size()),
+            rtvs.data(),
+            FALSE,
+            hasDepth ? &dsv : nullptr);
 
         if (raster.clear.clearColor)
         {
-            commandList_->ClearRenderTargetView(
-                rtv, raster.clear.color.data(), 0, nullptr);
+            for (const auto rtv : rtvs)
+            {
+                commandList_->ClearRenderTargetView(
+                    rtv, raster.clear.color.data(), 0, nullptr);
+            }
         }
         if (raster.clear.clearDepth && hasDepth)
         {
@@ -1034,7 +1203,7 @@ namespace sge::d3d12::detail
         commandList_->IASetPrimitiveTopology(
             NativeTopology(raster.rasterState.topology));
         commandList_->IASetVertexBuffers(
-            0, 1, &geometry->vertexView);
+            0, 1, &geometryView);
         commandList_->DrawInstanced(
             raster.vertexCount,
             1,

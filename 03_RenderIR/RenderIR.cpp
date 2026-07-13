@@ -43,6 +43,12 @@ namespace sge::ir
         return 0;
     }
 
+    const std::vector<gpu::ProgramParameter>&
+        ProgramDeclaration::BindingParameters() const noexcept
+    {
+        return programInterface.parameters.empty() ? parameters : programInterface.parameters;
+    }
+
     gpu::ExecutionDomain WorkDeclaration::Domain() const noexcept
     {
         if (std::holds_alternative<RasterWork>(payload))
@@ -160,7 +166,7 @@ namespace sge::ir
             HashCombine(seed, HashString(program.pixelEntry));
             HashCombine(seed, HashString(program.computeEntry));
 
-            for (const auto& parameter : program.parameters)
+            for (const auto& parameter : program.BindingParameters())
             {
                 HashEnum(seed, parameter.kind);
                 HashEnum(seed, parameter.stage);
@@ -168,6 +174,18 @@ namespace sge::ir
                 HashCombine(seed, parameter.registerIndex);
                 HashCombine(seed, parameter.registerSpace);
             }
+            for (const auto& input : program.programInterface.vertexInputs)
+            {
+                HashCombine(seed, HashString(input.semanticName));
+                HashCombine(seed, input.semanticIndex);
+                HashEnum(seed, input.format);
+                HashCombine(seed, input.inputSlot);
+                HashCombine(seed, input.alignedByteOffset);
+                HashEnum(seed, input.inputRate);
+                HashCombine(seed, input.instanceStepRate);
+            }
+            HashCombine(seed, program.programInterface.colorOutputCount);
+            HashCombine(seed, program.programInterface.depthAttachmentAllowed);
         }
 
         for (const auto& work : works)
@@ -182,7 +200,10 @@ namespace sge::ir
                 if constexpr (std::is_same_v<T, RasterWork>)
                 {
                     HashCombine(seed, payload.program.Value());
-                    HashCombine(seed, payload.vertexResource.Value());
+                    HashCombine(seed, payload.vertexResource.resource.Value());
+                    HashCombine(seed, static_cast<std::size_t>(payload.vertexResource.offsetBytes));
+                    HashCombine(seed, static_cast<std::size_t>(payload.vertexResource.sizeBytes));
+                    HashCombine(seed, payload.vertexResource.strideBytes);
                     HashCombine(seed, payload.vertexCount);
                     HashCombine(seed, payload.firstVertex);
                     HashEnum(seed, payload.rasterState.topology);
@@ -191,14 +212,25 @@ namespace sge::ir
                     for (const auto& binding : payload.bindings)
                     {
                         HashCombine(seed, binding.parameterIndex);
-                        HashCombine(seed, binding.resource.Value());
+                        HashCombine(seed, binding.resource.resource.Value());
+                        HashCombine(seed, static_cast<std::size_t>(binding.resource.offsetBytes));
+                        HashCombine(seed, static_cast<std::size_t>(binding.resource.sizeBytes));
+                        HashCombine(seed, binding.resource.strideBytes);
                         HashCombine(seed, binding.frameLag);
                     }
-                    for (const auto color : payload.attachments.colors)
+                    for (const auto& color : payload.attachments.colors)
                     {
-                        HashCombine(seed, color.Value());
+                        HashCombine(seed, color.resource.Value());
+                        HashCombine(seed, static_cast<std::size_t>(color.offsetBytes));
+                        HashCombine(seed, static_cast<std::size_t>(color.sizeBytes));
+                        HashCombine(seed, color.strideBytes);
                     }
-                    HashCombine(seed, payload.attachments.depth.Value());
+                    HashCombine(seed, payload.attachments.depth.resource.Value());
+                    HashCombine(seed, static_cast<std::size_t>(
+                        payload.attachments.depth.offsetBytes));
+                    HashCombine(seed, static_cast<std::size_t>(
+                        payload.attachments.depth.sizeBytes));
+                    HashCombine(seed, payload.attachments.depth.strideBytes);
                 }
                 else if constexpr (std::is_same_v<T, ComputeWork>)
                 {
@@ -209,7 +241,10 @@ namespace sge::ir
                     for (const auto& binding : payload.bindings)
                     {
                         HashCombine(seed, binding.parameterIndex);
-                        HashCombine(seed, binding.resource.Value());
+                        HashCombine(seed, binding.resource.resource.Value());
+                        HashCombine(seed, static_cast<std::size_t>(binding.resource.offsetBytes));
+                        HashCombine(seed, static_cast<std::size_t>(binding.resource.sizeBytes));
+                        HashCombine(seed, binding.resource.strideBytes);
                         HashCombine(seed, binding.frameLag);
                     }
                 }

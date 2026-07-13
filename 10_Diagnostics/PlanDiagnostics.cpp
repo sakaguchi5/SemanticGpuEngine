@@ -147,6 +147,10 @@ namespace sge::diagnostics
                    << static_cast<int>(executable.rasterState.composition)
                    << ", depth="
                    << static_cast<int>(executable.rasterState.depth)
+                   << ", vertex-inputs=" << executable.vertexInputs.size()
+                   << ", color-targets=" << executable.colorFormats.size()
+                   << ", depth-format="
+                   << static_cast<int>(executable.depthFormat)
                    << "\n";
         }
     }

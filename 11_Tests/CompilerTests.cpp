@@ -872,6 +872,84 @@ namespace
         assert(rejectedCopyMix);
     }
 
+    void TestProgramInterfaceAndResourceViews()
+    {
+        using namespace sge;
+        constexpr gpu::ResourceId vertices{0};
+        constexpr gpu::ResourceId colorA{1};
+        constexpr gpu::ResourceId colorB{2};
+
+        ir::SemanticModule module;
+        module.resources = {
+            {.id = vertices, .name = "PositionOnlyVertices",
+                .lifetime = gpu::ResourceLifetimeClass::Persistent,
+                .update = gpu::ResourceUpdateClass::Immutable,
+                .description = ir::BufferDescription{
+                    .sizeBytes = 24,
+                    .strideBytes = 8,
+                    .usage = ir::BufferUsage::Vertex
+                        | ir::BufferUsage::CopyDestination},
+                .data = std::vector<std::byte>(24)},
+            {.id = colorA, .name = "ColorA",
+                .lifetime = gpu::ResourceLifetimeClass::FrameLocal,
+                .update = gpu::ResourceUpdateClass::GpuProduced,
+                .description = ir::TextureDescription{
+                    .format = gpu::ResourceFormat::Rgba8Unorm,
+                    .width = 64, .height = 64,
+                    .usage = ir::TextureUsage::ColorAttachment}},
+            {.id = colorB, .name = "ColorB",
+                .lifetime = gpu::ResourceLifetimeClass::FrameLocal,
+                .update = gpu::ResourceUpdateClass::GpuProduced,
+                .description = ir::TextureDescription{
+                    .format = gpu::ResourceFormat::Rgba8Unorm,
+                    .width = 64, .height = 64,
+                    .usage = ir::TextureUsage::ColorAttachment}}
+        };
+        module.programs.push_back({
+            .id = gpu::ProgramId{0},
+            .name = "PositionOnlyMrt",
+            .vertexEntry = "VSMain",
+            .pixelEntry = "PSMain",
+            .programInterface = {
+                .vertexInputs = {{
+                    "POSITION", 0, ir::VertexElementFormat::Float2,
+                    0, 0, ir::VertexInputRate::PerVertex, 0}},
+                .colorOutputCount = 2,
+                .depthAttachmentAllowed = false}
+        });
+        module.works.push_back({
+            .id = gpu::WorkId{0},
+            .name = "DrawPositionOnlyMrt",
+            .accesses = {
+                {vertices, gpu::AccessMode::Read,
+                    gpu::ResourceRole::VertexInput},
+                {colorA, gpu::AccessMode::Write,
+                    gpu::ResourceRole::ColorOutput},
+                {colorB, gpu::AccessMode::Write,
+                    gpu::ResourceRole::ColorOutput}},
+            .payload = ir::RasterWork{
+                .program = gpu::ProgramId{0},
+                .vertexResource = ir::ResourceView{vertices, 8, 16, 8},
+                .attachments = {{colorA, colorB}, {}},
+                .vertexCount = 2,
+                .rasterState = {.depth = gpu::DepthMode::Disabled}}
+        });
+
+        const auto result = compiler::RenderCompiler{}.Compile(
+            module, gpu::DeviceCapabilities{});
+        assert(result.plan.executables.size() == 1);
+        const auto& executable = result.plan.executables.front();
+        assert(executable.vertexInputs.size() == 1);
+        assert(executable.vertexInputs[0].format
+            == ir::VertexElementFormat::Float2);
+        assert(executable.colorFormats.size() == 2);
+        assert(executable.depthFormat == gpu::ResourceFormat::Unknown);
+        const auto& raster = std::get<ir::RasterWork>(module.works[0].payload);
+        assert(raster.vertexResource.offsetBytes == 8);
+        assert(raster.vertexResource.sizeBytes == 16);
+        assert(raster.vertexResource.strideBytes == 8);
+    }
+
     void TestCubePlan()
     {
         using namespace sge;
@@ -954,6 +1032,7 @@ int main()
         TestTemporalLagDeterminesRingCapacity();
         TestPersistentResourcesAreImmutableAndReadOnly();
         TestPersistentReadStateEnvelope();
+        TestProgramInterfaceAndResourceViews();
         TestPgaAndSdfModels();
         TestCubePlan();
         TestSdfFrontendPlan();

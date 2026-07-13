@@ -38,6 +38,9 @@ namespace sge::d3d12::detail
     [[nodiscard]] D3D12_RESOURCE_STATES NativeState(
         gpu::AbstractState state) noexcept;
 
+    [[nodiscard]] DXGI_FORMAT NativeVertexFormat(
+        ir::VertexElementFormat format) noexcept;
+
     [[nodiscard]] D3D_PRIMITIVE_TOPOLOGY NativeTopology(
         gpu::PrimitiveTopology topology) noexcept;
 

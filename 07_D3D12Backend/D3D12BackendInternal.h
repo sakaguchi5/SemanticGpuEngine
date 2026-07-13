@@ -13,6 +13,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <unordered_map>
 #include <vector>
@@ -45,6 +46,20 @@ namespace sge::d3d12::detail
         bool hasDsv = false;
         bool hasSrv = false;
         bool hasUav = false;
+    };
+
+    struct ShaderViewKey
+    {
+        ir::ResourceView view;
+        gpu::ProgramParameterKind kind =
+            gpu::ProgramParameterKind::ShaderResource;
+
+        auto operator<=>(const ShaderViewKey&) const = default;
+    };
+
+    struct CachedShaderView
+    {
+        std::vector<D3D12_GPU_DESCRIPTOR_HANDLE> instances;
     };
 
     struct QueueFrameContext
@@ -164,6 +179,16 @@ namespace sge::d3d12::detail
             FrameContext& frame,
             const ir::ResourceDeclaration& declaration);
 
+        [[nodiscard]] D3D12_GPU_DESCRIPTOR_HANDLE ResolveShaderDescriptor(
+            const ir::SemanticModule& module,
+            const ir::ResourceView& view,
+            gpu::ProgramParameterKind kind,
+            std::uint32_t frameLag);
+
+        [[nodiscard]] D3D12_VERTEX_BUFFER_VIEW BuildVertexView(
+            const ir::SemanticModule& module,
+            const ir::ResourceView& view);
+
         void ExecuteRasterWork(
             const ir::SemanticModule& module,
             const ir::WorkDeclaration& work,
@@ -258,6 +283,8 @@ namespace sge::d3d12::detail
             gpu::ResourceId,
             D3D12_RESOURCE_STATES,
             foundation::StrongIdHash<gpu::ResourceTag>> persistentReadStates_;
+
+        std::map<ShaderViewKey, CachedShaderView> customShaderViews_;
 
         std::unordered_map<
             gpu::ResourceId,

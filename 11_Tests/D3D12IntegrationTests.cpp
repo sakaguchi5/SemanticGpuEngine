@@ -87,19 +87,25 @@ namespace
                 .shaderPath = "Shaders/IntegrationTemporalRead.hlsl",
                 .vertexEntry = "VSMain",
                 .pixelEntry = "PSMain",
+                .programInterface = {
+                    .vertexInputs = {{
+                        "POSITION", 0, ir::VertexElementFormat::Float3,
+                        0, 0, ir::VertexInputRate::PerVertex, 0}},
+                    .colorOutputCount = 1,
+                    .depthAttachmentAllowed = false},
                 .parameters = {{.name = "PreviousHistory",
                     .kind = gpu::ProgramParameterKind::ShaderResource,
                     .stage = gpu::ProgramStage::Pixel}}},
             {.id = gpu::ProgramId{3}, .name = "PersistentReader",
                 .shaderPath = "Shaders/IntegrationPersistentRead.hlsl",
                 .computeEntry = "CSMain",
-                .parameters = {
+                .programInterface = {.parameters = {
                     {.name = "SharedVertices",
                         .kind = gpu::ProgramParameterKind::ShaderResource,
                         .stage = gpu::ProgramStage::Compute},
                     {.name = "OutputBuffer",
                         .kind = gpu::ProgramParameterKind::UnorderedAccess,
-                        .stage = gpu::ProgramStage::Compute}}}
+                        .stage = gpu::ProgramStage::Compute}}}}
         };
 
         module.works = {
@@ -118,7 +124,13 @@ namespace
                         gpu::ResourceRole::ProgramOutput}},
                 .payload = ir::ComputeWork{
                     .program = gpu::ProgramId{3},
-                    .bindings = {{0, fullscreen}, {1, aliasA}}}},
+                    .bindings = {
+                        {0, ir::ResourceView{
+                            fullscreen,
+                            sizeof(classical::Vertex),
+                            sizeof(classical::Vertex),
+                            sizeof(classical::Vertex)}},
+                        {1, aliasA}}}},
             {.id = gpu::WorkId{2}, .name = "UseAliasB",
                 .accesses = {{aliasB, gpu::AccessMode::Write,
                     gpu::ResourceRole::ProgramOutput}},
