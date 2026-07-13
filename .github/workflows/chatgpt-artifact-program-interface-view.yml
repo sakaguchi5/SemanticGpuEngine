@@ -1,0 +1,64 @@
+name: ChatGPT Program Interface Resource View Artifact
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reconstruct and apply patch
+        shell: pwsh
+        run: |
+          $chunks = Get-ChildItem ".chatgpt-artifact/apply.b64.*" | Sort-Object Name
+          $base64 = ($chunks | ForEach-Object { Get-Content -LiteralPath $_.FullName -Raw }) -join ""
+          [IO.File]::WriteAllBytes(
+              (Join-Path $env:RUNNER_TEMP "apply.ps1"),
+              [Convert]::FromBase64String($base64))
+          & (Join-Path $env:RUNNER_TEMP "apply.ps1") -RepoRoot $env:GITHUB_WORKSPACE
+      - name: Package changed files
+        shell: pwsh
+        run: |
+          $paths = @(
+            "03_RenderIR/RenderIR.h",
+            "03_RenderIR/RenderIR.cpp",
+            "04_RenderCompiler/RenderCompiler.h",
+            "04_RenderCompiler/RenderCompiler.cpp",
+            "07_D3D12Backend/D3D12Helpers.h",
+            "07_D3D12Backend/D3D12Helpers.cpp",
+            "07_D3D12Backend/D3D12BackendInternal.h",
+            "07_D3D12Backend/D3D12Compilation.cpp",
+            "07_D3D12Backend/D3D12Backend.cpp",
+            "08_ClassicalRasterFrontend/ClassicalLowering.cpp",
+            "09_ExperimentalGeometry/SdfLowering.cpp",
+            "10_Diagnostics/PlanDiagnostics.cpp",
+            "11_Tests/CompilerTests.cpp",
+            "11_Tests/D3D12IntegrationTests.cpp",
+            "Shaders/IntegrationTemporalRead.hlsl"
+          )
+          $stage = Join-Path $env:RUNNER_TEMP "ProgramInterfaceResourceView_f001aa"
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          foreach ($relative in $paths) {
+            $source = Join-Path $env:GITHUB_WORKSPACE $relative
+            if (-not (Test-Path -LiteralPath $source)) {
+              throw "Missing patched file: $relative"
+            }
+            $destination = Join-Path $stage $relative
+            New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
+            Copy-Item -LiteralPath $source -Destination $destination -Force
+          }
+          $zip = Join-Path $env:RUNNER_TEMP "ProgramInterfaceResourceView_f001aa.zip"
+          Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $zip -CompressionLevel Optimal -Force
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash.ToLowerInvariant()
+          "sha256=$hash" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+      - name: Upload ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: ProgramInterfaceResourceView_f001aa
+          path: ${{ runner.temp }}\ProgramInterfaceResourceView_f001aa.zip
+          if-no-files-found: error
+          retention-days: 1
