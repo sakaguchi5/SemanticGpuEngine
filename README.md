@@ -53,17 +53,18 @@ Runtime diagnostics:
 A package owns:
 
 - resource blueprints, physical-instance selectors, allocation identities,
-  initial Buffer data, persistent read envelopes, typeless requirements, and
-  optimized clear values;
+  reconstructible Buffer/Texture subresource data, external binding slots,
+  persistent read envelopes, typeless requirements, and optimized clear values;
 - program blueprints and executable specializations;
 - normalized Buffer and Texture views;
 - compiled Raster, Compute, Copy, and Present commands;
 - a linear `CompiledOperation` stream;
 - backend feature requirements, hashes, and package statistics.
 
-`FrameInvocation` is separate from the static package. It supplies only
-frame-dependent CPU resource data and the frame number, so changing constants
-does not change package identity.
+`FrameInvocation` is separate from the static package. It supplies
+frame-dependent CPU data and borrowed external resources with incoming and
+outgoing state contracts. `FrameSubmission` returns per-queue completion
+points and the current device epoch.
 
 ### Unified operation stream
 
@@ -106,10 +107,16 @@ arenas directly from the package. It no longer invokes the old
 The old source execution function may remain in the concrete backend only as an
 unreachable regression implementation; it is not part of `IRenderBackend`.
 
-The implementation remains a finite reference rather than a bindless allocator
-or production residency manager. Immutable Texture initial-data upload,
-general external resource binding, and full device-loss recovery remain later
-runtime-closure work.
+Immutable Texture data is canonicalized by mip/layer/plane and uploaded through
+`GetCopyableFootprints`/`CopyTextureRegion`. Borrowed D3D12 resources are
+validated against package slots and can be safely rebound; the reference path
+uses a conservative idle descriptor recycle when a bound object changes.
+
+Device removal enables DRED before device creation, records
+`device_removed.json`, increments a device epoch, reconstructs package-owned
+objects from the package, resets temporal history, and requests a fresh bind
+for external resources. The implementation remains a finite reference rather
+than a bindless allocator or production residency manager.
 
 ## Diagnostics and reproducible experiments
 

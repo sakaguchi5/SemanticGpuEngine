@@ -135,11 +135,12 @@ namespace
             return FullCapabilities();
         }
 
-        void Execute(
+        runtime::FrameSubmission Execute(
             const compiler::CompiledRenderPackage&,
             const runtime::FrameInvocation&) override
         {
             executed = true;
+            return {.deviceEpoch = 1};
         }
 
         void WaitIdle() override
@@ -536,9 +537,9 @@ namespace
             "Backend-ready package did not retain its native blueprints.");
         ValidateBackendOperationStream(result.package);
         PackageOnlyBackend backend;
-        backend.Execute(result.package, {});
-        Require(backend.executed,
-            "A package-only backend could not implement IRenderBackend.");
+        const auto submission = backend.Execute(result.package, {});
+        Require(backend.executed && submission.deviceEpoch == 1,
+            "A package-only backend could not implement submission completion.");
     }
 
     void TestTextureRangeStateModel()
@@ -743,6 +744,83 @@ namespace
         Require(!budget.Succeeded(), "Memory budget overflow was accepted.");
     }
 
+    void TestResourceMaterializationContract()
+    {
+        ir::SemanticModule textureModule;
+        textureModule.resources.push_back({
+            .id = gpu::ResourceId{0},
+            .name = "ImmutableTexture",
+            .lifetime = gpu::ResourceLifetimeClass::Persistent,
+            .update = gpu::ResourceUpdateClass::Immutable,
+            .description = ir::TextureDescription{
+                .dimension = gpu::ResourceKind::Texture2D,
+                .format = gpu::ResourceFormat::Rgba8Unorm,
+                .width = 2,
+                .height = 2,
+                .depth = 1,
+                .mipLevels = 1,
+                .arrayLayers = 1,
+                .sampleCount = 1,
+                .usage = ir::TextureUsage::Sampled},
+            .textureData = {{
+                .mip = 0,
+                .arrayLayer = 0,
+                .plane = 0,
+                .rowPitch = 8,
+                .slicePitch = 16,
+                .bytes = std::vector<std::byte>(16, std::byte{0x2a})}}
+        });
+        const auto texture = compiler::RenderPackageCompiler{}.Compile(
+            textureModule, FullCapabilities());
+        Require(texture.Succeeded(),
+            "Immutable texture materialization contract failed.");
+        Require(std::holds_alternative<compiler::TextureInitialContent>(
+                    texture.package.resources.front().initialContent),
+            "Immutable texture bytes were not canonicalized by subresource.");
+        Require(texture.package.resources.front().rebuildPolicy
+                == compiler::ResourceRebuildPolicy::RecreateFromPackage,
+            "Package-owned texture is not reconstructible after device loss.");
+        Require(std::any_of(
+                    texture.package.preparationOperations.begin(),
+                    texture.package.preparationOperations.end(),
+                    [](const compiler::CompiledPreparationOperation& operation)
+                    {
+                        return std::holds_alternative<
+                            compiler::UploadTexturePreparation>(operation);
+                    }),
+            "Immutable texture upload preparation was not emitted.");
+
+        auto incomplete = textureModule;
+        auto& description = std::get<ir::TextureDescription>(
+            incomplete.resources.front().description);
+        description.mipLevels = 2;
+        const auto rejected = compiler::RenderPackageCompiler{}.Compile(
+            incomplete, FullCapabilities());
+        Require(!rejected.Succeeded(),
+            "Incomplete immutable texture mip content was accepted.");
+
+        ir::SemanticModule externalModule;
+        externalModule.resources.push_back({
+            .id = gpu::ResourceId{0},
+            .name = "ImportedBuffer",
+            .lifetime = gpu::ResourceLifetimeClass::External,
+            .update = gpu::ResourceUpdateClass::Imported,
+            .description = ir::BufferDescription{
+                .sizeBytes = 64,
+                .strideBytes = 4,
+                .usage = ir::BufferUsage::Storage}}
+        );
+        const auto external = compiler::RenderPackageCompiler{}.Compile(
+            externalModule, FullCapabilities());
+        Require(external.Succeeded(),
+            "External resource materialization contract failed.");
+        Require(external.package.resources.front().origin
+                == compiler::ResourceOrigin::ExternalBorrowed
+                && external.package.resources.front().rebuildPolicy
+                == compiler::ResourceRebuildPolicy::RequireExternalRebind,
+            "External resource ownership/rebuild contract was lost.");
+    }
+
     void TestDeterminismAndExperimentHarness()
     {
         auto capabilities = FullCapabilities();
@@ -799,5 +877,6 @@ void RunV1AcceptanceTests()
     TestTextureRangeStateModel();
     TestGeneralRasterContract();
     TestCopyHandoffAndBudget();
+    TestResourceMaterializationContract();
     TestDeterminismAndExperimentHarness();
 }

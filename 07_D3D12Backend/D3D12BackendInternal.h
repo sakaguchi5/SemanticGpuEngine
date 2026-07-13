@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <map>
 #include <optional>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -23,6 +24,29 @@ namespace sge::d3d12::detail
     constexpr UINT FrameCount = 3;
     constexpr UINT64 UploadArenaSize = 1024ull * 1024ull;
     constexpr std::size_t QueueClassCount = 3;
+
+    class D3D12ExternalResource final : public runtime::IExternalResource
+    {
+    public:
+        explicit D3D12ExternalResource(ID3D12Resource* native);
+        [[nodiscard]] std::string_view BackendType() const noexcept override;
+
+        Microsoft::WRL::ComPtr<ID3D12Resource> resource;
+    };
+
+    class D3D12QueueCompletion final : public runtime::IQueueCompletion
+    {
+    public:
+        D3D12QueueCompletion(
+            Microsoft::WRL::ComPtr<ID3D12Fence> source,
+            UINT64 target);
+        [[nodiscard]] bool IsComplete() const noexcept override;
+        void Wait() override;
+
+    private:
+        Microsoft::WRL::ComPtr<ID3D12Fence> fence_;
+        UINT64 value_ = 0;
+    };
 
     struct ProgramRecord
     {
@@ -134,11 +158,13 @@ namespace sge::d3d12::detail
 
         [[nodiscard]] gpu::DeviceCapabilities Capabilities() const override;
 
-        void Execute(
+        runtime::FrameSubmission Execute(
             const compiler::CompiledRenderPackage& package,
             const runtime::FrameInvocation& invocation) override;
 
         void WaitIdle() override;
+        [[nodiscard]] void* NativeDeviceHandle() const noexcept;
+        [[nodiscard]] bool RecreateDeviceForTesting();
 
     private:
         // Unreachable regression implementation retained while old compiler
@@ -148,7 +174,19 @@ namespace sge::d3d12::detail
             const compiler::ExecutionPlan& plan);
 
         void EnableDebugLayer();
+        void EnableDred();
         void ValidateDebugLayer();
+        void CreateDeviceObjects();
+        void DestroyDeviceObjects() noexcept;
+        void RecreateDeviceObjects();
+        void WriteDeviceRemovedDiagnostics(
+            HRESULT operationResult,
+            HRESULT removedReason,
+            const char* operation) const noexcept;
+        [[nodiscard]] bool DeviceWasRemoved() const noexcept;
+        [[nodiscard]] runtime::FrameSubmission ExecutePackageFrame(
+            const compiler::CompiledRenderPackage& package,
+            const runtime::FrameInvocation& invocation);
         void CreateDeviceAndQueue();
         void CreateSwapChain();
         void CreateDescriptorHeaps();
@@ -192,6 +230,16 @@ namespace sge::d3d12::detail
         void EnsureUploadCapacity(UINT64 requiredBytes);
         void UploadPackageInitialBufferData(
             const compiler::CompiledRenderPackage& package);
+        void UploadPackageInitialTextureData(
+            const compiler::CompiledRenderPackage& package);
+        void BindExternalResources(
+            const compiler::CompiledRenderPackage& package,
+            const runtime::FrameInvocation& invocation);
+        void ReleaseExternalResources(
+            const compiler::CompiledRenderPackage& package,
+            const runtime::FrameInvocation& invocation,
+            FrameContext& frame,
+            std::array<UINT64, QueueClassCount>& finalSignals);
         void InitializePackagePersistentReadStates(
             const compiler::CompiledRenderPackage& package);
         void InitializePersistentReadStates();
@@ -388,6 +436,12 @@ namespace sge::d3d12::detail
         std::optional<gpu::ResourceId> presentationResource_;
         std::optional<std::size_t> compiledStructureHash_;
         std::optional<std::size_t> compiledPackageHash_;
+        UINT preparedWidth_ = 0;
+        UINT preparedHeight_ = 0;
+        std::uint64_t preparedDeviceEpoch_ = 0;
+        std::uint64_t deviceEpoch_ = 1;
+        std::size_t lastOperationIndex_ = 0;
+        std::string lastWorkName_;
         const compiler::CompiledRenderPackage* activePackage_ = nullptr;
         const runtime::FrameInvocation* activeInvocation_ = nullptr;
     };

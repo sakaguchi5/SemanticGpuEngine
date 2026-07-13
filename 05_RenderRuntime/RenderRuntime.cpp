@@ -32,14 +32,14 @@ namespace sge::runtime
         }
     }
 
-    void RenderRuntime::Execute(const ir::SemanticModule& module)
+    FrameSubmission RenderRuntime::Execute(const ir::SemanticModule& module)
     {
         FrameInvocation invocation;
         invocation.frameNumber = frameNumber_;
-        Execute(module, invocation);
+        return Execute(module, invocation);
     }
 
-    void RenderRuntime::Execute(
+    FrameSubmission RenderRuntime::Execute(
         const ir::SemanticModule& module,
         const FrameInvocation& invocation)
     {
@@ -113,8 +113,9 @@ namespace sge::runtime
                 resolved.dynamicResourceData[resource.id] = resource.data;
             }
         }
-        backend_->Execute(*cachedPackage_, resolved);
+        auto submission = backend_->Execute(*cachedPackage_, resolved);
         ++frameNumber_;
+        return submission;
     }
 
     void RenderRuntime::WaitIdle()

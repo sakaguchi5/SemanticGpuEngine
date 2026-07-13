@@ -43,6 +43,8 @@ The D3D12 package path must materialize directly from package blueprints:
 - frame-local, temporal, persistent, and presentation instances;
 - alias heaps and physical allocations;
 - immutable Buffer initial data;
+- immutable Texture mip/layer subresource data and preparation uploads;
+- external Buffer/Texture slots with explicit ownership and state contracts;
 - persistent compatible read envelopes;
 - typed or typeless Texture resources and optimized clear values;
 - programs, root signatures, PSOs, and range descriptors;
@@ -84,6 +86,10 @@ V1 architecture closure is accepted only when:
 - repeated compilation produces identical package hashes and operation kinds;
 - unsupported backend capabilities produce compile-time structured errors;
 - source/module/plan materialization is absent from the package execution path.
+- package-owned resources can be rematerialized after a device-epoch change;
+- external resources require an explicit rebind after device recreation;
+- frame submission exposes queue completion points;
+- DRED device-removal diagnostics include package and operation identity.
 
 The finite gate excludes Ray Work, bindless descriptors, DXC/Shader Model 6,
 direct PGA/CGA GPU evaluation, and automatic Raster/Compute/Ray selection.

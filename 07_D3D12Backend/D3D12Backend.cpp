@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <array>
+#include <fstream>
+#include <sstream>
 #include <string>
 #include <stdexcept>
 #include <utility>
@@ -11,6 +13,52 @@ using Microsoft::WRL::ComPtr;
 
 namespace sge::d3d12::detail
 {
+    D3D12ExternalResource::D3D12ExternalResource(ID3D12Resource* native)
+        : resource(native)
+    {
+        if (native == nullptr)
+        {
+            throw std::invalid_argument(
+                "Cannot wrap a null D3D12 external resource.");
+        }
+    }
+
+    std::string_view D3D12ExternalResource::BackendType() const noexcept
+    {
+        return "D3D12";
+    }
+
+    D3D12QueueCompletion::D3D12QueueCompletion(
+        ComPtr<ID3D12Fence> source,
+        UINT64 target)
+        : fence_(std::move(source)), value_(target)
+    {
+    }
+
+    bool D3D12QueueCompletion::IsComplete() const noexcept
+    {
+        return !fence_ || fence_->GetCompletedValue() >= value_;
+    }
+
+    void D3D12QueueCompletion::Wait()
+    {
+        if (IsComplete()) return;
+        const HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (event == nullptr)
+        {
+            throw std::runtime_error(
+                "CreateEventW failed for external completion.");
+        }
+        const HRESULT result = fence_->SetEventOnCompletion(value_, event);
+        if (FAILED(result))
+        {
+            CloseHandle(event);
+            ThrowIfFailed(result, "External completion wait");
+        }
+        WaitForSingleObject(event, INFINITE);
+        CloseHandle(event);
+    }
+
     Backend::Backend(
         platform::NativeSurface surface,
         BackendConfiguration configuration)
@@ -26,12 +74,96 @@ namespace sge::d3d12::detail
         }
 
         EnableDebugLayer();
+        EnableDred();
+        CreateDeviceObjects();
+    }
+
+    void Backend::EnableDred()
+    {
+        ComPtr<ID3D12DeviceRemovedExtendedDataSettings> settings;
+        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&settings))))
+        {
+            settings->SetAutoBreadcrumbsEnablement(
+                D3D12_DRED_ENABLEMENT_FORCED_ON);
+            settings->SetPageFaultEnablement(
+                D3D12_DRED_ENABLEMENT_FORCED_ON);
+        }
+    }
+
+    void Backend::CreateDeviceObjects()
+    {
         CreateDeviceAndQueue();
         CreateSwapChain();
         CreateDescriptorHeaps();
         CreateFrameContexts();
         CreateFence();
         CreateRenderTargets();
+    }
+
+    void Backend::DestroyDeviceObjects() noexcept
+    {
+        for (auto& frame : frames_)
+        {
+            if (frame.uploadArena && frame.mappedUpload != nullptr)
+            {
+                frame.uploadArena->Unmap(0, nullptr);
+            }
+            frame = {};
+        }
+        for (auto& state : queueSyncStates_)
+        {
+            if (state.event != nullptr) CloseHandle(state.event);
+            state = {};
+        }
+        resources_.clear();
+        resourceInstancePlans_.clear();
+        persistentReadStates_.clear();
+        customShaderViews_.clear();
+        packageShaderViews_.clear();
+        packageAttachmentViews_.clear();
+        physicalAllocations_.clear();
+        allocationHeaps_.clear();
+        activeAliasedResources_.clear();
+        temporalInstanceUsages_.clear();
+        programs_.clear();
+        pipelines_.clear();
+        presentationResource_.reset();
+        for (auto& buffer : backBuffers_) buffer.Reset();
+        commandList_.Reset();
+        rtvHeap_.Reset();
+        dsvHeap_.Reset();
+        shaderHeap_.Reset();
+        swapChain_.Reset();
+        copyQueue_.Reset();
+        computeQueue_.Reset();
+        queue_.Reset();
+        device_.Reset();
+        adapter_.Reset();
+        factory_.Reset();
+        compiledPackageHash_.reset();
+        compiledStructureHash_.reset();
+        preparedWidth_ = preparedHeight_ = 0;
+        preparedDeviceEpoch_ = 0;
+    }
+
+    void Backend::RecreateDeviceObjects()
+    {
+        DestroyDeviceObjects();
+        ++deviceEpoch_;
+        EnableDred();
+        CreateDeviceObjects();
+    }
+
+    void* Backend::NativeDeviceHandle() const noexcept
+    {
+        return device_.Get();
+    }
+
+    bool Backend::RecreateDeviceForTesting()
+    {
+        WaitIdle();
+        RecreateDeviceObjects();
+        return device_ != nullptr;
     }
 
     Backend::~Backend()
@@ -616,6 +748,93 @@ namespace sge::d3d12::detail
 #endif
     }
 
+    bool Backend::DeviceWasRemoved() const noexcept
+    {
+        return device_ != nullptr
+            && FAILED(device_->GetDeviceRemovedReason());
+    }
+
+    void Backend::WriteDeviceRemovedDiagnostics(
+        HRESULT operationResult,
+        HRESULT removedReason,
+        const char* operation) const noexcept
+    {
+        try
+        {
+            const auto escape = [](std::string_view value)
+            {
+                std::string result;
+                for (const char character : value)
+                {
+                    if (character == '\\' || character == '"')
+                        result.push_back('\\');
+                    if (character == '\n') result += "\\n";
+                    else if (character == '\r') result += "\\r";
+                    else result.push_back(character);
+                }
+                return result;
+            };
+            std::string breadcrumbName;
+            UINT breadcrumbCount = 0;
+            UINT lastBreadcrumb = 0;
+            D3D12_GPU_VIRTUAL_ADDRESS pageFaultAddress = 0;
+            ComPtr<ID3D12DeviceRemovedExtendedData> dred;
+            if (device_ && SUCCEEDED(device_.As(&dred)))
+            {
+                D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT breadcrumbs{};
+                if (SUCCEEDED(dred->GetAutoBreadcrumbsOutput(&breadcrumbs))
+                    && breadcrumbs.pHeadAutoBreadcrumbNode != nullptr)
+                {
+                    const auto* node = breadcrumbs.pHeadAutoBreadcrumbNode;
+                    if (node->pCommandListDebugNameA != nullptr)
+                    {
+                        breadcrumbName = node->pCommandListDebugNameA;
+                    }
+                    breadcrumbCount = node->BreadcrumbCount;
+                    if (node->pLastBreadcrumbValue != nullptr)
+                    {
+                        lastBreadcrumb = *node->pLastBreadcrumbValue;
+                    }
+                }
+                D3D12_DRED_PAGE_FAULT_OUTPUT fault{};
+                if (SUCCEEDED(dred->GetPageFaultAllocationOutput(&fault)))
+                {
+                    pageFaultAddress = fault.PageFaultVA;
+                }
+            }
+
+            std::ofstream output(
+                "device_removed.json", std::ios::trunc);
+            output << "{\n"
+                << "  \"operation\": \""
+                << escape(operation == nullptr ? "unknown" : operation)
+                << "\",\n"
+                << "  \"operation_result\": "
+                << static_cast<std::int64_t>(operationResult) << ",\n"
+                << "  \"removed_reason\": "
+                << static_cast<std::int64_t>(removedReason) << ",\n"
+                << "  \"device_epoch\": " << deviceEpoch_ << ",\n"
+                << "  \"package_hash\": "
+                << (compiledPackageHash_ ? *compiledPackageHash_ : 0)
+                << ",\n"
+                << "  \"last_operation_index\": "
+                << lastOperationIndex_ << ",\n"
+                << "  \"last_work\": \"" << escape(lastWorkName_) << "\",\n"
+                << "  \"breadcrumb_name\": \""
+                << escape(breadcrumbName) << "\",\n"
+                << "  \"breadcrumb_count\": "
+                << breadcrumbCount << ",\n"
+                << "  \"last_breadcrumb\": "
+                << lastBreadcrumb << ",\n"
+                << "  \"page_fault_address\": "
+                << pageFaultAddress << "\n"
+                << "}\n";
+        }
+        catch (...)
+        {
+        }
+    }
+
     void Backend::CreateDeviceAndQueue()
     {
         UINT factoryFlags = 0;
@@ -938,5 +1157,24 @@ namespace sge::d3d12
         BackendConfiguration configuration)
     {
         return std::make_unique<detail::Backend>(surface, configuration);
+    }
+
+    std::shared_ptr<runtime::IExternalResource> WrapExternalResource(
+        void* nativeResource)
+    {
+        return std::make_shared<detail::D3D12ExternalResource>(
+            static_cast<ID3D12Resource*>(nativeResource));
+    }
+
+    void* NativeDevice(runtime::IRenderBackend& backend)
+    {
+        auto* native = dynamic_cast<detail::Backend*>(&backend);
+        return native == nullptr ? nullptr : native->NativeDeviceHandle();
+    }
+
+    bool RecreateDeviceForTesting(runtime::IRenderBackend& backend)
+    {
+        auto* native = dynamic_cast<detail::Backend*>(&backend);
+        return native != nullptr && native->RecreateDeviceForTesting();
     }
 }

@@ -8,6 +8,7 @@
 #include <map>
 #include <set>
 #include <stdexcept>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -1197,13 +1198,14 @@ namespace sge::compiler
                     {.resource = resource.id});
             }
             if (resource.update == gpu::ResourceUpdateClass::Immutable
+                && resource.Kind() == gpu::ResourceKind::Buffer
                 && resource.data.size() != resource.SizeBytes())
             {
                 AddDiagnostic(
                     diagnostics,
-                    DiagnosticCode::InvalidResource,
+                    DiagnosticCode::InvalidInitialContent,
                     DiagnosticSeverity::Error,
-                    "Immutable resource data size does not match its declaration.",
+                    "Immutable buffer data size does not match its declaration.",
                     {.resource = resource.id});
             }
             if (resource.lifetime == gpu::ResourceLifetimeClass::External
@@ -1335,6 +1337,107 @@ namespace sge::compiler
                         DiagnosticSeverity::Error,
                         "Multisampled V1 textures are 2D, single-mip, and cannot be UAVs.",
                         {.resource = resource.id});
+                }
+
+                if (resource.update == gpu::ResourceUpdateClass::Immutable
+                    && resource.lifetime
+                        != gpu::ResourceLifetimeClass::External)
+                {
+                    if ((texture->width == 0 || texture->height == 0)
+                        && !resource.textureData.empty())
+                    {
+                        AddDiagnostic(
+                            diagnostics,
+                            DiagnosticCode::InvalidInitialContent,
+                            DiagnosticSeverity::Error,
+                            "Surface-relative immutable textures cannot carry fixed initial data.",
+                            {.resource = resource.id});
+                    }
+                    if (texture->sampleCount > 1
+                        && !resource.textureData.empty())
+                    {
+                        AddDiagnostic(
+                            diagnostics,
+                            DiagnosticCode::InvalidInitialContent,
+                            DiagnosticSeverity::Error,
+                            "Immutable multisampled texture initial data is not supported.",
+                            {.resource = resource.id});
+                    }
+                    if (texture->format == gpu::ResourceFormat::Depth32Float
+                        && !resource.textureData.empty())
+                    {
+                        AddDiagnostic(
+                            diagnostics,
+                            DiagnosticCode::InvalidInitialContent,
+                            DiagnosticSeverity::Error,
+                            "Depth/stencil texture initial data is outside the V1 upload contract.",
+                            {.resource = resource.id});
+                    }
+
+                    std::set<std::tuple<
+                        std::uint16_t, std::uint16_t, std::uint8_t>> seen;
+                    const auto bytesPerTexel = gpu::BytesPerTexel(
+                        texture->format);
+                    for (const auto& subresource : resource.textureData)
+                    {
+                        const bool validIndex =
+                            subresource.mip < texture->mipLevels
+                            && subresource.arrayLayer
+                                < (texture->dimension
+                                    == gpu::ResourceKind::Texture3D
+                                    ? 1u : texture->arrayLayers)
+                            && subresource.plane == 0;
+                        const auto width = std::max(
+                            1u, texture->width >> subresource.mip);
+                        const auto height = std::max(
+                            1u, texture->height >> subresource.mip);
+                        const auto depth = texture->dimension
+                                == gpu::ResourceKind::Texture3D
+                            ? std::max<std::uint32_t>(
+                                1u, texture->depth >> subresource.mip)
+                            : 1u;
+                        const auto minimumRow = static_cast<std::uint64_t>(
+                            width) * bytesPerTexel;
+                        const auto minimumSlice = minimumRow * height;
+                        const auto requiredBytes = minimumSlice * depth;
+                        const bool layoutValid = bytesPerTexel != 0
+                            && subresource.rowPitch >= minimumRow
+                            && subresource.slicePitch
+                                >= subresource.rowPitch * height
+                            && subresource.bytes.size()
+                                >= subresource.slicePitch * depth;
+                        if (!validIndex
+                            || !seen.emplace(
+                                subresource.mip,
+                                subresource.arrayLayer,
+                                subresource.plane).second
+                            || !layoutValid
+                            || subresource.bytes.size() < requiredBytes)
+                        {
+                            AddDiagnostic(
+                                diagnostics,
+                                DiagnosticCode::InvalidInitialContent,
+                                DiagnosticSeverity::Error,
+                                "Immutable texture subresource data has an invalid index, duplicate entry, pitch, or byte count.",
+                                {.resource = resource.id});
+                        }
+                    }
+
+                    const auto expectedSubresources =
+                        static_cast<std::size_t>(texture->mipLevels)
+                        * (texture->dimension
+                            == gpu::ResourceKind::Texture3D
+                            ? 1u : texture->arrayLayers);
+                    if (!resource.textureData.empty()
+                        && seen.size() != expectedSubresources)
+                    {
+                        AddDiagnostic(
+                            diagnostics,
+                            DiagnosticCode::InvalidInitialContent,
+                            DiagnosticSeverity::Error,
+                            "Immutable texture initial data must provide the complete mip/layer set.",
+                            {.resource = resource.id});
+                    }
                 }
             }
         }
@@ -1593,6 +1696,52 @@ namespace sge::compiler
             const auto uses = CollectViewUses(module, work, diagnostics);
             for (const auto& use : uses)
             {
+                const auto* usedResource = TryResource(
+                    module, use.view.resource);
+                if (usedResource != nullptr
+                    && usedResource->lifetime
+                        == gpu::ResourceLifetimeClass::External
+                    && usedResource->Kind()
+                        != gpu::ResourceKind::Presentation)
+                {
+                    const bool wholeBuffer =
+                        use.view.kind == gpu::ResourceKind::Buffer
+                        && use.view.byteOffset == 0
+                        && use.view.byteSize == usedResource->SizeBytes();
+                    bool wholeTexture = false;
+                    if (use.view.kind != gpu::ResourceKind::Buffer)
+                    {
+                        const auto& texture =
+                            std::get<ir::TextureDescription>(
+                                usedResource->description);
+                        const auto& range = use.view.textureRange;
+                        wholeTexture = range.firstMip == 0
+                            && range.mipCount == texture.mipLevels
+                            && range.firstArrayLayer == 0
+                            && range.arrayLayerCount
+                                == (texture.dimension
+                                    == gpu::ResourceKind::Texture3D
+                                    ? 1u : texture.arrayLayers)
+                            && range.firstPlane == 0
+                            && range.planeCount == 1
+                            && range.firstDepthSlice == 0
+                            && range.depthSliceCount
+                                == (texture.dimension
+                                    == gpu::ResourceKind::Texture3D
+                                    ? texture.depth : 1u)
+                            && use.view.format == texture.format;
+                    }
+                    if (!wholeBuffer && !wholeTexture)
+                    {
+                        AddDiagnostic(
+                            diagnostics,
+                            DiagnosticCode::InvalidView,
+                            DiagnosticSeverity::Error,
+                            "V1 external resources are acquired and released as whole resources.",
+                            {.resource = use.view.resource,
+                             .work = work.id});
+                    }
+                }
                 if (use.view.kind == gpu::ResourceKind::Buffer
                     || use.view.kind == gpu::ResourceKind::Presentation)
                 {
@@ -1832,12 +1981,77 @@ namespace sge::compiler
             {
                 allocation = lifetime->allocation;
             }
-            result.package.resources.push_back({
-                .declaration = resource,
-                .instances = instancePlan,
-                .allocation = allocation,
-                .estimatedCommittedBytes = bytes
-            });
+            CompiledResourceBlueprint blueprint;
+            blueprint.declaration = resource;
+            blueprint.instances = instancePlan;
+            blueprint.allocation = allocation;
+            blueprint.estimatedCommittedBytes = bytes;
+            if (resource.Kind() == gpu::ResourceKind::Presentation)
+            {
+                blueprint.origin = ResourceOrigin::Presentation;
+                blueprint.rebuildPolicy =
+                    ResourceRebuildPolicy::BackendManaged;
+            }
+            else if (resource.lifetime
+                == gpu::ResourceLifetimeClass::External)
+            {
+                blueprint.origin = ResourceOrigin::ExternalBorrowed;
+                blueprint.rebuildPolicy =
+                    ResourceRebuildPolicy::RequireExternalRebind;
+            }
+            else
+            {
+                blueprint.origin = ResourceOrigin::PackageOwned;
+                blueprint.rebuildPolicy =
+                    ResourceRebuildPolicy::RecreateFromPackage;
+            }
+            if (const auto* texture = std::get_if<ir::TextureDescription>(
+                    &resource.description))
+            {
+                blueprint.extentPolicy =
+                    texture->width == 0 || texture->height == 0
+                    ? ResourceExtentPolicy::SurfaceRelative
+                    : ResourceExtentPolicy::Fixed;
+
+                if (!resource.textureData.empty())
+                {
+                    TextureInitialContent content;
+                    content.subresources.reserve(resource.textureData.size());
+                    for (const auto& source : resource.textureData)
+                    {
+                        content.subresources.push_back({
+                            .mip = source.mip,
+                            .arrayLayer = source.arrayLayer,
+                            .plane = source.plane,
+                            .width = std::max(
+                                1u, texture->width >> source.mip),
+                            .height = std::max(
+                                1u, texture->height >> source.mip),
+                            .depth = texture->dimension
+                                    == gpu::ResourceKind::Texture3D
+                                ? std::max<std::uint32_t>(
+                                    1u, texture->depth >> source.mip)
+                                : 1u,
+                            .sourceRowPitch = source.rowPitch,
+                            .sourceSlicePitch = source.slicePitch,
+                            .bytes = source.bytes
+                        });
+                    }
+                    blueprint.initialContent = std::move(content);
+                    result.package.preparationOperations.push_back(
+                        UploadTexturePreparation{resource.id});
+                }
+            }
+            else if (resource.Kind() == gpu::ResourceKind::Buffer
+                && !resource.data.empty()
+                && resource.update != gpu::ResourceUpdateClass::CpuUpdated)
+            {
+                blueprint.initialContent = BufferInitialContent{
+                    resource.data};
+                result.package.preparationOperations.push_back(
+                    UploadBufferPreparation{resource.id});
+            }
+            result.package.resources.push_back(std::move(blueprint));
             result.package.statistics.estimatedCommittedBytes += bytes;
             result.package.statistics.physicalInstanceCount +=
                 instancePlan.physicalInstanceCount;
@@ -2165,7 +2379,39 @@ namespace sge::compiler
             if (blueprint != result.package.resources.end())
             {
                 blueprint->persistentReadStates = envelope.states;
+                result.package.preparationOperations.push_back(
+                    InitializePersistentStatePreparation{
+                        envelope.resource});
             }
+        }
+
+        for (const auto& blueprint : result.package.resources)
+        {
+            if (blueprint.origin != ResourceOrigin::ExternalBorrowed)
+            {
+                continue;
+            }
+            ExternalResourceSlot slot;
+            slot.resource = blueprint.declaration.id;
+            slot.kind = blueprint.declaration.Kind();
+            slot.expectedDescription = blueprint.declaration.description;
+            for (const auto& work : result.report.works)
+            {
+                for (const auto& requirement : work.rangeStates)
+                {
+                    if (requirement.view.resource != slot.resource)
+                    {
+                        continue;
+                    }
+                    if (slot.firstRequiredState
+                        == gpu::AbstractState::Undefined)
+                    {
+                        slot.firstRequiredState = requirement.state;
+                    }
+                    slot.lastRequiredState = requirement.state;
+                }
+            }
+            result.package.externalSlots.push_back(std::move(slot));
         }
 
         const auto handoffAlreadyPlanned = [&](std::size_t releaseWork,
@@ -2971,6 +3217,10 @@ namespace sge::compiler
             }
             foundation::HashCombine(
                 packageHash, resource.requiresTypelessResource);
+            foundation::HashEnum(packageHash, resource.origin);
+            foundation::HashEnum(packageHash, resource.rebuildPolicy);
+            foundation::HashEnum(packageHash, resource.extentPolicy);
+            foundation::HashCombine(packageHash, resource.initialContent.index());
             for (const auto state : resource.persistentReadStates)
             {
                 foundation::HashEnum(packageHash, state);
@@ -2993,6 +3243,24 @@ namespace sge::compiler
                 foundation::HashCombine(
                     packageHash, resource.optimizedClear->stencil);
             }
+        }
+
+        for (const auto& preparation : result.package.preparationOperations)
+        {
+            foundation::HashCombine(packageHash, preparation.index());
+            std::visit([&](const auto& value)
+            {
+                foundation::HashCombine(
+                    packageHash, value.resource.Value());
+            }, preparation);
+        }
+        for (const auto& slot : result.package.externalSlots)
+        {
+            foundation::HashCombine(packageHash, slot.resource.Value());
+            foundation::HashEnum(packageHash, slot.kind);
+            foundation::HashEnum(packageHash, slot.firstRequiredState);
+            foundation::HashEnum(packageHash, slot.lastRequiredState);
+            foundation::HashCombine(packageHash, slot.requiredEveryFrame);
         }
 
         for (const auto& operation : result.package.operations)
@@ -3090,6 +3358,8 @@ namespace sge::compiler
             return "QueueHandoffRequired";
         case DiagnosticCode::ShaderInterfaceMismatch:
             return "ShaderInterfaceMismatch";
+        case DiagnosticCode::InvalidInitialContent:
+            return "InvalidInitialContent";
         }
         return "Unknown";
     }

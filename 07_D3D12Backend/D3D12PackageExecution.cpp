@@ -262,12 +262,15 @@ namespace sge::d3d12::detail
         std::vector<const compiler::CompiledResourceBlueprint*> uploadsToMake;
         for (const auto& blueprint : package.resources)
         {
+            const auto* content = std::get_if<
+                compiler::BufferInitialContent>(&blueprint.initialContent);
             if (blueprint.declaration.Kind() == gpu::ResourceKind::Buffer
                 && blueprint.declaration.lifetime
                     != gpu::ResourceLifetimeClass::External
                 && blueprint.declaration.update
                     != gpu::ResourceUpdateClass::CpuUpdated
-                && !blueprint.declaration.data.empty())
+                && content != nullptr
+                && !content->bytes.empty())
             {
                 uploadsToMake.push_back(&blueprint);
             }
@@ -296,7 +299,9 @@ namespace sge::d3d12::detail
         const auto uploadProperties = HeapProperties(D3D12_HEAP_TYPE_UPLOAD);
         for (const auto* blueprint : uploadsToMake)
         {
-            const auto byteCount = blueprint->declaration.data.size();
+            const auto& bytes = std::get<compiler::BufferInitialContent>(
+                blueprint->initialContent).bytes;
+            const auto byteCount = bytes.size();
             const auto uploadDescription = BufferDescription(byteCount);
             ComPtr<ID3D12Resource> upload;
             ThrowIfFailed(device_->CreateCommittedResource(
@@ -313,7 +318,7 @@ namespace sge::d3d12::detail
                 "Map package initialization upload buffer");
             std::memcpy(
                 mapped,
-                blueprint->declaration.data.data(),
+                bytes.data(),
                 byteCount);
             upload->Unmap(0, nullptr);
 
@@ -339,6 +344,139 @@ namespace sge::d3d12::detail
 
         ThrowIfFailed(list->Close(),
             "Close package initialization list");
+        ID3D12CommandList* lists[] = {list.Get()};
+        queue_->ExecuteCommandLists(1, lists);
+        const UINT64 completion = SignalQueue(gpu::QueueClass::Direct);
+        WaitForCpuQueueValue(gpu::QueueClass::Direct, completion);
+        ValidateDebugLayer();
+    }
+
+    void Backend::UploadPackageInitialTextureData(
+        const compiler::CompiledRenderPackage& package)
+    {
+        struct PendingUpload
+        {
+            const compiler::CompiledResourceBlueprint* blueprint = nullptr;
+            const compiler::TextureInitialContent* content = nullptr;
+        };
+        std::vector<PendingUpload> pending;
+        for (const auto& blueprint : package.resources)
+        {
+            const auto* content = std::get_if<
+                compiler::TextureInitialContent>(&blueprint.initialContent);
+            if (content != nullptr && !content->subresources.empty())
+            {
+                pending.push_back({&blueprint, content});
+            }
+        }
+        if (pending.empty()) return;
+
+        ComPtr<ID3D12CommandAllocator> allocator;
+        ComPtr<ID3D12GraphicsCommandList> list;
+        ThrowIfFailed(device_->CreateCommandAllocator(
+            D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)),
+            "Create texture initialization allocator");
+        ThrowIfFailed(device_->CreateCommandList(
+            0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr,
+            IID_PPV_ARGS(&list)), "Create texture initialization list");
+
+        const auto uploadProperties = HeapProperties(D3D12_HEAP_TYPE_UPLOAD);
+        std::vector<ComPtr<ID3D12Resource>> uploadResources;
+        for (const auto& upload : pending)
+        {
+            auto found = resources_.find(upload.blueprint->declaration.id);
+            if (found == resources_.end() || found->second.empty())
+            {
+                throw std::runtime_error(
+                    "Texture initial data has no materialized resource.");
+            }
+            const auto& texture = std::get<ir::TextureDescription>(
+                upload.blueprint->declaration.description);
+            const UINT arrays = texture.dimension == gpu::ResourceKind::Texture3D
+                ? 1u : texture.arrayLayers;
+
+            for (auto& record : found->second)
+            {
+                const auto native = record.resource->GetDesc();
+                for (const auto& source : upload.content->subresources)
+                {
+                    const UINT subresource = source.mip
+                        + source.arrayLayer * native.MipLevels
+                        + source.plane * native.MipLevels * arrays;
+                    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+                    UINT rows = 0;
+                    UINT64 rowBytes = 0;
+                    UINT64 totalBytes = 0;
+                    device_->GetCopyableFootprints(
+                        &native, subresource, 1, 0,
+                        &footprint, &rows, &rowBytes, &totalBytes);
+
+                    ComPtr<ID3D12Resource> staging;
+                    const auto stagingDescription = BufferDescription(totalBytes);
+                    ThrowIfFailed(device_->CreateCommittedResource(
+                        &uploadProperties,
+                        D3D12_HEAP_FLAG_NONE,
+                        &stagingDescription,
+                        D3D12_RESOURCE_STATE_GENERIC_READ,
+                        nullptr,
+                        IID_PPV_ARGS(&staging)),
+                        "Create texture initialization upload buffer");
+                    std::byte* mapped = nullptr;
+                    ThrowIfFailed(staging->Map(
+                        0, nullptr, reinterpret_cast<void**>(&mapped)),
+                        "Map texture initialization upload buffer");
+                    const UINT depth = footprint.Footprint.Depth;
+                    for (UINT z = 0; z < depth; ++z)
+                    {
+                        for (UINT y = 0; y < rows; ++y)
+                        {
+                            const auto sourceOffset =
+                                static_cast<UINT64>(z) * source.sourceSlicePitch
+                                + static_cast<UINT64>(y) * source.sourceRowPitch;
+                            const auto destinationOffset = footprint.Offset
+                                + static_cast<UINT64>(z) * rows
+                                    * footprint.Footprint.RowPitch
+                                + static_cast<UINT64>(y)
+                                    * footprint.Footprint.RowPitch;
+                            std::memcpy(
+                                mapped + destinationOffset,
+                                source.bytes.data() + sourceOffset,
+                                static_cast<std::size_t>(rowBytes));
+                        }
+                    }
+                    staging->Unmap(0, nullptr);
+
+                    D3D12_RESOURCE_BARRIER toCopy{};
+                    toCopy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                    toCopy.Transition.pResource = record.resource.Get();
+                    toCopy.Transition.Subresource = subresource;
+                    toCopy.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+                    toCopy.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+                    list->ResourceBarrier(1, &toCopy);
+
+                    D3D12_TEXTURE_COPY_LOCATION destination{};
+                    destination.pResource = record.resource.Get();
+                    destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                    destination.SubresourceIndex = subresource;
+                    D3D12_TEXTURE_COPY_LOCATION origin{};
+                    origin.pResource = staging.Get();
+                    origin.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                    origin.PlacedFootprint = footprint;
+                    list->CopyTextureRegion(
+                        &destination, 0, 0, 0, &origin, nullptr);
+
+                    std::swap(
+                        toCopy.Transition.StateBefore,
+                        toCopy.Transition.StateAfter);
+                    list->ResourceBarrier(1, &toCopy);
+                    uploadResources.push_back(std::move(staging));
+                }
+                record.state = D3D12_RESOURCE_STATE_COMMON;
+                record.subresourceStates.clear();
+            }
+        }
+
+        ThrowIfFailed(list->Close(), "Close texture initialization list");
         ID3D12CommandList* lists[] = {list.Get()};
         queue_->ExecuteCommandLists(1, lists);
         const UINT64 completion = SignalQueue(gpu::QueueClass::Direct);
@@ -381,7 +519,10 @@ namespace sge::d3d12::detail
         if (compiledPackageHash_
             && *compiledPackageHash_ == package.packageHash
             && compiledStructureHash_
-            && *compiledStructureHash_ == package.packageHash)
+            && *compiledStructureHash_ == package.packageHash
+            && preparedWidth_ == width_
+            && preparedHeight_ == height_
+            && preparedDeviceEpoch_ == deviceEpoch_)
         {
             return;
         }
@@ -634,6 +775,7 @@ namespace sge::d3d12::detail
         }
 
         UploadPackageInitialBufferData(package);
+        UploadPackageInitialTextureData(package);
         InitializePackagePersistentReadStates(package);
 
         for (const auto& blueprint : package.programs)
@@ -653,6 +795,9 @@ namespace sge::d3d12::detail
         // to be rematerialized after a surface resize.
         compiledStructureHash_ = package.packageHash;
         compiledPackageHash_ = package.packageHash;
+        preparedWidth_ = width_;
+        preparedHeight_ = height_;
+        preparedDeviceEpoch_ = deviceEpoch_;
     }
 
 
@@ -1588,7 +1733,162 @@ namespace sge::d3d12::detail
         }
     }
 
-    void Backend::Execute(
+    void Backend::BindExternalResources(
+        const compiler::CompiledRenderPackage& package,
+        const runtime::FrameInvocation& invocation)
+    {
+        for (const auto& slot : package.externalSlots)
+        {
+            if (slot.kind == gpu::ResourceKind::Presentation) continue;
+            const auto binding = invocation.externalResources.find(
+                slot.resource);
+            if (binding == invocation.externalResources.end()
+                || binding->second.resource == nullptr)
+            {
+                throw runtime::BackendFailure(
+                    runtime::BackendFailureKind::ExternalRebindRequired,
+                    "A required external resource was not rebound.");
+            }
+            auto native = std::dynamic_pointer_cast<D3D12ExternalResource>(
+                binding->second.resource);
+            if (!native || native->resource == nullptr)
+            {
+                throw runtime::BackendFailure(
+                    runtime::BackendFailureKind::InvalidPackage,
+                    "External resource backend type is not D3D12.");
+            }
+            if (binding->second.availableAfter)
+            {
+                binding->second.availableAfter->Wait();
+            }
+            ComPtr<ID3D12Device> owner;
+            ThrowIfFailed(native->resource->GetDevice(IID_PPV_ARGS(&owner)),
+                "Query external resource device");
+            if (owner.Get() != device_.Get())
+            {
+                throw runtime::BackendFailure(
+                    runtime::BackendFailureKind::ExternalRebindRequired,
+                    "External resource belongs to a different device epoch.");
+            }
+
+            const auto description = native->resource->GetDesc();
+            if (slot.kind == gpu::ResourceKind::Buffer)
+            {
+                const auto& expected = std::get<ir::BufferDescription>(
+                    slot.expectedDescription);
+                if (description.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER
+                    || description.Width < expected.byteSize)
+                {
+                    throw runtime::BackendFailure(
+                        runtime::BackendFailureKind::InvalidPackage,
+                        "External buffer does not satisfy its package slot.");
+                }
+            }
+            else
+            {
+                const auto& expected = std::get<ir::TextureDescription>(
+                    slot.expectedDescription);
+                const auto expectedNative = TextureDescription(
+                    expected, width_, height_);
+                const auto typeless = NativeTypelessFormat(expected.format);
+                if (description.Dimension != expectedNative.Dimension
+                    || description.Width != expectedNative.Width
+                    || description.Height != expectedNative.Height
+                    || description.DepthOrArraySize
+                        != expectedNative.DepthOrArraySize
+                    || description.MipLevels != expectedNative.MipLevels
+                    || description.SampleDesc.Count
+                        != expectedNative.SampleDesc.Count
+                    || (description.Format != expectedNative.Format
+                        && description.Format != typeless))
+                {
+                    throw runtime::BackendFailure(
+                        runtime::BackendFailureKind::InvalidPackage,
+                        "External texture does not satisfy its package slot.");
+                }
+            }
+
+            auto& instances = resources_[slot.resource];
+            if (instances.size() != FrameCount) instances.resize(FrameCount);
+            auto& record = instances.at(frameIndex_);
+            if (record.resource
+                && record.resource.Get() != native->resource.Get())
+            {
+                // Descriptor contents may still be consumed by older frames.
+                // V1 permits rebinding, but performs the safe conservative
+                // recycle until a dedicated frame-local descriptor arena is
+                // introduced.
+                WaitIdle();
+                packageShaderViews_.clear();
+                packageAttachmentViews_.clear();
+                nextRtvDescriptor_ = FrameCount;
+                nextDsvDescriptor_ = 0;
+                nextShaderDescriptor_ = 0;
+            }
+            record = {};
+            record.resource = native->resource;
+            const auto incoming = binding->second.incomingState
+                    == gpu::AbstractState::Undefined
+                ? slot.firstRequiredState
+                : binding->second.incomingState;
+            record.state = incoming == gpu::AbstractState::Undefined
+                ? D3D12_RESOURCE_STATE_COMMON
+                : NativeState(incoming);
+        }
+    }
+
+    void Backend::ReleaseExternalResources(
+        const compiler::CompiledRenderPackage& package,
+        const runtime::FrameInvocation& invocation,
+        FrameContext& frame,
+        std::array<UINT64, QueueClassCount>& finalSignals)
+    {
+        bool hasRelease = false;
+        for (const auto& slot : package.externalSlots)
+        {
+            if (slot.kind == gpu::ResourceKind::Presentation) continue;
+            const auto binding = invocation.externalResources.find(slot.resource);
+            if (binding == invocation.externalResources.end()) continue;
+            const auto target = binding->second.outgoingState
+                    == gpu::AbstractState::Undefined
+                ? slot.lastRequiredState
+                : binding->second.outgoingState;
+            if (target != gpu::AbstractState::Undefined) hasRelease = true;
+        }
+        if (!hasRelease) return;
+
+        for (const auto queue : {gpu::QueueClass::Compute,
+                                 gpu::QueueClass::Copy})
+        {
+            const auto value = finalSignals[QueueIndex(queue)];
+            if (value != 0)
+                WaitForQueueValue(gpu::QueueClass::Direct, queue, value);
+        }
+        commandList_ = AcquireCommandList(frame, gpu::QueueClass::Direct);
+        activeQueue_ = gpu::QueueClass::Direct;
+        for (const auto& slot : package.externalSlots)
+        {
+            if (slot.kind == gpu::ResourceKind::Presentation) continue;
+            const auto binding = invocation.externalResources.find(slot.resource);
+            if (binding == invocation.externalResources.end()) continue;
+            const auto target = binding->second.outgoingState
+                    == gpu::AbstractState::Undefined
+                ? slot.lastRequiredState
+                : binding->second.outgoingState;
+            if (target != gpu::AbstractState::Undefined)
+                Transition(slot.resource, target);
+        }
+        ThrowIfFailed(commandList_->Close(),
+            "Close external resource release list");
+        ID3D12CommandList* lists[] = {commandList_.Get()};
+        queue_->ExecuteCommandLists(1, lists);
+        const UINT64 value = SignalQueue(gpu::QueueClass::Direct);
+        finalSignals[QueueIndex(gpu::QueueClass::Direct)] = value;
+        frame.queues[QueueIndex(gpu::QueueClass::Direct)]
+            .completionFenceValue = value;
+    }
+
+    runtime::FrameSubmission Backend::ExecutePackageFrame(
         const compiler::CompiledRenderPackage& package,
         const runtime::FrameInvocation& invocation)
     {
@@ -1601,7 +1901,7 @@ namespace sge::d3d12::detail
             {
                 activePackage_ = nullptr;
                 activeInvocation_ = nullptr;
-                return;
+                return {.deviceEpoch = deviceEpoch_};
             }
 
             EnsurePackageCompiled(package);
@@ -1618,6 +1918,7 @@ namespace sge::d3d12::detail
 
             activeFrameSlot_ = static_cast<std::uint32_t>(
                 frameNumber_ % FrameCount);
+            BindExternalResources(package, invocation);
             FrameContext& frame = frames_[activeFrameSlot_];
             BeginFrame(frame);
             ValidateDebugLayer();
@@ -1629,6 +1930,7 @@ namespace sge::d3d12::detail
             };
             std::vector<WorkSignal> signals(
                 package.statistics.workCount);
+            std::array<UINT64, QueueClassCount> finalSignals{};
 
             bool commandListOpen = false;
             std::size_t currentWorkIndex = 0;
@@ -1654,8 +1956,12 @@ namespace sge::d3d12::detail
                 }
             };
 
-            for (const auto& operation : package.operations)
+            for (std::size_t operationIndex = 0;
+                 operationIndex < package.operations.size();
+                 ++operationIndex)
             {
+                lastOperationIndex_ = operationIndex;
+                const auto& operation = package.operations[operationIndex];
                 std::visit([&](const auto& value)
                 {
                     using T = std::decay_t<decltype(value)>;
@@ -1699,6 +2005,7 @@ namespace sge::d3d12::detail
                         currentWorkIndex = value.workIndex;
                         currentQueue = value.queue;
                         currentWorkName = value.name;
+                        lastWorkName_ = value.name;
                         commandList_ = AcquireCommandList(frame, currentQueue);
                         activeQueue_ = currentQueue;
                         if (currentQueue != gpu::QueueClass::Copy)
@@ -1816,6 +2123,7 @@ namespace sge::d3d12::detail
                         ID3D12CommandList* lists[] = {commandList_.Get()};
                         QueueFor(currentQueue)->ExecuteCommandLists(1, lists);
                         const UINT64 signalValue = SignalQueue(currentQueue);
+                        finalSignals[QueueIndex(currentQueue)] = signalValue;
                         signals[currentWorkIndex] = {
                             currentQueue, signalValue};
                         frame.queues[QueueIndex(currentQueue)]
@@ -1837,18 +2145,90 @@ namespace sge::d3d12::detail
                     "Compiled operation stream ended with an open work.");
             }
 
+            ReleaseExternalResources(
+                package, invocation, frame, finalSignals);
+
             ThrowIfFailed(swapChain_->Present(1, 0),
                 "Present compiled operation stream");
             frameIndex_ = swapChain_->GetCurrentBackBufferIndex();
             ++frameNumber_;
             activePackage_ = nullptr;
             activeInvocation_ = nullptr;
+            runtime::FrameSubmission submission;
+            submission.deviceEpoch = deviceEpoch_;
+            constexpr std::array queues{
+                gpu::QueueClass::Direct,
+                gpu::QueueClass::Compute,
+                gpu::QueueClass::Copy};
+            for (const auto queue : queues)
+            {
+                const auto index = QueueIndex(queue);
+                submission.queues[index].queue = queue;
+                submission.queues[index].value = finalSignals[index];
+                if (finalSignals[index] != 0)
+                {
+                    submission.queues[index].completion =
+                        std::make_shared<D3D12QueueCompletion>(
+                            SyncFor(queue).fence, finalSignals[index]);
+                }
+            }
+            return submission;
         }
         catch (...)
         {
             activePackage_ = nullptr;
             activeInvocation_ = nullptr;
             throw;
+        }
+    }
+
+    runtime::FrameSubmission Backend::Execute(
+        const compiler::CompiledRenderPackage& package,
+        const runtime::FrameInvocation& invocation)
+    {
+        try
+        {
+            return ExecutePackageFrame(package, invocation);
+        }
+        catch (const runtime::BackendFailure&)
+        {
+            throw;
+        }
+        catch (const std::exception& error)
+        {
+            const HRESULT removedReason = device_ == nullptr
+                ? DXGI_ERROR_DEVICE_REMOVED
+                : device_->GetDeviceRemovedReason();
+            if (SUCCEEDED(removedReason)) throw;
+
+            WriteDeviceRemovedDiagnostics(
+                DXGI_ERROR_DEVICE_REMOVED, removedReason, error.what());
+            if (!configuration_.enableDeviceRecovery)
+            {
+                throw runtime::BackendFailure(
+                    runtime::BackendFailureKind::DeviceRemoved,
+                    "D3D12 device was removed.",
+                    DXGI_ERROR_DEVICE_REMOVED,
+                    removedReason);
+            }
+
+            RecreateDeviceObjects();
+            const bool needsExternalRebind = std::any_of(
+                package.externalSlots.begin(),
+                package.externalSlots.end(),
+                [](const compiler::ExternalResourceSlot& slot)
+                {
+                    return slot.kind != gpu::ResourceKind::Presentation;
+                });
+            if (needsExternalRebind)
+            {
+                throw runtime::BackendFailure(
+                    runtime::BackendFailureKind::ExternalRebindRequired,
+                    "The device was recreated; external resources must be rebound.",
+                    DXGI_ERROR_DEVICE_REMOVED,
+                    removedReason);
+            }
+            return ExecutePackageFrame(package, invocation);
         }
     }
 

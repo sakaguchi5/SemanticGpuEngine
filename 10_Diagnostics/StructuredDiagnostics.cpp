@@ -1,5 +1,6 @@
 #include "10_Diagnostics/StructuredDiagnostics.h"
 
+#include <algorithm>
 #include <fstream>
 #include <iomanip>
 #include <sstream>
@@ -270,6 +271,20 @@ namespace sge::diagnostics
                << statistics.queueWaitCount << ",\n"
                << "    \"estimatedCommittedBytes\": "
                << statistics.estimatedCommittedBytes << "\n"
+               << "  },\n"
+               << "  \"materialization\": {\n"
+               << "    \"preparationOperations\": "
+               << package.preparationOperations.size() << ",\n"
+               << "    \"externalSlots\": "
+               << package.externalSlots.size() << ",\n"
+               << "    \"reconstructibleResources\": "
+               << std::count_if(
+                    package.resources.begin(), package.resources.end(),
+                    [](const compiler::CompiledResourceBlueprint& resource)
+                    {
+                        return resource.rebuildPolicy
+                            == compiler::ResourceRebuildPolicy::RecreateFromPackage;
+                    }) << "\n"
                << "  },\n"
                << "  \"requirements\": {\n"
                << "    \"textureSubresourceViews\": "

@@ -33,7 +33,8 @@ namespace sge::compiler
         UnsupportedCapability,
         MemoryBudgetExceeded,
         QueueHandoffRequired,
-        ShaderInterfaceMismatch
+        ShaderInterfaceMismatch,
+        InvalidInitialContent
     };
 
     struct DiagnosticLocation
@@ -209,10 +210,100 @@ namespace sge::compiler
         std::uint8_t stencil = 0;
     };
 
+    enum class ResourceOrigin
+    {
+        PackageOwned,
+        ExternalBorrowed,
+        Presentation
+    };
+
+    enum class ResourceRebuildPolicy
+    {
+        RecreateFromPackage,
+        RequireExternalRebind,
+        BackendManaged
+    };
+
+    enum class ResourceExtentPolicy
+    {
+        Fixed,
+        SurfaceRelative
+    };
+
+    struct NoInitialContent
+    {
+    };
+
+    struct BufferInitialContent
+    {
+        std::vector<std::byte> bytes;
+    };
+
+    struct TextureSubresourceContent
+    {
+        std::uint16_t mip = 0;
+        std::uint16_t arrayLayer = 0;
+        std::uint8_t plane = 0;
+        std::uint32_t width = 0;
+        std::uint32_t height = 0;
+        std::uint32_t depth = 1;
+        std::uint64_t sourceRowPitch = 0;
+        std::uint64_t sourceSlicePitch = 0;
+        std::vector<std::byte> bytes;
+    };
+
+    struct TextureInitialContent
+    {
+        std::vector<TextureSubresourceContent> subresources;
+    };
+
+    using InitialContent = std::variant<
+        NoInitialContent,
+        BufferInitialContent,
+        TextureInitialContent>;
+
+    struct UploadBufferPreparation
+    {
+        gpu::ResourceId resource;
+    };
+
+    struct UploadTexturePreparation
+    {
+        gpu::ResourceId resource;
+    };
+
+    struct InitializePersistentStatePreparation
+    {
+        gpu::ResourceId resource;
+    };
+
+    using CompiledPreparationOperation = std::variant<
+        UploadBufferPreparation,
+        UploadTexturePreparation,
+        InitializePersistentStatePreparation>;
+
+    struct ExternalResourceSlot
+    {
+        gpu::ResourceId resource;
+        gpu::ResourceKind kind = gpu::ResourceKind::Buffer;
+        ir::ResourceDescription expectedDescription =
+            ir::BufferDescription{};
+        gpu::AbstractState firstRequiredState =
+            gpu::AbstractState::Undefined;
+        gpu::AbstractState lastRequiredState =
+            gpu::AbstractState::Undefined;
+        bool requiredEveryFrame = true;
+    };
+
     struct CompiledResourceBlueprint
     {
         ir::ResourceDeclaration declaration;
         ResourceInstancePlan instances;
+        ResourceOrigin origin = ResourceOrigin::PackageOwned;
+        ResourceRebuildPolicy rebuildPolicy =
+            ResourceRebuildPolicy::RecreateFromPackage;
+        ResourceExtentPolicy extentPolicy = ResourceExtentPolicy::Fixed;
+        InitialContent initialContent = NoInitialContent{};
         std::optional<gpu::PhysicalAllocationId> allocation;
         std::vector<gpu::AbstractState> persistentReadStates;
         std::optional<CompiledOptimizedClearValue> optimizedClear;
@@ -323,6 +414,8 @@ namespace sge::compiler
         std::vector<CompiledResourceBlueprint> resources;
         std::vector<CompiledProgramBlueprint> programs;
         std::vector<ExecutableKey> executables;
+        std::vector<CompiledPreparationOperation> preparationOperations;
+        std::vector<ExternalResourceSlot> externalSlots;
         std::vector<CompiledOperation> operations;
         BackendFeatureRequirements requirements;
         PackageStatistics statistics;

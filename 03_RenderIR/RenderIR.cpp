@@ -192,6 +192,21 @@ namespace sge::ir
                     seed,
                     HashBytes(resource.data.data(), resource.data.size()));
             }
+            for (const auto& subresource : resource.textureData)
+            {
+                HashCombine(seed, subresource.mip);
+                HashCombine(seed, subresource.arrayLayer);
+                HashCombine(seed, subresource.plane);
+                HashCombine(seed, static_cast<std::size_t>(
+                    subresource.rowPitch));
+                HashCombine(seed, static_cast<std::size_t>(
+                    subresource.slicePitch));
+                if (!subresource.bytes.empty())
+                {
+                    HashCombine(seed, HashBytes(
+                        subresource.bytes.data(), subresource.bytes.size()));
+                }
+            }
         }
 
         for (const auto& program : programs)

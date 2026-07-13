@@ -17,6 +17,8 @@
 #include <utility>
 #include <vector>
 #include <windows.h>
+#include <d3d12.h>
+#include <wrl/client.h>
 
 namespace
 {
@@ -643,6 +645,67 @@ void RunD3D12IntegrationTests()
 
     auto backend = d3d12::CreateBackend(
         application.Surface(), {.forceWarp = true});
+    auto* backendForRecovery = backend.get();
+    auto* nativeDevice = static_cast<ID3D12Device*>(
+        d3d12::NativeDevice(*backend));
+    if (nativeDevice == nullptr)
+        throw std::runtime_error("D3D12 native device is unavailable.");
+    D3D12_HEAP_PROPERTIES externalHeap{};
+    externalHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC externalDescription{};
+    externalDescription.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    externalDescription.Width = 64;
+    externalDescription.Height = 1;
+    externalDescription.DepthOrArraySize = 1;
+    externalDescription.MipLevels = 1;
+    externalDescription.SampleDesc.Count = 1;
+    externalDescription.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    externalDescription.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    Microsoft::WRL::ComPtr<ID3D12Resource> externalBuffer;
+    if (FAILED(nativeDevice->CreateCommittedResource(
+            &externalHeap,
+            D3D12_HEAP_FLAG_NONE,
+            &externalDescription,
+            D3D12_RESOURCE_STATE_COMMON,
+            nullptr,
+            IID_PPV_ARGS(&externalBuffer))))
+    {
+        throw std::runtime_error("Create external WARP buffer failed.");
+    }
+    ir::SemanticModule externalModule;
+    externalModule.resources.push_back({
+        .id = gpu::ResourceId{50},
+        .name = "ExternalBuffer",
+        .lifetime = gpu::ResourceLifetimeClass::External,
+        .update = gpu::ResourceUpdateClass::Imported,
+        .description = ir::BufferDescription{
+            .sizeBytes = 64,
+            .strideBytes = 4,
+            .usage = ir::BufferUsage::Storage}}
+    );
+    externalModule.resources.push_back({
+        .id = gpu::ResourceId{51},
+        .name = "ImmutableTexture",
+        .lifetime = gpu::ResourceLifetimeClass::Persistent,
+        .update = gpu::ResourceUpdateClass::Immutable,
+        .description = ir::TextureDescription{
+            .dimension = gpu::ResourceKind::Texture2D,
+            .format = gpu::ResourceFormat::Rgba8Unorm,
+            .width = 2,
+            .height = 2,
+            .depth = 1,
+            .mipLevels = 1,
+            .arrayLayers = 1,
+            .sampleCount = 1,
+            .usage = ir::TextureUsage::Sampled},
+        .textureData = {{
+            .mip = 0,
+            .arrayLayer = 0,
+            .plane = 0,
+            .rowPitch = 8,
+            .slicePitch = 16,
+            .bytes = std::vector<std::byte>(16, std::byte{0x3c})}}
+    });
     const auto copyQueueModule = BuildCopyQueuePackageModule();
     const auto copyQueuePackage = compiler::RenderPackageCompiler{}.Compile(
         copyQueueModule, backend->Capabilities());
@@ -759,10 +822,54 @@ void RunD3D12IntegrationTests()
             .planDiagnosticsPath = {},
             .graphDiagnosticsPath = {}}
     };
+    runtime::FrameInvocation externalInvocation;
+    externalInvocation.externalResources.emplace(
+        gpu::ResourceId{50},
+        runtime::ExternalResourceBinding{
+            .resource = d3d12::WrapExternalResource(externalBuffer.Get()),
+            .incomingState = gpu::AbstractState::Undefined,
+            .outgoingState = gpu::AbstractState::Undefined});
+    const auto externalSubmission = runtime.Execute(
+        externalModule, externalInvocation);
+    if (externalSubmission.deviceEpoch == 0)
+    {
+        throw std::runtime_error(
+            "External WARP binding returned no device epoch.");
+    }
+    auto reconstructibleTextureModule = externalModule;
+    reconstructibleTextureModule.resources.erase(
+        reconstructibleTextureModule.resources.begin());
+    const auto beforeRecreation = runtime.Execute(
+        reconstructibleTextureModule);
+    if (!d3d12::RecreateDeviceForTesting(*backendForRecovery))
+        throw std::runtime_error("D3D12 reconstruction test failed.");
+    bool externalRebindRequested = false;
+    try
+    {
+        runtime.Execute(externalModule, externalInvocation);
+    }
+    catch (const runtime::BackendFailure& failure)
+    {
+        externalRebindRequested = failure.kind
+            == runtime::BackendFailureKind::ExternalRebindRequired;
+    }
+    if (!externalRebindRequested)
+    {
+        throw std::runtime_error(
+            "A stale external resource was accepted after device recreation.");
+    }
+    const auto afterRecreation = runtime.Execute(
+        reconstructibleTextureModule);
+    if (afterRecreation.deviceEpoch <= beforeRecreation.deviceEpoch)
+    {
+        throw std::runtime_error(
+            "Device epoch did not advance across package reconstruction.");
+    }
 
     std::uint32_t copyQueueFrameCount = 0;
     std::uint32_t advancedFrameCount = 0;
     std::uint32_t frameCount = 0;
+    bool recreatedDevice = false;
     const int result = application.Run(
         [&](const platform::FrameTime&)
         {
@@ -778,7 +885,23 @@ void RunD3D12IntegrationTests()
                 ++advancedFrameCount;
                 return;
             }
-            runtime.Execute(module);
+            if (!recreatedDevice)
+            {
+                if (!d3d12::RecreateDeviceForTesting(*backendForRecovery))
+                {
+                    throw std::runtime_error(
+                        "D3D12 test device recreation failed.");
+                }
+                recreatedDevice = true;
+            }
+            const auto submission = runtime.Execute(module);
+            if (submission.deviceEpoch == 0
+                || submission.queues[0].value == 0
+                || submission.queues[0].completion == nullptr)
+            {
+                throw std::runtime_error(
+                    "Frame submission did not expose Direct queue completion.");
+            }
             ++frameCount;
             if (frameCount == 12)
             {
@@ -791,7 +914,8 @@ void RunD3D12IntegrationTests()
         });
 
     if (result != 0 || copyQueueFrameCount != 5
-        || advancedFrameCount != 2 || frameCount != 12)
+        || advancedFrameCount != 2 || frameCount != 12
+        || !recreatedDevice)
     {
         throw std::runtime_error(
             "D3D12 WARP integration test did not complete the five-frame Copy-slot reuse, native-package, and 12-frame paths.");

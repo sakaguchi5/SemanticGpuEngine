@@ -171,6 +171,19 @@ namespace sge::ir
         TextureDescription,
         PresentationDescription>;
 
+    // Source layout for one immutable texture subresource. Row and slice
+    // pitches describe the caller-owned byte layout; the backend repacks it
+    // into its native copyable footprint during package preparation.
+    struct TextureSubresourceData
+    {
+        std::uint16_t mip = 0;
+        std::uint16_t arrayLayer = 0;
+        std::uint8_t plane = 0;
+        std::uint64_t rowPitch = 0;
+        std::uint64_t slicePitch = 0;
+        std::vector<std::byte> bytes;
+    };
+
     struct ResourceDeclaration
     {
         gpu::ResourceId id;
@@ -181,6 +194,7 @@ namespace sge::ir
             gpu::ResourceUpdateClass::Immutable;
         ResourceDescription description = BufferDescription{};
         std::vector<std::byte> data;
+        std::vector<TextureSubresourceData> textureData;
 
         [[nodiscard]] gpu::ResourceKind Kind() const noexcept;
         [[nodiscard]] gpu::ResourceFormat Format() const noexcept;

@@ -4,14 +4,72 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <array>
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <stdexcept>
+#include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
 namespace sge::runtime
 {
+    enum class BackendFailureKind
+    {
+        OrdinaryFailure,
+        DeviceRemoved,
+        OutOfMemory,
+        InvalidPackage,
+        ExternalRebindRequired
+    };
+
+    class BackendFailure : public std::runtime_error
+    {
+    public:
+        BackendFailure(
+            BackendFailureKind failureKind,
+            std::string message,
+            std::int64_t operationResult = 0,
+            std::int64_t removedReason = 0)
+            : std::runtime_error(std::move(message)),
+              kind(failureKind),
+              operationResult(operationResult),
+              deviceRemovedReason(removedReason)
+        {
+        }
+
+        BackendFailureKind kind;
+        std::int64_t operationResult = 0;
+        std::int64_t deviceRemovedReason = 0;
+    };
+
+    class IExternalResource
+    {
+    public:
+        virtual ~IExternalResource() = default;
+        [[nodiscard]] virtual std::string_view BackendType() const noexcept = 0;
+    };
+
+    class IQueueCompletion
+    {
+    public:
+        virtual ~IQueueCompletion() = default;
+        [[nodiscard]] virtual bool IsComplete() const noexcept = 0;
+        virtual void Wait() = 0;
+    };
+
+    struct ExternalResourceBinding
+    {
+        std::shared_ptr<IExternalResource> resource;
+        // Optional producer completion. The reference implementation waits
+        // this point before importing the resource for the frame.
+        std::shared_ptr<IQueueCompletion> availableAfter;
+        gpu::AbstractState incomingState = gpu::AbstractState::Undefined;
+        gpu::AbstractState outgoingState = gpu::AbstractState::Undefined;
+    };
+
     struct FrameInvocation
     {
         std::uint64_t frameNumber = 0;
@@ -23,6 +81,24 @@ namespace sge::runtime
             gpu::ResourceId,
             std::vector<std::byte>,
             foundation::StrongIdHash<gpu::ResourceTag>> dynamicResourceData;
+
+        std::unordered_map<
+            gpu::ResourceId,
+            ExternalResourceBinding,
+            foundation::StrongIdHash<gpu::ResourceTag>> externalResources;
+    };
+
+    struct QueueCompletionPoint
+    {
+        gpu::QueueClass queue = gpu::QueueClass::Direct;
+        std::uint64_t value = 0;
+        std::shared_ptr<IQueueCompletion> completion;
+    };
+
+    struct FrameSubmission
+    {
+        std::uint64_t deviceEpoch = 0;
+        std::array<QueueCompletionPoint, 3> queues{};
     };
 
     class IRenderBackend
@@ -34,7 +110,7 @@ namespace sge::runtime
 
         // The backend boundary is package-only. Source SemanticModule and the
         // compiler's analysis ExecutionPlan never cross this interface.
-        virtual void Execute(
+        virtual FrameSubmission Execute(
             const compiler::CompiledRenderPackage& package,
             const FrameInvocation& invocation) = 0;
 
@@ -61,8 +137,9 @@ namespace sge::runtime
         RenderRuntime& operator=(const RenderRuntime&) = delete;
         ~RenderRuntime();
 
-        void Execute(const ir::SemanticModule& module);
-        void Execute(
+        FrameSubmission Execute(
+            const ir::SemanticModule& module);
+        FrameSubmission Execute(
             const ir::SemanticModule& module,
             const FrameInvocation& invocation);
         void WaitIdle();
