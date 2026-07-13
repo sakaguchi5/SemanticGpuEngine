@@ -1,12 +1,8 @@
 name: ChatGPT Program Interface Resource View Artifact
 
 on:
-  push:
-    branches:
-      - chatgpt-artifact-program-interface-view-f001aa-v2
   pull_request:
-    branches:
-      - master
+    branches: [master]
   workflow_dispatch:
 
 permissions:
@@ -18,58 +14,70 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Reconstruct and apply patch
+        id: apply
         shell: pwsh
+        continue-on-error: true
         run: |
-          $chunks = Get-ChildItem ".chatgpt-artifact/apply.ps1.gz.b64.*" | Sort-Object Name
-          $base64 = ($chunks | ForEach-Object { Get-Content -LiteralPath $_.FullName -Raw }) -join ""
-          $gzipPath = Join-Path $env:RUNNER_TEMP "apply.ps1.gz"
-          $scriptPath = Join-Path $env:RUNNER_TEMP "apply.ps1"
-          [IO.File]::WriteAllBytes($gzipPath, [Convert]::FromBase64String($base64))
-          $input = [IO.File]::OpenRead($gzipPath)
+          $diagnostic = Join-Path $env:RUNNER_TEMP "apply-diagnostic.txt"
           try {
-            $gzip = [IO.Compression.GZipStream]::new($input, [IO.Compression.CompressionMode]::Decompress)
+            $chunks = Get-ChildItem ".chatgpt-artifact/apply.ps1.gz.b64.*" | Sort-Object Name
+            $base64 = ($chunks | ForEach-Object { Get-Content -LiteralPath $_.FullName -Raw }) -join ""
+            $gzipPath = Join-Path $env:RUNNER_TEMP "apply.ps1.gz"
+            $scriptPath = Join-Path $env:RUNNER_TEMP "apply.ps1"
+            [IO.File]::WriteAllBytes($gzipPath, [Convert]::FromBase64String($base64))
+            "gzip_sha256=$((Get-FileHash -Algorithm SHA256 $gzipPath).Hash)" | Out-File $diagnostic
+            $input = [IO.File]::OpenRead($gzipPath)
             try {
-              $output = [IO.File]::Create($scriptPath)
-              try { $gzip.CopyTo($output) } finally { $output.Dispose() }
-            } finally { $gzip.Dispose() }
-          } finally { $input.Dispose() }
-          & $scriptPath -RepoRoot $env:GITHUB_WORKSPACE
+              $gzip = [IO.Compression.GZipStream]::new($input, [IO.Compression.CompressionMode]::Decompress)
+              try {
+                $output = [IO.File]::Create($scriptPath)
+                try { $gzip.CopyTo($output) } finally { $output.Dispose() }
+              } finally { $gzip.Dispose() }
+            } finally { $input.Dispose() }
+            "script_sha256=$((Get-FileHash -Algorithm SHA256 $scriptPath).Hash)" | Out-File $diagnostic -Append
+            & $scriptPath -RepoRoot $env:GITHUB_WORKSPACE *>> $diagnostic
+            if ($LASTEXITCODE -ne 0) { throw "apply.ps1 exited with code $LASTEXITCODE" }
+            "success=true" | Out-File $env:GITHUB_OUTPUT -Append
+          }
+          catch {
+            $_ | Format-List * -Force | Out-File $diagnostic -Append
+            "success=false" | Out-File $env:GITHUB_OUTPUT -Append
+            exit 1
+          }
+      - name: Upload diagnostic
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apply-diagnostic
+          path: ${{ runner.temp }}\apply-diagnostic.txt
+          if-no-files-found: error
+          retention-days: 1
       - name: Package changed files
+        if: steps.apply.outputs.success == 'true'
         shell: pwsh
         run: |
           $paths = @(
-            "03_RenderIR/RenderIR.h",
-            "03_RenderIR/RenderIR.cpp",
-            "04_RenderCompiler/RenderCompiler.h",
-            "04_RenderCompiler/RenderCompiler.cpp",
-            "07_D3D12Backend/D3D12Helpers.h",
-            "07_D3D12Backend/D3D12Helpers.cpp",
-            "07_D3D12Backend/D3D12BackendInternal.h",
-            "07_D3D12Backend/D3D12Compilation.cpp",
-            "07_D3D12Backend/D3D12Backend.cpp",
-            "08_ClassicalRasterFrontend/ClassicalLowering.cpp",
-            "09_ExperimentalGeometry/SdfLowering.cpp",
-            "10_Diagnostics/PlanDiagnostics.cpp",
-            "11_Tests/CompilerTests.cpp",
-            "11_Tests/D3D12IntegrationTests.cpp",
+            "03_RenderIR/RenderIR.h", "03_RenderIR/RenderIR.cpp",
+            "04_RenderCompiler/RenderCompiler.h", "04_RenderCompiler/RenderCompiler.cpp",
+            "07_D3D12Backend/D3D12Helpers.h", "07_D3D12Backend/D3D12Helpers.cpp",
+            "07_D3D12Backend/D3D12BackendInternal.h", "07_D3D12Backend/D3D12Compilation.cpp",
+            "07_D3D12Backend/D3D12Backend.cpp", "08_ClassicalRasterFrontend/ClassicalLowering.cpp",
+            "09_ExperimentalGeometry/SdfLowering.cpp", "10_Diagnostics/PlanDiagnostics.cpp",
+            "11_Tests/CompilerTests.cpp", "11_Tests/D3D12IntegrationTests.cpp",
             "Shaders/IntegrationTemporalRead.hlsl"
           )
           $stage = Join-Path $env:RUNNER_TEMP "ProgramInterfaceResourceView_f001aa"
           New-Item -ItemType Directory -Path $stage -Force | Out-Null
           foreach ($relative in $paths) {
-            $source = Join-Path $env:GITHUB_WORKSPACE $relative
-            if (-not (Test-Path -LiteralPath $source)) { throw "Missing patched file: $relative" }
             $destination = Join-Path $stage $relative
             New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
-            Copy-Item -LiteralPath $source -Destination $destination -Force
+            Copy-Item -LiteralPath (Join-Path $env:GITHUB_WORKSPACE $relative) -Destination $destination -Force
           }
-          $zip = Join-Path $env:RUNNER_TEMP "ProgramInterfaceResourceView_f001aa.zip"
-          Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $zip -CompressionLevel Optimal -Force
-          Get-FileHash -Algorithm SHA256 -LiteralPath $zip | Format-List
+          Compress-Archive -Path (Join-Path $stage "*") -DestinationPath (Join-Path $env:RUNNER_TEMP "ProgramInterfaceResourceView_f001aa.zip") -Force
       - name: Upload ZIP
+        if: steps.apply.outputs.success == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: ProgramInterfaceResourceView_f001aa
           path: ${{ runner.temp }}\ProgramInterfaceResourceView_f001aa.zip
-          if-no-files-found: error
           retention-days: 1
