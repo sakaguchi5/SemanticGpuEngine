@@ -373,6 +373,113 @@ namespace
         return module;
     }
 
+    sge::ir::SemanticModule BuildCopyQueuePackageModule()
+    {
+        using namespace sge;
+        constexpr gpu::ResourceId sourcePositions{0};
+        constexpr gpu::ResourceId copiedPositions{1};
+        constexpr gpu::ResourceId instanceColor{2};
+        constexpr gpu::ResourceId presentation{3};
+
+        struct Position { float x, y, z; };
+        struct Color { float r, g, b, a; };
+        const std::array<Position, 3> positions{{
+            {-0.55f, -0.45f, 0.0f},
+            { 0.55f, -0.45f, 0.0f},
+            { 0.00f,  0.55f, 0.0f}}};
+        const std::array<Color, 1> colors{{
+            {0.2f, 0.9f, 0.35f, 1.0f}}};
+
+        ir::SemanticModule module;
+        module.resources = {
+            {.id = sourcePositions, .name = "CopyQueueSourcePositions",
+                .lifetime = gpu::ResourceLifetimeClass::Persistent,
+                .update = gpu::ResourceUpdateClass::Immutable,
+                .description = ir::BufferDescription{
+                    .sizeBytes = sizeof(positions),
+                    .strideBytes = sizeof(Position),
+                    .usage = ir::BufferUsage::CopySource},
+                .data = ArrayBytes(positions)},
+            {.id = copiedPositions, .name = "CopyQueueVertexDestination",
+                .lifetime = gpu::ResourceLifetimeClass::FrameLocal,
+                .update = gpu::ResourceUpdateClass::GpuProduced,
+                .description = ir::BufferDescription{
+                    .sizeBytes = sizeof(positions),
+                    .strideBytes = sizeof(Position),
+                    .usage = ir::BufferUsage::Vertex
+                        | ir::BufferUsage::CopyDestination}},
+            {.id = instanceColor, .name = "CopyQueueInstanceColor",
+                .lifetime = gpu::ResourceLifetimeClass::Persistent,
+                .update = gpu::ResourceUpdateClass::Immutable,
+                .description = ir::BufferDescription{
+                    .sizeBytes = sizeof(colors),
+                    .strideBytes = sizeof(Color),
+                    .usage = ir::BufferUsage::Vertex},
+                .data = ArrayBytes(colors)},
+            {.id = presentation, .name = "CopyQueuePresentation",
+                .lifetime = gpu::ResourceLifetimeClass::External,
+                .update = gpu::ResourceUpdateClass::Imported,
+                .description = ir::PresentationDescription{}}
+        };
+        module.programs.push_back({
+            .id = gpu::ProgramId{0},
+            .name = "CopyQueueRasterConsumer",
+            .shaderPath = "Shaders/IntegrationGeneralRaster.hlsl",
+            .vertexEntry = "VSMain",
+            .pixelEntry = "PSMain",
+            .programInterface = {
+                .parameters = {},
+                .vertexInputs = {
+                    {"POSITION", 0, ir::VertexElementFormat::Float3,
+                        0, 0, ir::VertexInputRate::PerVertex, 0},
+                    {"COLOR", 0, ir::VertexElementFormat::Float4,
+                        1, 0, ir::VertexInputRate::PerInstance, 1}},
+                .colorOutputCount = 1,
+                .depthAttachmentAllowed = false}});
+        module.works = {
+            {.id = gpu::WorkId{0}, .name = "CopyStaticPositionsOnCopyQueue",
+                .accesses = {
+                    {sourcePositions, gpu::AccessMode::Read,
+                        gpu::ResourceRole::TransferSource},
+                    {copiedPositions, gpu::AccessMode::Write,
+                        gpu::ResourceRole::TransferDestination}},
+                .payload = ir::CopyWork{
+                    .source = sourcePositions,
+                    .destination = copiedPositions,
+                    .sizeBytes = sizeof(positions)}},
+            {.id = gpu::WorkId{1}, .name = "ConsumeCopiedPositionsOnDirectQueue",
+                .accesses = {
+                    {copiedPositions, gpu::AccessMode::Read,
+                        gpu::ResourceRole::VertexInput},
+                    {instanceColor, gpu::AccessMode::Read,
+                        gpu::ResourceRole::VertexInput},
+                    {presentation, gpu::AccessMode::Write,
+                        gpu::ResourceRole::ColorOutput}},
+                .payload = ir::RasterWork{
+                    .program = gpu::ProgramId{0},
+                    .vertexResource = copiedPositions,
+                    .attachments = {{presentation}, {}},
+                    .vertexCount = 3,
+                    .rasterState = {.depth = gpu::DepthMode::Disabled},
+                    .clear = {
+                        .clearColor = true,
+                        .color = {0.015f, 0.02f, 0.03f, 1.0f},
+                        .colorLoad = ir::AttachmentLoadOperation::Clear},
+                    .vertexStreams = {
+                        {0, ir::ResourceView{
+                            copiedPositions, 0, sizeof(positions),
+                            sizeof(Position)}},
+                        {1, ir::ResourceView{
+                            instanceColor, 0, sizeof(colors), sizeof(Color)}}},
+                    .instanceCount = 1}},
+            {.id = gpu::WorkId{2}, .name = "PresentCopyQueuePackage",
+                .accesses = {{presentation, gpu::AccessMode::Read,
+                    gpu::ResourceRole::Presentation}},
+                .payload = ir::PresentWork{presentation}}
+        };
+        return module;
+    }
+
     sge::ir::SemanticModule BuildIntegrationModule()
     {
         using namespace sge;
@@ -536,6 +643,43 @@ void RunD3D12IntegrationTests()
 
     auto backend = d3d12::CreateBackend(
         application.Surface(), {.forceWarp = true});
+    const auto copyQueueModule = BuildCopyQueuePackageModule();
+    const auto copyQueuePackage = compiler::RenderPackageCompiler{}.Compile(
+        copyQueueModule, backend->Capabilities());
+    const auto copyHandoff = std::find_if(
+        copyQueuePackage.package.queueHandoffs.begin(),
+        copyQueuePackage.package.queueHandoffs.end(),
+        [](const compiler::QueueHandoffPlan& handoff)
+        {
+            return handoff.releaseQueue == gpu::QueueClass::Copy
+                && handoff.acquireQueue == gpu::QueueClass::Direct
+                && handoff.releaseState
+                    == gpu::AbstractState::TransferWrite
+                && handoff.acquireState
+                    == gpu::AbstractState::VertexRead;
+        });
+    const auto cyclicCopyReuse = std::find_if(
+        copyQueuePackage.package.cyclicFrameHandoffs.begin(),
+        copyQueuePackage.package.cyclicFrameHandoffs.end(),
+        [](const compiler::CyclicFrameHandoffPlan& handoff)
+        {
+            return handoff.resource == gpu::ResourceId{1}
+                && handoff.releaseQueue == gpu::QueueClass::Direct
+                && handoff.acquireQueue == gpu::QueueClass::Copy
+                && handoff.requiresCommonRelease;
+        });
+    if (!copyQueuePackage.Succeeded()
+        || copyHandoff == copyQueuePackage.package.queueHandoffs.end()
+        || !copyHandoff->crossesCopyQueue
+        || copyHandoff->releaseView.resource != gpu::ResourceId{1}
+        || copyHandoff->acquireView.resource != gpu::ResourceId{1}
+        || cyclicCopyReuse
+            == copyQueuePackage.package.cyclicFrameHandoffs.end())
+    {
+        throw std::runtime_error(
+            "Copy queue package did not compile exact intra-frame and cyclic handoffs.");
+    }
+
     const auto advancedModule = BuildAdvancedPackageModule();
     const auto advancedPackage = compiler::RenderPackageCompiler{}.Compile(
         advancedModule, backend->Capabilities());
@@ -596,11 +740,18 @@ void RunD3D12IntegrationTests()
             .graphDiagnosticsPath = {}}
     };
 
+    std::uint32_t copyQueueFrameCount = 0;
     std::uint32_t advancedFrameCount = 0;
     std::uint32_t frameCount = 0;
     const int result = application.Run(
         [&](const platform::FrameTime&)
         {
+            if (copyQueueFrameCount < 5)
+            {
+                runtime.Execute(copyQueueModule);
+                ++copyQueueFrameCount;
+                return;
+            }
             if (advancedFrameCount < 2)
             {
                 runtime.Execute(advancedModule);
@@ -619,10 +770,11 @@ void RunD3D12IntegrationTests()
             }
         });
 
-    if (result != 0 || advancedFrameCount != 2 || frameCount != 12)
+    if (result != 0 || copyQueueFrameCount != 5
+        || advancedFrameCount != 2 || frameCount != 12)
     {
         throw std::runtime_error(
-            "D3D12 WARP integration test did not complete the native-package and 12-frame paths.");
+            "D3D12 WARP integration test did not complete the five-frame Copy-slot reuse, native-package, and 12-frame paths.");
     }
     runtime.WaitIdle();
 }

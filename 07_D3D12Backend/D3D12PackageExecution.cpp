@@ -2,10 +2,13 @@
 
 #include <algorithm>
 #include <array>
+#include <iterator>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <variant>
@@ -253,6 +256,119 @@ namespace sge::d3d12::detail
         }
     }
 
+    void Backend::UploadPackageInitialBufferData(
+        const compiler::CompiledRenderPackage& package)
+    {
+        std::vector<const compiler::CompiledResourceBlueprint*> uploadsToMake;
+        for (const auto& blueprint : package.resources)
+        {
+            if (blueprint.declaration.Kind() == gpu::ResourceKind::Buffer
+                && blueprint.declaration.lifetime
+                    != gpu::ResourceLifetimeClass::External
+                && blueprint.declaration.update
+                    != gpu::ResourceUpdateClass::CpuUpdated
+                && !blueprint.declaration.data.empty())
+            {
+                uploadsToMake.push_back(&blueprint);
+            }
+        }
+        if (uploadsToMake.empty())
+        {
+            return;
+        }
+
+        ComPtr<ID3D12CommandAllocator> allocator;
+        ComPtr<ID3D12GraphicsCommandList> list;
+        ThrowIfFailed(device_->CreateCommandAllocator(
+            D3D12_COMMAND_LIST_TYPE_DIRECT,
+            IID_PPV_ARGS(&allocator)),
+            "Create package initialization allocator");
+        ThrowIfFailed(device_->CreateCommandList(
+            0,
+            D3D12_COMMAND_LIST_TYPE_DIRECT,
+            allocator.Get(),
+            nullptr,
+            IID_PPV_ARGS(&list)),
+            "Create package initialization list");
+
+        std::vector<ComPtr<ID3D12Resource>> uploadResources;
+        uploadResources.reserve(uploadsToMake.size());
+        const auto uploadProperties = HeapProperties(D3D12_HEAP_TYPE_UPLOAD);
+        for (const auto* blueprint : uploadsToMake)
+        {
+            const auto byteCount = blueprint->declaration.data.size();
+            const auto uploadDescription = BufferDescription(byteCount);
+            ComPtr<ID3D12Resource> upload;
+            ThrowIfFailed(device_->CreateCommittedResource(
+                &uploadProperties,
+                D3D12_HEAP_FLAG_NONE,
+                &uploadDescription,
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+                nullptr,
+                IID_PPV_ARGS(&upload)),
+                "Create package initialization upload buffer");
+
+            void* mapped = nullptr;
+            ThrowIfFailed(upload->Map(0, nullptr, &mapped),
+                "Map package initialization upload buffer");
+            std::memcpy(
+                mapped,
+                blueprint->declaration.data.data(),
+                byteCount);
+            upload->Unmap(0, nullptr);
+
+            auto found = resources_.find(blueprint->declaration.id);
+            if (found == resources_.end() || found->second.empty())
+            {
+                throw std::runtime_error(
+                    "Package initial data has no materialized buffer.");
+            }
+            for (auto& record : found->second)
+            {
+                list->CopyBufferRegion(
+                    record.resource.Get(),
+                    0,
+                    upload.Get(),
+                    0,
+                    byteCount);
+                record.state = D3D12_RESOURCE_STATE_COMMON;
+                record.subresourceStates.clear();
+            }
+            uploadResources.push_back(std::move(upload));
+        }
+
+        ThrowIfFailed(list->Close(),
+            "Close package initialization list");
+        ID3D12CommandList* lists[] = {list.Get()};
+        queue_->ExecuteCommandLists(1, lists);
+        const UINT64 completion = SignalQueue(gpu::QueueClass::Direct);
+        WaitForCpuQueueValue(gpu::QueueClass::Direct, completion);
+        ValidateDebugLayer();
+    }
+
+    void Backend::InitializePackagePersistentReadStates(
+        const compiler::CompiledRenderPackage& package)
+    {
+        persistentReadStates_.clear();
+        for (const auto& envelope : package.plan.persistentReadStates)
+        {
+            UINT nativeBits = 0;
+            for (const auto state : envelope.states)
+            {
+                nativeBits |= static_cast<UINT>(NativeState(state));
+            }
+            if (nativeBits == 0
+                || !persistentReadStates_.emplace(
+                    envelope.resource,
+                    static_cast<D3D12_RESOURCE_STATES>(nativeBits)).second)
+            {
+                throw std::runtime_error(
+                    "Invalid package persistent read-state envelope.");
+            }
+        }
+        InitializePersistentReadStates();
+    }
+
     void Backend::EnsurePackageCompiled(
         const compiler::CompiledRenderPackage& package)
     {
@@ -280,6 +396,10 @@ namespace sge::d3d12::detail
 
         auto plan = package.plan;
         plan.structureHash = package.packageHash;
+        // Package materialization starts every non-external resource in COMMON.
+        // Persistent read envelopes are installed only after canonical initial
+        // data has been uploaded.
+        plan.persistentReadStates.clear();
 
         // Materialization still reuses the established EnsureCompiled path,
         // but its PSO warm-up must use the package-native ProgramInterface.
@@ -326,9 +446,119 @@ namespace sge::d3d12::detail
             }
         }
 
+        struct OptimizedClearCandidate
+        {
+            bool assigned = false;
+            bool conflict = false;
+            bool depth = false;
+            D3D12_CLEAR_VALUE value{};
+        };
+        std::unordered_map<gpu::ResourceId, OptimizedClearCandidate,
+            foundation::StrongIdHash<gpu::ResourceTag>> optimizedClears;
+        const auto sameClear = [](const OptimizedClearCandidate& candidate,
+                                  const D3D12_CLEAR_VALUE& value,
+                                  bool depth)
+        {
+            if (!candidate.assigned || candidate.depth != depth
+                || candidate.value.Format != value.Format)
+            {
+                return false;
+            }
+            if (depth)
+            {
+                return candidate.value.DepthStencil.Depth
+                        == value.DepthStencil.Depth
+                    && candidate.value.DepthStencil.Stencil
+                        == value.DepthStencil.Stencil;
+            }
+            return std::equal(
+                std::begin(candidate.value.Color),
+                std::end(candidate.value.Color),
+                std::begin(value.Color));
+        };
+        const auto recordOptimizedClear = [&](
+            const compiler::NormalizedResourceView& view,
+            const ir::ClearDescription& clear,
+            bool depth)
+        {
+            const auto& declaration = PackageResource(package, view.resource);
+            if (declaration.lifetime
+                    == gpu::ResourceLifetimeClass::External
+                || typelessResources.contains(view.resource))
+            {
+                return;
+            }
+
+            D3D12_CLEAR_VALUE value{};
+            value.Format = NativeFormat(view.format);
+            if (depth)
+            {
+                value.DepthStencil.Depth = clear.depth;
+                value.DepthStencil.Stencil = 0;
+            }
+            else
+            {
+                std::copy(
+                    clear.color.begin(),
+                    clear.color.end(),
+                    std::begin(value.Color));
+            }
+
+            auto& candidate = optimizedClears[view.resource];
+            if (!candidate.assigned)
+            {
+                candidate.assigned = true;
+                candidate.depth = depth;
+                candidate.value = value;
+            }
+            else if (!sameClear(candidate, value, depth))
+            {
+                candidate.conflict = true;
+            }
+        };
+        for (const auto& work : package.works)
+        {
+            const auto* raster = std::get_if<
+                compiler::CompiledRasterCommand>(&work.command);
+            if (raster == nullptr)
+            {
+                continue;
+            }
+            if (raster->clear.clearColor
+                || raster->clear.colorLoad
+                    == ir::AttachmentLoadOperation::Clear)
+            {
+                for (const auto& color : raster->colorAttachments)
+                {
+                    recordOptimizedClear(color, raster->clear, false);
+                }
+            }
+            if (raster->depthAttachment
+                && (raster->clear.clearDepth
+                    || raster->clear.depthLoad
+                        == ir::AttachmentLoadOperation::Clear))
+            {
+                recordOptimizedClear(
+                    *raster->depthAttachment, raster->clear, true);
+            }
+        }
+
         auto materializationModule = package.canonicalModule;
         for (auto& resource : materializationModule.resources)
         {
+            if (resource.Kind() == gpu::ResourceKind::Buffer
+                && resource.lifetime
+                    != gpu::ResourceLifetimeClass::External
+                && resource.update
+                    != gpu::ResourceUpdateClass::CpuUpdated
+                && !resource.data.empty())
+            {
+                // The legacy materializer otherwise uploads into COPY_DEST and
+                // leaves a guessed Vertex/Constant state. Package execution
+                // owns initialization and keeps buffers in COMMON afterward.
+                resource.data.clear();
+            }
+
             auto* texture = std::get_if<ir::TextureDescription>(
                 &resource.description);
             if (texture != nullptr
@@ -336,31 +566,28 @@ namespace sge::d3d12::detail
                     || texture->sampleCount > 1
                     || typelessResources.contains(resource.id)))
             {
-                // The established CreateTexture path also creates one legacy
-                // whole-resource descriptor. Array and MSAA descriptors need a
-                // different D3D12 dimension, so materialize a harmless resource
-                // first and replace it below before any package command runs.
+                // The established CreateTexture path creates legacy whole-
+                // resource descriptors with dimensions that are not valid for
+                // every generalized texture. Package descriptors are created
+                // lazily from normalized views instead.
                 texture->usage = ir::TextureUsage::None;
             }
         }
         EnsureCompiled(materializationModule, plan);
 
-        // Recreate array/MSAA textures with their canonical creation flags.
-        // Package-native range descriptors are created lazily, so these records
-        // deliberately start without legacy SRV/UAV/RTV/DSV handles.
+        // Recreate every package texture from its canonical description. This
+        // removes legacy whole-resource descriptors and, importantly, does not
+        // attach an optimized clear value when the IR has no stable resource-
+        // level clear contract. Placed resources keep their alias allocation.
         for (const auto& blueprint : package.resources)
         {
             const auto* texture = std::get_if<ir::TextureDescription>(
                 &blueprint.declaration.description);
-            const bool typeless = typelessResources.contains(
-                blueprint.declaration.id);
-            if (texture == nullptr
-                || (texture->arrayLayers == 1
-                    && texture->sampleCount == 1
-                    && !typeless))
+            if (texture == nullptr)
             {
                 continue;
             }
+
             auto found = resources_.find(blueprint.declaration.id);
             if (found == resources_.end())
             {
@@ -370,45 +597,59 @@ namespace sge::d3d12::detail
 
             auto nativeDescription = TextureDescription(
                 *texture, width_, height_);
-            if (typeless)
+            if (typelessResources.contains(blueprint.declaration.id))
             {
                 nativeDescription.Format = NativeTypelessFormat(
                     texture->format);
             }
             const auto properties = HeapProperties(D3D12_HEAP_TYPE_DEFAULT);
-            D3D12_CLEAR_VALUE clear{};
-            D3D12_CLEAR_VALUE* clearPointer = nullptr;
-            const auto usage = static_cast<std::uint32_t>(texture->usage);
-            if ((usage & static_cast<std::uint32_t>(
-                    ir::TextureUsage::ColorAttachment)) != 0)
-            {
-                clear.Format = nativeDescription.Format;
-                clear.Color[3] = 1.0f;
-                clearPointer = &clear;
-            }
-            else if ((usage & static_cast<std::uint32_t>(
-                    ir::TextureUsage::DepthAttachment)) != 0)
-            {
-                clear.Format = nativeDescription.Format;
-                clear.DepthStencil.Depth = 1.0f;
-                clearPointer = &clear;
-            }
+            const auto allocation = physicalAllocations_.find(
+                blueprint.declaration.id);
 
-            for (auto& record : found->second)
+            for (std::size_t instance = 0;
+                 instance < found->second.size(); ++instance)
             {
+                ID3D12Heap* heap = nullptr;
+                if (allocation != physicalAllocations_.end())
+                {
+                    heap = allocationHeaps_.at(allocation->second)
+                        .at(instance % FrameCount).Get();
+                }
+
                 ResourceRecord replacement;
-                ThrowIfFailed(device_->CreateCommittedResource(
-                    &properties,
-                    D3D12_HEAP_FLAG_NONE,
-                    &nativeDescription,
-                    D3D12_RESOURCE_STATE_COMMON,
-                    clearPointer,
-                    IID_PPV_ARGS(&replacement.resource)),
-                    "Create package array/MSAA texture");
-                record = std::move(replacement);
+                const auto clear = optimizedClears.find(
+                    blueprint.declaration.id);
+                const D3D12_CLEAR_VALUE* clearValue =
+                    clear != optimizedClears.end()
+                        && clear->second.assigned
+                        && !clear->second.conflict
+                        && !typelessResources.contains(
+                            blueprint.declaration.id)
+                    ? &clear->second.value
+                    : nullptr;
+                const HRESULT createResult = heap != nullptr
+                    ? device_->CreatePlacedResource(
+                        heap,
+                        0,
+                        &nativeDescription,
+                        D3D12_RESOURCE_STATE_COMMON,
+                        clearValue,
+                        IID_PPV_ARGS(&replacement.resource))
+                    : device_->CreateCommittedResource(
+                        &properties,
+                        D3D12_HEAP_FLAG_NONE,
+                        &nativeDescription,
+                        D3D12_RESOURCE_STATE_COMMON,
+                        clearValue,
+                        IID_PPV_ARGS(&replacement.resource));
+                ThrowIfFailed(
+                    createResult, "Create canonical package texture");
+                found->second[instance] = std::move(replacement);
             }
-            physicalAllocations_.erase(blueprint.declaration.id);
         }
+
+        UploadPackageInitialBufferData(package);
+        InitializePackagePersistentReadStates(package);
 
         packageShaderViews_.clear();
         packageAttachmentViews_.clear();
@@ -967,6 +1208,11 @@ namespace sge::d3d12::detail
         gpu::AbstractState abstractState,
         std::uint32_t frameLag)
     {
+        if (activeQueue_ == gpu::QueueClass::Copy)
+        {
+            throw std::runtime_error(
+                "Package state transitions must not be recorded on a Copy command list.");
+        }
         if (view.kind == gpu::ResourceKind::Buffer
             || view.kind == gpu::ResourceKind::Presentation)
         {
@@ -1038,6 +1284,87 @@ namespace sge::d3d12::detail
             record->subresourceStates.end(),
             [&](D3D12_RESOURCE_STATES state){ return state == target; });
         if (uniform) record->state = target;
+    }
+
+    bool Backend::PackageRangeIsCommon(
+        const compiler::NormalizedResourceView& view,
+        std::uint32_t frameLag) const
+    {
+        if (view.kind == gpu::ResourceKind::Presentation)
+        {
+            return false;
+        }
+        const auto* record = ResolveResource(view.resource, frameLag);
+        if (record == nullptr)
+        {
+            return false;
+        }
+        if (view.kind == gpu::ResourceKind::Buffer)
+        {
+            return record->state == D3D12_RESOURCE_STATE_COMMON;
+        }
+
+        const auto description = record->resource->GetDesc();
+        const UINT mipLevels = description.MipLevels;
+        const UINT arraySize = description.Dimension
+                == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+            ? 1u : description.DepthOrArraySize;
+        const auto stateAt = [&](UINT subresource)
+        {
+            return record->subresourceStates.empty()
+                ? record->state
+                : record->subresourceStates.at(subresource);
+        };
+        for (UINT plane = view.textureRange.firstPlane;
+             plane < static_cast<UINT>(view.textureRange.firstPlane
+                 + view.textureRange.planeCount); ++plane)
+        {
+            for (UINT layer = view.textureRange.firstArrayLayer;
+                 layer < static_cast<UINT>(view.textureRange.firstArrayLayer
+                     + view.textureRange.arrayLayerCount); ++layer)
+            {
+                for (UINT mip = view.textureRange.firstMip;
+                     mip < static_cast<UINT>(view.textureRange.firstMip
+                         + view.textureRange.mipCount); ++mip)
+                {
+                    if (stateAt(SubresourceIndex(
+                            mip, layer, plane, mipLevels, arraySize))
+                        != D3D12_RESOURCE_STATE_COMMON)
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
+    void Backend::ValidateCopyQueueRequirement(
+        const compiler::RangeStateRequirement& requirement)
+    {
+        if (activeQueue_ != gpu::QueueClass::Copy)
+        {
+            throw std::runtime_error(
+                "Copy requirement validation ran on a non-Copy queue.");
+        }
+        if (requirement.state != gpu::AbstractState::TransferRead
+            && requirement.state != gpu::AbstractState::TransferWrite)
+        {
+            throw std::runtime_error(
+                "Copy work requires a non-copy resource state.");
+        }
+        if (!PackageRangeIsCommon(
+                requirement.view, requirement.frameLag))
+        {
+            throw std::runtime_error(
+                "Copy queue resource did not arrive in COMMON. The producing "
+                "Direct/Compute queue must release the exact view before the "
+                "Copy queue waits and executes.");
+        }
+        // COPY_SOURCE/COPY_DEST are obtained through implicit promotion from
+        // COMMON. Resources used on a Copy queue decay to COMMON when this
+        // command list finishes execution, so the tracked state deliberately
+        // remains COMMON and no transition barrier is recorded here.
     }
 
     void Backend::ExecutePackageRaster(
@@ -1323,11 +1650,40 @@ namespace sge::d3d12::detail
                 for (const auto& handoff : package.queueHandoffs)
                 {
                     if (handoff.acquireScheduledWork != workIndex) continue;
-                    const auto& signal = signals.at(handoff.releaseScheduledWork);
-                    if (signal.value == 0)
+                    if (handoff.acquireQueue != work.queue)
+                    {
                         throw std::runtime_error(
-                            "Package queue handoff references an unsignaled work.");
+                            "Package queue handoff acquire queue does not match its work.");
+                    }
+                    const auto& signal = signals.at(handoff.releaseScheduledWork);
+                    if (signal.value == 0
+                        || signal.queue != handoff.releaseQueue)
+                    {
+                        throw std::runtime_error(
+                            "Package queue handoff references an unsignaled release.");
+                    }
                     WaitForQueueValue(work.queue, signal.queue, signal.value);
+                }
+
+                // BeginFrame has waited for every queue that previously used
+                // this physical frame slot. A cyclic handoff therefore needs
+                // no new GPU fence, but a Copy-first reuse must observe the
+                // COMMON release emitted by the previous cycle's last user.
+                for (const auto& handoff : package.cyclicFrameHandoffs)
+                {
+                    if (handoff.acquireScheduledWork != workIndex) continue;
+                    if (handoff.acquireQueue != work.queue)
+                    {
+                        throw std::runtime_error(
+                            "Cyclic frame handoff acquire queue does not match its work.");
+                    }
+                    if (handoff.requiresCommonRelease
+                        && !PackageRangeIsCommon(handoff.acquireView))
+                    {
+                        throw std::runtime_error(
+                            "FrameLocal physical instance was recycled before its "
+                            "previous cycle released the Copy-first state cell to COMMON.");
+                    }
                 }
 
                 commandList_ = AcquireCommandList(frame, work.queue);
@@ -1341,10 +1697,17 @@ namespace sge::d3d12::detail
                 {
                     ActivateAliasedResource(
                         requirement.view.resource, requirement.frameLag);
-                    TransitionPackageRange(
-                        requirement.view,
-                        requirement.state,
-                        requirement.frameLag);
+                    if (work.queue == gpu::QueueClass::Copy)
+                    {
+                        ValidateCopyQueueRequirement(requirement);
+                    }
+                    else
+                    {
+                        TransitionPackageRange(
+                            requirement.view,
+                            requirement.state,
+                            requirement.frameLag);
+                    }
                 }
 
                 std::visit([&](const auto& command)
@@ -1364,24 +1727,55 @@ namespace sge::d3d12::detail
                 for (const auto& handoff : package.queueHandoffs)
                 {
                     if (handoff.releaseScheduledWork != workIndex) continue;
-                    for (const auto& requirement : work.rangeStates)
+                    if (handoff.releaseQueue != work.queue)
                     {
-                        if (requirement.view.resource == handoff.resource
-                            && requirement.frameLag == handoff.frameLag)
-                        {
-                            TransitionPackageRange(
-                                requirement.view,
-                                gpu::AbstractState::Undefined,
-                                requirement.frameLag);
-                        }
+                        throw std::runtime_error(
+                            "Package queue handoff release queue does not match its work.");
                     }
+                    if (work.queue == gpu::QueueClass::Copy)
+                    {
+                        if (!PackageRangeIsCommon(
+                                handoff.releaseView, handoff.frameLag))
+                        {
+                            throw std::runtime_error(
+                                "Copy queue handoff lost its implicit COMMON state.");
+                        }
+                        continue;
+                    }
+                    TransitionPackageRange(
+                        handoff.releaseView,
+                        gpu::AbstractState::Undefined,
+                        handoff.frameLag);
+                }
+                for (const auto& handoff : package.cyclicFrameHandoffs)
+                {
+                    if (handoff.releaseScheduledWork != workIndex) continue;
+                    if (handoff.releaseQueue != work.queue)
+                    {
+                        throw std::runtime_error(
+                            "Cyclic frame handoff release queue does not match its work.");
+                    }
+                    if (!handoff.requiresCommonRelease) continue;
+                    if (work.queue == gpu::QueueClass::Copy)
+                    {
+                        if (!PackageRangeIsCommon(handoff.releaseView))
+                        {
+                            throw std::runtime_error(
+                                "Copy-final FrameLocal state cell did not decay to COMMON.");
+                        }
+                        continue;
+                    }
+                    TransitionPackageRange(
+                        handoff.releaseView,
+                        gpu::AbstractState::Undefined);
                 }
                 for (const auto& requirement : work.rangeStates)
                 {
                     const auto& declaration = PackageResource(
                         package, requirement.view.resource);
                     if (declaration.lifetime
-                        == gpu::ResourceLifetimeClass::Temporal)
+                            == gpu::ResourceLifetimeClass::Temporal
+                        && work.queue != gpu::QueueClass::Copy)
                     {
                         TransitionPackageRange(
                             requirement.view,

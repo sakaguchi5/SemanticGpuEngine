@@ -188,6 +188,10 @@ namespace sge::d3d12::detail
         void EnsurePackageDescriptorCapacity(
             const compiler::CompiledRenderPackage& package);
         void EnsureUploadCapacity(UINT64 requiredBytes);
+        void UploadPackageInitialBufferData(
+            const compiler::CompiledRenderPackage& package);
+        void InitializePackagePersistentReadStates(
+            const compiler::CompiledRenderPackage& package);
         void InitializePersistentReadStates();
 
         [[nodiscard]] ResourceRecord CreateStaticBuffer(
@@ -275,6 +279,11 @@ namespace sge::d3d12::detail
             const compiler::NormalizedResourceView& view,
             gpu::AbstractState abstractState,
             std::uint32_t frameLag = 0);
+        void ValidateCopyQueueRequirement(
+            const compiler::RangeStateRequirement& requirement);
+        [[nodiscard]] bool PackageRangeIsCommon(
+            const compiler::NormalizedResourceView& view,
+            std::uint32_t frameLag = 0) const;
         void ActivateAliasedResource(
             gpu::ResourceId resource,
             std::uint32_t frameLag = 0);

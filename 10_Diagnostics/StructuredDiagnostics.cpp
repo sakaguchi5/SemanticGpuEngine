@@ -57,6 +57,35 @@ namespace
         first = false;
         output << '"' << name << "\":" << value->Value();
     }
+    void WriteNormalizedView(
+        std::ostream& output,
+        const sge::compiler::NormalizedResourceView& view)
+    {
+        output << '{'
+               << "\"resource\":" << view.resource.Value()
+               << ",\"kind\":" << static_cast<unsigned>(view.kind)
+               << ",\"byteOffset\":" << view.byteOffset
+               << ",\"byteSize\":" << view.byteSize
+               << ",\"strideBytes\":" << view.strideBytes
+               << ",\"firstMip\":" << view.textureRange.firstMip
+               << ",\"mipCount\":" << view.textureRange.mipCount
+               << ",\"firstArrayLayer\":"
+               << view.textureRange.firstArrayLayer
+               << ",\"arrayLayerCount\":"
+               << view.textureRange.arrayLayerCount
+               << ",\"firstPlane\":"
+               << static_cast<unsigned>(view.textureRange.firstPlane)
+               << ",\"planeCount\":"
+               << static_cast<unsigned>(view.textureRange.planeCount)
+               << ",\"firstDepthSlice\":"
+               << view.textureRange.firstDepthSlice
+               << ",\"depthSliceCount\":"
+               << view.textureRange.depthSliceCount
+               << ",\"format\":\""
+               << sge::gpu::ToString(view.format)
+               << "\"}";
+    }
+
 }
 
 namespace sge::diagnostics
@@ -197,9 +226,46 @@ namespace sge::diagnostics
                    << static_cast<unsigned>(handoff.releaseQueue)
                    << ",\"acquireQueue\":"
                    << static_cast<unsigned>(handoff.acquireQueue)
-                   << ",\"crossesCopyQueue\":"
+                   << ",\"releaseState\":\""
+                   << gpu::ToString(handoff.releaseState)
+                   << "\",\"acquireState\":\""
+                   << gpu::ToString(handoff.acquireState)
+                   << "\",\"releaseView\":";
+            WriteNormalizedView(output, handoff.releaseView);
+            output << ",\"acquireView\":";
+            WriteNormalizedView(output, handoff.acquireView);
+            output << ",\"crossesCopyQueue\":"
                    << (handoff.crossesCopyQueue ? "true" : "false") << '}';
             output << (index + 1 == package.queueHandoffs.size() ? "\n" : ",\n");
+        }
+
+        output << "  ],\n  \"cyclicFrameHandoffs\": [\n";
+        for (std::size_t index = 0;
+             index < package.cyclicFrameHandoffs.size(); ++index)
+        {
+            const auto& handoff = package.cyclicFrameHandoffs[index];
+            output << "    {\"releaseWork\":"
+                   << handoff.releaseScheduledWork
+                   << ",\"acquireWork\":"
+                   << handoff.acquireScheduledWork
+                   << ",\"resource\":" << handoff.resource.Value()
+                   << ",\"releaseQueue\":"
+                   << static_cast<unsigned>(handoff.releaseQueue)
+                   << ",\"acquireQueue\":"
+                   << static_cast<unsigned>(handoff.acquireQueue)
+                   << ",\"releaseState\":\""
+                   << gpu::ToString(handoff.releaseState)
+                   << "\",\"acquireState\":\""
+                   << gpu::ToString(handoff.acquireState)
+                   << "\",\"releaseView\":";
+            WriteNormalizedView(output, handoff.releaseView);
+            output << ",\"acquireView\":";
+            WriteNormalizedView(output, handoff.acquireView);
+            output << ",\"requiresCommonRelease\":"
+                   << (handoff.requiresCommonRelease ? "true" : "false")
+                   << '}';
+            output << (index + 1 == package.cyclicFrameHandoffs.size()
+                ? "\n" : ",\n");
         }
 
         output << "  ],\n  \"diagnostics\": [\n";

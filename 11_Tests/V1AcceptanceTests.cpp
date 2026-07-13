@@ -3,6 +3,7 @@
 #include "04_RenderCompiler/CompiledRenderPackage.h"
 #include "12_CubeLab/ExperimentHarness.h"
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -328,7 +329,8 @@ namespace
                 .description = ir::BufferDescription{
                     .sizeBytes = 64,
                     .strideBytes = 4,
-                    .usage = ir::BufferUsage::CopySource},
+                    .usage = ir::BufferUsage::CopySource
+                        | ir::BufferUsage::Storage},
                 .data = std::vector<std::byte>(64)},
             StorageBuffer(produced, 64)
         };
@@ -336,10 +338,14 @@ namespace
             .id = gpu::ProgramId{0},
             .name = "ReadProduced",
             .computeEntry = "CSMain",
-            .programInterface = {.parameters = {{
-                .name = "Input",
-                .kind = gpu::ProgramParameterKind::ShaderResource,
-                .stage = gpu::ProgramStage::Compute}}}
+            .programInterface = {.parameters = {
+                {.name = "ProducedInput",
+                    .kind = gpu::ProgramParameterKind::ShaderResource,
+                    .stage = gpu::ProgramStage::Compute},
+                {.name = "PersistentCopyInput",
+                    .kind = gpu::ProgramParameterKind::ShaderResource,
+                    .stage = gpu::ProgramStage::Compute}}
+            }
         });
         module.works = {
             {.id = gpu::WorkId{0},
@@ -355,11 +361,14 @@ namespace
                     .sizeBytes = 64}},
             {.id = gpu::WorkId{1},
                 .name = "ConsumeCopiedData",
-                .accesses = {{produced, gpu::AccessMode::Read,
-                    gpu::ResourceRole::ProgramInput}},
+                .accesses = {
+                    {produced, gpu::AccessMode::Read,
+                        gpu::ResourceRole::ProgramInput},
+                    {source, gpu::AccessMode::Read,
+                        gpu::ResourceRole::ProgramInput}},
                 .payload = ir::ComputeWork{
                     .program = gpu::ProgramId{0},
-                    .bindings = {{0, produced}}}}
+                    .bindings = {{0, produced}, {1, source}}}}
         };
         return module;
     }
@@ -491,8 +500,70 @@ namespace
         Require(handoff.Succeeded(), "Copy handoff package failed.");
         Require(!handoff.package.queueHandoffs.empty(),
             "Copy handoff was not materialized in the package.");
+        const auto exact = std::find_if(
+            handoff.package.queueHandoffs.begin(),
+            handoff.package.queueHandoffs.end(),
+            [](const compiler::QueueHandoffPlan& plan)
+            {
+                return plan.releaseQueue == gpu::QueueClass::Copy
+                    && plan.acquireQueue == gpu::QueueClass::Compute
+                    && plan.releaseState
+                        == gpu::AbstractState::TransferWrite
+                    && plan.acquireState
+                        == gpu::AbstractState::ProgramRead
+                    && plan.releaseView.resource == gpu::ResourceId{1}
+                    && plan.acquireView.resource == gpu::ResourceId{1}
+                    && plan.crossesCopyQueue;
+            });
+        Require(exact != handoff.package.queueHandoffs.end(),
+            "Copy handoff lost its exact release/acquire views or states.");
+        const auto persistentRead = std::find_if(
+            handoff.package.queueHandoffs.begin(),
+            handoff.package.queueHandoffs.end(),
+            [](const compiler::QueueHandoffPlan& plan)
+            {
+                return plan.releaseQueue == gpu::QueueClass::Copy
+                    && plan.acquireQueue == gpu::QueueClass::Compute
+                    && plan.releaseState
+                        == gpu::AbstractState::TransferRead
+                    && plan.acquireState
+                        == gpu::AbstractState::ProgramRead
+                    && plan.releaseView.resource == gpu::ResourceId{0}
+                    && plan.acquireView.resource == gpu::ResourceId{0}
+                    && plan.crossesCopyQueue;
+            });
+        Require(persistentRead != handoff.package.queueHandoffs.end(),
+            "Persistent read-only use incorrectly skipped a Copy-queue handoff.");
         Require(handoff.package.requirements.explicitCopyQueueHandoffs,
             "Copy handoff capability requirement was not recorded.");
+        const auto cyclic = std::find_if(
+            handoff.package.cyclicFrameHandoffs.begin(),
+            handoff.package.cyclicFrameHandoffs.end(),
+            [](const compiler::CyclicFrameHandoffPlan& plan)
+            {
+                return plan.resource == gpu::ResourceId{1}
+                    && plan.releaseScheduledWork == 1
+                    && plan.acquireScheduledWork == 0
+                    && plan.releaseQueue == gpu::QueueClass::Compute
+                    && plan.acquireQueue == gpu::QueueClass::Copy
+                    && plan.releaseState
+                        == gpu::AbstractState::ProgramRead
+                    && plan.acquireState
+                        == gpu::AbstractState::TransferWrite
+                    && plan.requiresCommonRelease;
+            });
+        Require(cyclic != handoff.package.cyclicFrameHandoffs.end(),
+            "FrameLocal Copy-first slot reuse has no cyclic COMMON release.");
+
+        const bool persistentCyclic = std::any_of(
+            handoff.package.cyclicFrameHandoffs.begin(),
+            handoff.package.cyclicFrameHandoffs.end(),
+            [](const compiler::CyclicFrameHandoffPlan& plan)
+            {
+                return plan.resource == gpu::ResourceId{0};
+            });
+        Require(!persistentCyclic,
+            "Persistent resource was incorrectly assigned a FrameLocal cyclic handoff.");
 
         auto module = SimpleComputeModule(1);
         capabilities.localMemoryBudget = 128;

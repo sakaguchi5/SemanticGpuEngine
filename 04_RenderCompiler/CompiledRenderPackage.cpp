@@ -1760,15 +1760,6 @@ namespace sge::compiler
                 std::move(text));
         }
 
-        std::unordered_map<std::size_t, std::size_t> scheduledPosition;
-        for (std::size_t index = 0;
-             index < result.package.plan.scheduledWorks.size(); ++index)
-        {
-            scheduledPosition.emplace(
-                result.package.plan.scheduledWorks[index].sourceWorkIndex,
-                index);
-        }
-
         for (const auto& resource : result.package.canonicalModule.resources)
         {
             const auto instance = std::find_if(
@@ -2109,142 +2100,272 @@ namespace sge::compiler
             }
         }
 
-        for (const auto& dependency : result.package.plan.dependencies)
+        const auto handoffAlreadyPlanned = [&](std::size_t releaseWork,
+                                                  std::size_t acquireWork,
+                                                  const RangeStateRequirement& release,
+                                                  const RangeStateRequirement& acquire)
         {
-            const auto beforeIt = scheduledPosition.find(dependency.before);
-            const auto afterIt = scheduledPosition.find(dependency.after);
-            if (beforeIt == scheduledPosition.end()
-                || afterIt == scheduledPosition.end())
-            {
-                continue;
-            }
-            const auto before = beforeIt->second;
-            const auto after = afterIt->second;
-            const auto releaseQueue = result.package.works[before].queue;
-            const auto acquireQueue = result.package.works[after].queue;
-            if (releaseQueue == acquireQueue)
-            {
-                continue;
-            }
-            const auto releaseState = std::find_if(
-                result.package.works[before].rangeStates.begin(),
-                result.package.works[before].rangeStates.end(),
-                [&](const RangeStateRequirement& requirement)
+            return std::any_of(
+                result.package.queueHandoffs.begin(),
+                result.package.queueHandoffs.end(),
+                [&](const QueueHandoffPlan& handoff)
                 {
-                    return requirement.view.resource == dependency.resource;
+                    return handoff.releaseScheduledWork == releaseWork
+                        && handoff.acquireScheduledWork == acquireWork
+                        && handoff.resource == acquire.view.resource
+                        && handoff.frameLag == acquire.frameLag
+                        && handoff.releaseView == release.view
+                        && handoff.acquireView == acquire.view;
                 });
-            const auto acquireState = std::find_if(
-                result.package.works[after].rangeStates.begin(),
-                result.package.works[after].rangeStates.end(),
-                [&](const RangeStateRequirement& requirement)
-                {
-                    return requirement.view.resource == dependency.resource;
-                });
+        };
+
+        const auto addHandoff = [&](std::size_t releaseWork,
+                                    std::size_t acquireWork,
+                                    const RangeStateRequirement& release,
+                                    const RangeStateRequirement& acquire)
+        {
+            const auto releaseQueue =
+                result.package.works.at(releaseWork).queue;
+            const auto acquireQueue =
+                result.package.works.at(acquireWork).queue;
+            if (releaseQueue == acquireQueue
+                || release.view.resource != acquire.view.resource
+                || release.frameLag != acquire.frameLag
+                || handoffAlreadyPlanned(
+                    releaseWork, acquireWork, release, acquire))
+            {
+                return;
+            }
+
             const bool copy = releaseQueue == gpu::QueueClass::Copy
                 || acquireQueue == gpu::QueueClass::Copy;
             result.package.queueHandoffs.push_back({
-                .releaseScheduledWork = before,
-                .acquireScheduledWork = after,
-                .resource = dependency.resource,
-                .frameLag = acquireState
-                        == result.package.works[after].rangeStates.end()
-                    ? 0
-                    : acquireState->frameLag,
+                .releaseScheduledWork = releaseWork,
+                .acquireScheduledWork = acquireWork,
+                .resource = acquire.view.resource,
+                .frameLag = acquire.frameLag,
+                .releaseView = release.view,
+                .acquireView = acquire.view,
                 .releaseQueue = releaseQueue,
                 .acquireQueue = acquireQueue,
-                .releaseState = releaseState
-                        == result.package.works[before].rangeStates.end()
-                    ? gpu::AbstractState::Undefined
-                    : releaseState->state,
-                .acquireState = acquireState
-                        == result.package.works[after].rangeStates.end()
-                    ? gpu::AbstractState::Undefined
-                    : acquireState->state,
+                .releaseState = release.state,
+                .acquireState = acquire.state,
                 .crossesCopyQueue = copy
             });
             result.package.requirements.explicitCopyQueueHandoffs =
                 result.package.requirements.explicitCopyQueueHandoffs || copy;
-        }
+        };
 
-        // Resource state ownership is a physical-instance property, not only
-        // a RAW/WAR/WAW dependency property. Two read-only works on different
-        // queues may have no data dependency, yet the first transition into a
-        // read state must complete before the other queue uses that instance.
-        // Persistent immutable reads are the exception: their union state is
-        // initialized once before frame execution.
+        // Queue ownership follows D3D12 state granularity. Buffers and the
+        // presentation image have one state cell; textures have one cell for
+        // each mip/array/plane subresource. Texture3D depth slices share the
+        // state of their mip and therefore deliberately collapse to one cell.
+        struct StateCellKey
+        {
+            gpu::ResourceId resource;
+            std::uint32_t frameLag = 0;
+            std::uint16_t mip = 0;
+            std::uint16_t arrayLayer = 0;
+            std::uint8_t plane = 0;
+
+            bool operator==(const StateCellKey&) const = default;
+        };
+        struct StateCellHash
+        {
+            std::size_t operator()(const StateCellKey& key) const noexcept
+            {
+                std::size_t seed = key.resource.Value();
+                foundation::HashCombine(seed, key.frameLag);
+                foundation::HashCombine(seed, key.mip);
+                foundation::HashCombine(seed, key.arrayLayer);
+                foundation::HashCombine(seed, key.plane);
+                return seed;
+            }
+        };
+        const auto stateCells = [&](const RangeStateRequirement& requirement)
+        {
+            std::vector<std::pair<StateCellKey, RangeStateRequirement>> cells;
+            if (requirement.view.kind == gpu::ResourceKind::Buffer
+                || requirement.view.kind == gpu::ResourceKind::Presentation)
+            {
+                cells.push_back({
+                    {requirement.view.resource, requirement.frameLag},
+                    requirement
+                });
+                return cells;
+            }
+
+            const auto& texture = std::get<ir::TextureDescription>(
+                result.package.canonicalModule.Resource(
+                    requirement.view.resource).description);
+            const auto& range = requirement.view.textureRange;
+            cells.reserve(static_cast<std::size_t>(range.mipCount)
+                * range.arrayLayerCount * range.planeCount);
+            for (std::uint16_t plane = range.firstPlane;
+                 plane < static_cast<std::uint16_t>(
+                    range.firstPlane + range.planeCount); ++plane)
+            {
+                for (std::uint16_t layer = range.firstArrayLayer;
+                     layer < static_cast<std::uint16_t>(
+                        range.firstArrayLayer + range.arrayLayerCount); ++layer)
+                {
+                    for (std::uint16_t mip = range.firstMip;
+                         mip < static_cast<std::uint16_t>(
+                            range.firstMip + range.mipCount); ++mip)
+                    {
+                        auto cell = requirement;
+                        cell.view.textureRange.firstMip = mip;
+                        cell.view.textureRange.mipCount = 1;
+                        cell.view.textureRange.firstArrayLayer =
+                            texture.dimension == gpu::ResourceKind::Texture3D
+                                ? 0 : layer;
+                        cell.view.textureRange.arrayLayerCount = 1;
+                        cell.view.textureRange.firstPlane =
+                            static_cast<std::uint8_t>(plane);
+                        cell.view.textureRange.planeCount = 1;
+                        cell.view.textureRange.firstDepthSlice = 0;
+                        cell.view.textureRange.depthSliceCount =
+                            texture.dimension == gpu::ResourceKind::Texture3D
+                                ? static_cast<std::uint16_t>(std::max(
+                                    1u,
+                                    static_cast<unsigned>(texture.depth)
+                                        >> mip))
+                                : 1;
+                        cells.push_back({
+                            {
+                                requirement.view.resource,
+                                requirement.frameLag,
+                                mip,
+                                cell.view.textureRange.firstArrayLayer,
+                                static_cast<std::uint8_t>(plane)
+                            },
+                            std::move(cell)
+                        });
+                    }
+                }
+            }
+            return cells;
+        };
+
         struct LastQueueUse
         {
             std::size_t work = 0;
             gpu::QueueClass queue = gpu::QueueClass::Direct;
-            gpu::AbstractState state = gpu::AbstractState::Undefined;
-            bool writeCapable = false;
+            RangeStateRequirement requirement;
         };
-        std::unordered_map<std::uint64_t, LastQueueUse> lastQueueUses;
-        const auto instanceKey = [](gpu::ResourceId resource,
-                                    std::uint32_t frameLag)
-        {
-            return (static_cast<std::uint64_t>(resource.Value()) << 32u)
-                | frameLag;
-        };
+        std::unordered_map<StateCellKey, LastQueueUse, StateCellHash>
+            lastQueueUses;
+        std::unordered_map<StateCellKey, LastQueueUse, StateCellHash>
+            firstFrameLocalUses;
+        std::unordered_map<StateCellKey, LastQueueUse, StateCellHash>
+            lastFrameLocalUses;
         for (std::size_t workIndex = 0;
              workIndex < result.package.works.size(); ++workIndex)
         {
             const auto& work = result.package.works[workIndex];
             for (const auto& requirement : work.rangeStates)
             {
-                const auto key = instanceKey(
-                    requirement.view.resource, requirement.frameLag);
-                const auto previous = lastQueueUses.find(key);
-                if (previous != lastQueueUses.end()
-                    && previous->second.queue != work.queue)
+                const auto& declaration =
+                    result.package.canonicalModule.Resource(
+                        requirement.view.resource);
+                for (auto [key, cell] : stateCells(requirement))
                 {
-                    const auto& declaration =
-                        result.package.canonicalModule.Resource(
-                            requirement.view.resource);
-                    const bool persistentCompatibleReads =
-                        declaration.lifetime
-                            == gpu::ResourceLifetimeClass::Persistent
-                        && !previous->second.writeCapable
-                        && !requirement.writeCapable;
-                    const bool alreadyPlanned = std::any_of(
-                        result.package.queueHandoffs.begin(),
-                        result.package.queueHandoffs.end(),
-                        [&](const QueueHandoffPlan& handoff)
-                        {
-                            return handoff.releaseScheduledWork
-                                    == previous->second.work
-                                && handoff.acquireScheduledWork == workIndex
-                                && handoff.resource
-                                    == requirement.view.resource
-                                && handoff.frameLag == requirement.frameLag;
-                        });
-                    if (!persistentCompatibleReads && !alreadyPlanned)
+                    const LastQueueUse current{
+                        .work = workIndex,
+                        .queue = work.queue,
+                        .requirement = cell
+                    };
+                    const auto previous = lastQueueUses.find(key);
+                    if (previous != lastQueueUses.end()
+                        && previous->second.queue != work.queue)
                     {
-                        const bool copy = previous->second.queue
-                                == gpu::QueueClass::Copy
-                            || work.queue == gpu::QueueClass::Copy;
-                        result.package.queueHandoffs.push_back({
-                            .releaseScheduledWork = previous->second.work,
-                            .acquireScheduledWork = workIndex,
-                            .resource = requirement.view.resource,
-                            .frameLag = requirement.frameLag,
-                            .releaseQueue = previous->second.queue,
-                            .acquireQueue = work.queue,
-                            .releaseState = previous->second.state,
-                            .acquireState = requirement.state,
-                            .crossesCopyQueue = copy});
-                        result.package.requirements.explicitCopyQueueHandoffs =
-                            result.package.requirements
-                                .explicitCopyQueueHandoffs || copy;
+                        const bool persistentCompatibleReads =
+                            declaration.lifetime
+                                == gpu::ResourceLifetimeClass::Persistent
+                            && previous->second.queue
+                                != gpu::QueueClass::Copy
+                            && work.queue != gpu::QueueClass::Copy
+                            && !previous->second.requirement.writeCapable
+                            && !cell.writeCapable;
+                        if (!persistentCompatibleReads)
+                        {
+                            addHandoff(
+                                previous->second.work,
+                                workIndex,
+                                previous->second.requirement,
+                                cell);
+                        }
                     }
+
+                    if (declaration.lifetime
+                            == gpu::ResourceLifetimeClass::FrameLocal
+                        && requirement.frameLag == 0)
+                    {
+                        firstFrameLocalUses.try_emplace(key, current);
+                        lastFrameLocalUses.insert_or_assign(key, current);
+                    }
+                    lastQueueUses.insert_or_assign(key, current);
                 }
-                lastQueueUses[key] = {
-                    workIndex,
-                    work.queue,
-                    requirement.state,
-                    requirement.writeCapable};
             }
         }
+
+        // FrameLocal instances are finite rings. When a state cell is first
+        // consumed by the Copy queue in a frame, the previous use of that same
+        // physical slot (maxFramesInFlight frames earlier) must have released
+        // it to COMMON. The Copy queue itself cannot perform the arbitrary
+        // transition, so this is a compiler-visible cyclic ownership edge.
+        for (const auto& [key, first] : firstFrameLocalUses)
+        {
+            const auto last = lastFrameLocalUses.find(key);
+            if (last == lastFrameLocalUses.end()
+                || first.queue != gpu::QueueClass::Copy
+                || last->second.queue == gpu::QueueClass::Copy)
+            {
+                continue;
+            }
+
+            result.package.cyclicFrameHandoffs.push_back({
+                .releaseScheduledWork = last->second.work,
+                .acquireScheduledWork = first.work,
+                .resource = key.resource,
+                .releaseView = last->second.requirement.view,
+                .acquireView = first.requirement.view,
+                .releaseQueue = last->second.queue,
+                .acquireQueue = first.queue,
+                .releaseState = last->second.requirement.state,
+                .acquireState = first.requirement.state,
+                .requiresCommonRelease = true
+            });
+            result.package.requirements.explicitCopyQueueHandoffs = true;
+        }
+        std::sort(
+            result.package.cyclicFrameHandoffs.begin(),
+            result.package.cyclicFrameHandoffs.end(),
+            [](const CyclicFrameHandoffPlan& left,
+               const CyclicFrameHandoffPlan& right)
+            {
+                if (left.resource != right.resource)
+                {
+                    return left.resource.Value() < right.resource.Value();
+                }
+                if (left.releaseScheduledWork
+                    != right.releaseScheduledWork)
+                {
+                    return left.releaseScheduledWork
+                        < right.releaseScheduledWork;
+                }
+                if (left.acquireScheduledWork
+                    != right.acquireScheduledWork)
+                {
+                    return left.acquireScheduledWork
+                        < right.acquireScheduledWork;
+                }
+                if (left.releaseView != right.releaseView)
+                {
+                    return left.releaseView < right.releaseView;
+                }
+                return left.acquireView < right.acquireView;
+            });
 
         result.package.requirements.dynamicDescriptorGrowth =
             result.package.requirements.textureSubresourceViews
@@ -2305,7 +2426,9 @@ namespace sge::compiler
         result.package.statistics.executableCount =
             packageExecutables.size();
         result.package.statistics.barrierCount =
-            rangeBarrierUpperBound + result.package.queueHandoffs.size();
+            rangeBarrierUpperBound
+            + result.package.queueHandoffs.size()
+            + result.package.cyclicFrameHandoffs.size();
         result.package.statistics.queueWaitCount =
             result.package.queueHandoffs.size();
         for (const auto& work : result.package.works)
@@ -2443,8 +2566,29 @@ namespace sge::compiler
                 packageHash, handoff.acquireScheduledWork);
             foundation::HashCombine(packageHash, handoff.resource.Value());
             foundation::HashCombine(packageHash, handoff.frameLag);
+            hashView(handoff.releaseView);
+            hashView(handoff.acquireView);
             foundation::HashEnum(packageHash, handoff.releaseQueue);
             foundation::HashEnum(packageHash, handoff.acquireQueue);
+            foundation::HashEnum(packageHash, handoff.releaseState);
+            foundation::HashEnum(packageHash, handoff.acquireState);
+            foundation::HashCombine(packageHash, handoff.crossesCopyQueue);
+        }
+        for (const auto& handoff : result.package.cyclicFrameHandoffs)
+        {
+            foundation::HashCombine(
+                packageHash, handoff.releaseScheduledWork);
+            foundation::HashCombine(
+                packageHash, handoff.acquireScheduledWork);
+            foundation::HashCombine(packageHash, handoff.resource.Value());
+            hashView(handoff.releaseView);
+            hashView(handoff.acquireView);
+            foundation::HashEnum(packageHash, handoff.releaseQueue);
+            foundation::HashEnum(packageHash, handoff.acquireQueue);
+            foundation::HashEnum(packageHash, handoff.releaseState);
+            foundation::HashEnum(packageHash, handoff.acquireState);
+            foundation::HashCombine(
+                packageHash, handoff.requiresCommonRelease);
         }
         result.package.packageHash = packageHash;
         result.package.plan.structureHash = packageHash;

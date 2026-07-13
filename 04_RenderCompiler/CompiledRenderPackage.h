@@ -94,11 +94,31 @@ namespace sge::compiler
         std::size_t acquireScheduledWork = 0;
         gpu::ResourceId resource;
         std::uint32_t frameLag = 0;
+        NormalizedResourceView releaseView;
+        NormalizedResourceView acquireView;
         gpu::QueueClass releaseQueue = gpu::QueueClass::Direct;
         gpu::QueueClass acquireQueue = gpu::QueueClass::Direct;
         gpu::AbstractState releaseState = gpu::AbstractState::Undefined;
         gpu::AbstractState acquireState = gpu::AbstractState::Undefined;
         bool crossesCopyQueue = false;
+    };
+
+    struct CyclicFrameHandoffPlan
+    {
+        std::size_t releaseScheduledWork = 0;
+        std::size_t acquireScheduledWork = 0;
+        gpu::ResourceId resource;
+        NormalizedResourceView releaseView;
+        NormalizedResourceView acquireView;
+        gpu::QueueClass releaseQueue = gpu::QueueClass::Direct;
+        gpu::QueueClass acquireQueue = gpu::QueueClass::Direct;
+        gpu::AbstractState releaseState = gpu::AbstractState::Undefined;
+        gpu::AbstractState acquireState = gpu::AbstractState::Undefined;
+
+        // True when the next reuse begins on the Copy queue. In that case the
+        // previous non-Copy user must explicitly release the physical state
+        // cell to COMMON before the frame slot can be recycled.
+        bool requiresCommonRelease = false;
     };
 
     struct CompiledBinding
@@ -235,6 +255,7 @@ namespace sge::compiler
         std::vector<CompiledProgramBlueprint> programs;
         std::vector<CompiledWork> works;
         std::vector<QueueHandoffPlan> queueHandoffs;
+        std::vector<CyclicFrameHandoffPlan> cyclicFrameHandoffs;
         BackendFeatureRequirements requirements;
         PackageStatistics statistics;
         std::vector<Diagnostic> diagnostics;
