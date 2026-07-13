@@ -1777,7 +1777,7 @@ namespace sge::d3d12::detail
                 const auto& expected = std::get<ir::BufferDescription>(
                     slot.expectedDescription);
                 if (description.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER
-                    || description.Width < expected.byteSize)
+                    || description.Width < expected.sizeBytes)
                 {
                     throw runtime::BackendFailure(
                         runtime::BackendFailureKind::InvalidPackage,
