@@ -44,12 +44,36 @@ jobs:
             "success=false" | Out-File $env:GITHUB_OUTPUT -Append
             exit 1
           }
-      - name: Upload diagnostic
+      - name: Capture partial state
+        if: always()
+        shell: pwsh
+        run: |
+          $paths = @(
+            "03_RenderIR/RenderIR.h", "03_RenderIR/RenderIR.cpp",
+            "04_RenderCompiler/RenderCompiler.h", "04_RenderCompiler/RenderCompiler.cpp",
+            "07_D3D12Backend/D3D12Helpers.h", "07_D3D12Backend/D3D12Helpers.cpp",
+            "07_D3D12Backend/D3D12BackendInternal.h", "07_D3D12Backend/D3D12Compilation.cpp",
+            "07_D3D12Backend/D3D12Backend.cpp", "08_ClassicalRasterFrontend/ClassicalLowering.cpp",
+            "09_ExperimentalGeometry/SdfLowering.cpp", "10_Diagnostics/PlanDiagnostics.cpp",
+            "11_Tests/CompilerTests.cpp", "11_Tests/D3D12IntegrationTests.cpp",
+            "Shaders/IntegrationTemporalRead.hlsl"
+          )
+          $stage = Join-Path $env:RUNNER_TEMP "partial-state"
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          foreach ($relative in $paths) {
+            $destination = Join-Path $stage $relative
+            New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
+            Copy-Item -LiteralPath (Join-Path $env:GITHUB_WORKSPACE $relative) -Destination $destination -Force
+          }
+          Copy-Item -LiteralPath (Join-Path $env:RUNNER_TEMP "apply.ps1") -Destination (Join-Path $stage "apply.ps1") -Force
+          Copy-Item -LiteralPath (Join-Path $env:RUNNER_TEMP "apply-diagnostic.txt") -Destination (Join-Path $stage "apply-diagnostic.txt") -Force
+          Compress-Archive -Path (Join-Path $stage "*") -DestinationPath (Join-Path $env:RUNNER_TEMP "partial-state.zip") -Force
+      - name: Upload partial state
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: apply-diagnostic
-          path: ${{ runner.temp }}\apply-diagnostic.txt
+          name: partial-state
+          path: ${{ runner.temp }}\partial-state.zip
           if-no-files-found: error
           retention-days: 1
       - name: Package changed files
