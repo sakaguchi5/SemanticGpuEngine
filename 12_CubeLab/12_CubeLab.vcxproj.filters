@@ -2,8 +2,8 @@
 <Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup>
     <ClCompile Include="CubeExperiment.cpp" />
-  </ItemGroup>
-  <ItemGroup>
+    <ClCompile Include="ExperimentHarness.cpp" />
     <ClInclude Include="CubeExperiment.h" />
+    <ClInclude Include="ExperimentHarness.h" />
   </ItemGroup>
 </Project>

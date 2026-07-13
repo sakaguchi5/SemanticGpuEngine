@@ -37,6 +37,7 @@ namespace sge::d3d12::detail
     {
         Microsoft::WRL::ComPtr<ID3D12Resource> resource;
         D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
+        std::vector<D3D12_RESOURCE_STATES> subresourceStates;
         D3D12_VERTEX_BUFFER_VIEW vertexView{};
         D3D12_CPU_DESCRIPTOR_HANDLE rtv{};
         D3D12_CPU_DESCRIPTOR_HANDLE dsv{};
@@ -53,13 +54,37 @@ namespace sge::d3d12::detail
         ir::ResourceView view;
         gpu::ProgramParameterKind kind =
             gpu::ProgramParameterKind::ShaderResource;
-
         auto operator<=>(const ShaderViewKey&) const = default;
     };
 
     struct CachedShaderView
     {
         std::vector<D3D12_GPU_DESCRIPTOR_HANDLE> instances;
+    };
+
+    struct PackageShaderViewKey
+    {
+        compiler::NormalizedResourceView view;
+        gpu::ProgramParameterKind kind =
+            gpu::ProgramParameterKind::ShaderResource;
+        auto operator<=>(const PackageShaderViewKey&) const = default;
+    };
+
+    struct PackageAttachmentViewKey
+    {
+        compiler::NormalizedResourceView view;
+        bool depth = false;
+        auto operator<=>(const PackageAttachmentViewKey&) const = default;
+    };
+
+    struct CachedPackageShaderView
+    {
+        std::vector<D3D12_GPU_DESCRIPTOR_HANDLE> instances;
+    };
+
+    struct CachedPackageAttachmentView
+    {
+        std::vector<D3D12_CPU_DESCRIPTOR_HANDLE> instances;
     };
 
     struct QueueFrameContext
@@ -110,6 +135,10 @@ namespace sge::d3d12::detail
         [[nodiscard]] gpu::DeviceCapabilities Capabilities() const override;
 
         void Execute(
+            const compiler::CompiledRenderPackage& package,
+            const runtime::FrameInvocation& invocation) override;
+
+        void Execute(
             const ir::SemanticModule& module,
             const compiler::ExecutionPlan& plan) override;
 
@@ -154,54 +183,77 @@ namespace sge::d3d12::detail
         void EnsureCompiled(
             const ir::SemanticModule& module,
             const compiler::ExecutionPlan& plan);
+        void EnsurePackageCompiled(
+            const compiler::CompiledRenderPackage& package);
+        void EnsurePackageDescriptorCapacity(
+            const compiler::CompiledRenderPackage& package);
+        void EnsureUploadCapacity(UINT64 requiredBytes);
         void InitializePersistentReadStates();
 
         [[nodiscard]] ResourceRecord CreateStaticBuffer(
             const ir::ResourceDeclaration& declaration,
             ID3D12Heap* aliasHeap = nullptr);
-
         [[nodiscard]] ResourceRecord CreateTexture(
             const ir::ResourceDeclaration& declaration,
             ID3D12Heap* aliasHeap = nullptr);
-
         [[nodiscard]] ProgramRecord CreateProgram(
             const ir::ProgramDeclaration& declaration);
-
         [[nodiscard]] Microsoft::WRL::ComPtr<ID3D12RootSignature>
             CreateRootSignature(
                 const ir::ProgramDeclaration& declaration,
                 std::vector<UINT>& rootParameterIndices);
-
         [[nodiscard]] Microsoft::WRL::ComPtr<ID3D12PipelineState>
             CreatePipeline(const compiler::ExecutableKey& executable);
+        [[nodiscard]] Microsoft::WRL::ComPtr<ID3D12PipelineState>
+            CreatePackagePipeline(const compiler::ExecutableKey& executable);
 
         [[nodiscard]] D3D12_GPU_VIRTUAL_ADDRESS UploadConstants(
             FrameContext& frame,
             const ir::ResourceDeclaration& declaration);
-
         [[nodiscard]] D3D12_GPU_DESCRIPTOR_HANDLE ResolveShaderDescriptor(
             const ir::SemanticModule& module,
             const ir::ResourceView& view,
             gpu::ProgramParameterKind kind,
             std::uint32_t frameLag);
-
+        [[nodiscard]] D3D12_GPU_DESCRIPTOR_HANDLE
+            ResolvePackageShaderDescriptor(
+                const compiler::NormalizedResourceView& view,
+                gpu::ProgramParameterKind kind,
+                std::uint32_t frameLag);
+        [[nodiscard]] D3D12_CPU_DESCRIPTOR_HANDLE
+            ResolvePackageAttachmentDescriptor(
+                const compiler::NormalizedResourceView& view,
+                bool depth,
+                std::uint32_t frameLag = 0);
         [[nodiscard]] D3D12_VERTEX_BUFFER_VIEW BuildVertexView(
             const ir::SemanticModule& module,
             const ir::ResourceView& view);
+        [[nodiscard]] D3D12_VERTEX_BUFFER_VIEW BuildPackageVertexView(
+            const compiler::NormalizedResourceView& view,
+            std::uint32_t frameLag = 0);
+        [[nodiscard]] D3D12_INDEX_BUFFER_VIEW BuildPackageIndexView(
+            const compiler::CompiledIndexStream& stream,
+            std::uint32_t frameLag = 0);
 
         void ExecuteRasterWork(
             const ir::SemanticModule& module,
             const ir::WorkDeclaration& work,
             FrameContext& frame);
-
         void ExecuteComputeWork(
             const ir::SemanticModule& module,
             const ir::WorkDeclaration& work,
             FrameContext& frame);
-
         void ExecuteCopyWork(
             const ir::SemanticModule& module,
             const ir::WorkDeclaration& work);
+        void ExecutePackageRaster(
+            const compiler::CompiledRasterCommand& command,
+            FrameContext& frame);
+        void ExecutePackageCompute(
+            const compiler::CompiledComputeCommand& command,
+            FrameContext& frame);
+        void ExecutePackageCopy(
+            const compiler::CompiledCopyCommand& command);
 
         void BindResources(
             const ir::SemanticModule& module,
@@ -209,12 +261,20 @@ namespace sge::d3d12::detail
             const std::vector<ir::ResourceBinding>& bindings,
             FrameContext& frame,
             bool compute);
+        void BindPackageResources(
+            gpu::ProgramId program,
+            const std::vector<compiler::CompiledBinding>& bindings,
+            FrameContext& frame,
+            bool compute);
 
         void Transition(
             gpu::ResourceId resource,
             gpu::AbstractState abstractState,
             std::uint32_t frameLag = 0);
-
+        void TransitionPackageRange(
+            const compiler::NormalizedResourceView& view,
+            gpu::AbstractState abstractState,
+            std::uint32_t frameLag = 0);
         void ActivateAliasedResource(
             gpu::ResourceId resource,
             std::uint32_t frameLag = 0);
@@ -250,15 +310,17 @@ namespace sge::d3d12::detail
         UINT nextRtvDescriptor_ = FrameCount;
         UINT nextDsvDescriptor_ = 1;
         UINT nextShaderDescriptor_ = 0;
+        UINT rtvDescriptorCapacity_ = 64;
+        UINT dsvDescriptorCapacity_ = 16;
+        UINT shaderDescriptorCapacity_ = 128;
+        UINT64 uploadArenaCapacity_ = UploadArenaSize;
 
         std::array<
             Microsoft::WRL::ComPtr<ID3D12Resource>,
             FrameCount> backBuffers_;
-
         std::array<
             D3D12_RESOURCE_STATES,
             FrameCount> backBufferStates_{};
-
         std::array<FrameContext, FrameCount> frames_;
         Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> commandList_;
         std::uint64_t frameNumber_ = 0;
@@ -268,55 +330,57 @@ namespace sge::d3d12::detail
 
         std::array<QueueSyncState, QueueClassCount> queueSyncStates_;
         shader::ShaderCompiler shaderCompiler_;
-
         std::unordered_map<
             gpu::ResourceId,
             std::vector<ResourceRecord>,
             foundation::StrongIdHash<gpu::ResourceTag>> resources_;
-
         std::unordered_map<
             gpu::ResourceId,
             compiler::ResourceInstancePlan,
             foundation::StrongIdHash<gpu::ResourceTag>> resourceInstancePlans_;
-
         std::unordered_map<
             gpu::ResourceId,
             D3D12_RESOURCE_STATES,
             foundation::StrongIdHash<gpu::ResourceTag>> persistentReadStates_;
-
         std::map<ShaderViewKey, CachedShaderView> customShaderViews_;
-
+        std::map<PackageShaderViewKey, CachedPackageShaderView>
+            packageShaderViews_;
+        std::map<PackageAttachmentViewKey, CachedPackageAttachmentView>
+            packageAttachmentViews_;
         std::unordered_map<
             gpu::ResourceId,
             gpu::PhysicalAllocationId,
             foundation::StrongIdHash<gpu::ResourceTag>> physicalAllocations_;
-
         std::unordered_map<
             gpu::PhysicalAllocationId,
             std::vector<Microsoft::WRL::ComPtr<ID3D12Heap>>,
             foundation::StrongIdHash<gpu::PhysicalAllocationTag>> allocationHeaps_;
-
         std::unordered_map<
             gpu::PhysicalAllocationId,
             std::vector<std::optional<gpu::ResourceId>>,
-            foundation::StrongIdHash<gpu::PhysicalAllocationTag>> activeAliasedResources_;
-
+            foundation::StrongIdHash<gpu::PhysicalAllocationTag>>
+            activeAliasedResources_;
         std::unordered_map<
             gpu::ResourceId,
             std::vector<PhysicalInstanceUsage>,
             foundation::StrongIdHash<gpu::ResourceTag>> temporalInstanceUsages_;
-
         std::unordered_map<
             gpu::ProgramId,
             ProgramRecord,
             foundation::StrongIdHash<gpu::ProgramTag>> programs_;
-
         std::unordered_map<
             compiler::ExecutableKey,
             Microsoft::WRL::ComPtr<ID3D12PipelineState>,
             ExecutableKeyHash> pipelines_;
-
         std::optional<gpu::ResourceId> presentationResource_;
         std::optional<std::size_t> compiledStructureHash_;
+        std::optional<std::size_t> compiledPackageHash_;
+        const compiler::CompiledRenderPackage* activePackage_ = nullptr;
+        const runtime::FrameInvocation* activeInvocation_ = nullptr;
     };
 }
+
+// Existing compilation units use this symbolic limit inside Backend member
+// functions. Redirect it to the package-managed capacity without duplicating
+// the established upload/binding implementation.
+#define UploadArenaSize uploadArenaCapacity_

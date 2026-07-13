@@ -2,6 +2,7 @@
 #include "05_RenderRuntime/RenderRuntime.h"
 #include "07_D3D12Backend/D3D12Backend.h"
 #include "12_CubeLab/CubeExperiment.h"
+#include "12_CubeLab/ExperimentHarness.h"
 
 #include <exception>
 #include <fstream>
@@ -28,6 +29,18 @@ int WINAPI wWinMain(
 
         auto backend = sge::d3d12::CreateBackend(
             application.Surface());
+        const auto capabilities = backend->Capabilities();
+
+        if (commandLine != nullptr
+            && wcsstr(commandLine, L"--experiment-report") != nullptr)
+        {
+            sge::cube_lab::ExperimentScene scene;
+            scene.aspectRatio = 16.0f / 9.0f;
+            const auto report = sge::cube_lab::ExperimentHarness{}.Run(
+                scene, capabilities);
+            sge::cube_lab::ExperimentHarness::WriteCsv(
+                report, "experiment_report.csv");
+        }
 
         sge::runtime::RenderRuntime runtime{
             std::move(backend),
@@ -35,7 +48,8 @@ int WINAPI wWinMain(
                 .enableValidation = true,
                 .enablePlanCache = true,
                 .planDiagnosticsPath = "execution_plan.txt",
-                .graphDiagnosticsPath = "work_graph.dot"
+                .graphDiagnosticsPath = "work_graph.dot",
+                .packageDiagnosticsPath = "compiled_package.json"
             }
         };
 

@@ -78,9 +78,11 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="PlanDiagnostics.cpp" />
+    <ClCompile Include="StructuredDiagnostics.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="PlanDiagnostics.h" />
+    <ClInclude Include="StructuredDiagnostics.h" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\00_Foundation\00_Foundation.vcxproj">
@@ -95,9 +97,6 @@
     <ProjectReference Include="..\04_RenderCompiler\04_RenderCompiler.vcxproj">
       <Project>{2697C7F4-8454-4510-9BCF-59604FE23F5E}</Project>
     </ProjectReference>
-  </ItemGroup>
-  <ItemGroup>
-
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets" />

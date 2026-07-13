@@ -1,14 +1,17 @@
 #include "11_Tests/D3D12IntegrationTests.h"
+#include "11_Tests/V1AcceptanceTests.h"
 
-#include "04_RenderCompiler/RenderCompiler.h"
+#include "04_RenderCompiler/CompiledRenderPackage.h"
 #include "01_Platform/Platform.h"
 #include "05_RenderRuntime/RenderRuntime.h"
 #include "07_D3D12Backend/D3D12Backend.h"
 #include "08_ClassicalRasterFrontend/ClassicalRaster.h"
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <stdexcept>
 #include <utility>
@@ -23,8 +26,8 @@ namespace
     {
         try
         {
-            (void)sge::compiler::RenderCompiler{}.Compile(module, capabilities);
-            return false;
+            return !sge::compiler::RenderPackageCompiler{}
+                .Compile(module, capabilities).Succeeded();
         }
         catch (const std::runtime_error&)
         {
@@ -247,6 +250,129 @@ namespace
         }
     }
 
+    template<class T, std::size_t N>
+    std::vector<std::byte> ArrayBytes(const std::array<T, N>& values)
+    {
+        std::vector<std::byte> result(sizeof(values));
+        std::memcpy(result.data(), values.data(), sizeof(values));
+        return result;
+    }
+
+    sge::ir::SemanticModule BuildAdvancedPackageModule()
+    {
+        using namespace sge;
+        constexpr gpu::ResourceId positions{0};
+        constexpr gpu::ResourceId colors{1};
+        constexpr gpu::ResourceId indices{2};
+        constexpr gpu::ResourceId presentation{3};
+
+        struct Position { float x, y, z; };
+        struct Color { float r, g, b, a; };
+        const std::array<Position, 3> positionData{{
+            {-0.24f, -0.42f, 0.0f},
+            { 0.24f, -0.42f, 0.0f},
+            { 0.00f,  0.42f, 0.0f}}};
+        const std::array<Color, 2> colorData{{
+            {1.0f, 0.2f, 0.1f, 1.0f},
+            {0.1f, 0.5f, 1.0f, 1.0f}}};
+        const std::array<std::uint16_t, 3> indexData{{0, 1, 2}};
+
+        ir::SemanticModule module;
+        module.resources = {
+            {.id = positions, .name = "AdvancedPositions",
+                .lifetime = gpu::ResourceLifetimeClass::Persistent,
+                .update = gpu::ResourceUpdateClass::Immutable,
+                .description = ir::BufferDescription{
+                    .sizeBytes = sizeof(positionData),
+                    .strideBytes = sizeof(Position),
+                    .usage = ir::BufferUsage::Vertex
+                        | ir::BufferUsage::CopyDestination},
+                .data = ArrayBytes(positionData)},
+            {.id = colors, .name = "AdvancedInstanceColors",
+                .lifetime = gpu::ResourceLifetimeClass::Persistent,
+                .update = gpu::ResourceUpdateClass::Immutable,
+                .description = ir::BufferDescription{
+                    .sizeBytes = sizeof(colorData),
+                    .strideBytes = sizeof(Color),
+                    .usage = ir::BufferUsage::Vertex
+                        | ir::BufferUsage::CopyDestination},
+                .data = ArrayBytes(colorData)},
+            {.id = indices, .name = "AdvancedIndices",
+                .lifetime = gpu::ResourceLifetimeClass::Persistent,
+                .update = gpu::ResourceUpdateClass::Immutable,
+                .description = ir::BufferDescription{
+                    .sizeBytes = sizeof(indexData),
+                    .strideBytes = sizeof(std::uint16_t),
+                    .usage = ir::BufferUsage::Index
+                        | ir::BufferUsage::CopyDestination},
+                .data = ArrayBytes(indexData)},
+            {.id = presentation, .name = "AdvancedPresentation",
+                .lifetime = gpu::ResourceLifetimeClass::External,
+                .update = gpu::ResourceUpdateClass::Imported,
+                .description = ir::PresentationDescription{}}
+        };
+        module.programs.push_back({
+            .id = gpu::ProgramId{0},
+            .name = "AdvancedPackageRaster",
+            .shaderPath = "Shaders/IntegrationGeneralRaster.hlsl",
+            .vertexEntry = "VSMain",
+            .pixelEntry = "PSMain",
+            .programInterface = {
+                .parameters = {},
+                .vertexInputs = {
+                    {"POSITION", 0, ir::VertexElementFormat::Float3,
+                        0, 0, ir::VertexInputRate::PerVertex, 0},
+                    {"COLOR", 0, ir::VertexElementFormat::Float4,
+                        1, 0, ir::VertexInputRate::PerInstance, 1}},
+                .colorOutputCount = 1,
+                .depthAttachmentAllowed = false}});
+        module.works = {
+            {.id = gpu::WorkId{0}, .name = "AdvancedIndexedInstancedDraw",
+                .accesses = {
+                    {positions, gpu::AccessMode::Read,
+                        gpu::ResourceRole::VertexInput},
+                    {colors, gpu::AccessMode::Read,
+                        gpu::ResourceRole::VertexInput},
+                    {indices, gpu::AccessMode::Read,
+                        gpu::ResourceRole::IndexInput},
+                    {presentation, gpu::AccessMode::Write,
+                        gpu::ResourceRole::ColorOutput}},
+                .payload = ir::RasterWork{
+                    .program = gpu::ProgramId{0},
+                    .vertexResource = positions,
+                    .attachments = {{presentation}, {}},
+                    .vertexCount = 0,
+                    .rasterState = {
+                        .topology = gpu::PrimitiveTopology::TriangleList,
+                        .composition = gpu::CompositionMode::Replace,
+                        .depth = gpu::DepthMode::Disabled,
+                        .cull = ir::CullMode::Back,
+                        .fill = ir::FillMode::Solid,
+                        .frontFace = ir::FrontFace::Clockwise,
+                        .sampleCount = 1},
+                    .clear = {
+                        .clearColor = true,
+                        .color = {0.01f, 0.015f, 0.025f, 1.0f},
+                        .colorLoad = ir::AttachmentLoadOperation::Clear},
+                    .vertexStreams = {
+                        {0, ir::ResourceView{
+                            positions, 0, sizeof(positionData), sizeof(Position)}},
+                        {1, ir::ResourceView{
+                            colors, 0, sizeof(colorData), sizeof(Color)}}},
+                    .indexBinding = ir::IndexBinding{
+                        .resource = ir::ResourceView{
+                            indices, 0, sizeof(indexData), sizeof(std::uint16_t)},
+                        .format = ir::IndexFormat::Uint16},
+                    .indexCount = 3,
+                    .instanceCount = 2}},
+            {.id = gpu::WorkId{1}, .name = "PresentAdvancedPackage",
+                .accesses = {{presentation, gpu::AccessMode::Read,
+                    gpu::ResourceRole::Presentation}},
+                .payload = ir::PresentWork{presentation}}
+        };
+        return module;
+    }
+
     sge::ir::SemanticModule BuildIntegrationModule()
     {
         using namespace sge;
@@ -397,6 +523,7 @@ void RunD3D12IntegrationTests()
 {
     using namespace sge;
 
+    RunV1AcceptanceTests();
     RunResourceStateValidatorTests();
 
     platform::Win32Application application{
@@ -409,6 +536,18 @@ void RunD3D12IntegrationTests()
 
     auto backend = d3d12::CreateBackend(
         application.Surface(), {.forceWarp = true});
+    const auto advancedModule = BuildAdvancedPackageModule();
+    const auto advancedPackage = compiler::RenderPackageCompiler{}.Compile(
+        advancedModule, backend->Capabilities());
+    if (!advancedPackage.Succeeded()
+        || !advancedPackage.package.requirements.multipleVertexStreams
+        || !advancedPackage.package.requirements.indexedDraw
+        || !advancedPackage.package.requirements.instancedDraw
+        || advancedPackage.package.legacyExecutable)
+    {
+        throw std::runtime_error(
+            "Advanced package integration module was not compiled natively.");
+    }
     const auto module = BuildIntegrationModule();
     const auto compiled = compiler::RenderCompiler{}.Compile(
         module, backend->Capabilities());
@@ -457,10 +596,17 @@ void RunD3D12IntegrationTests()
             .graphDiagnosticsPath = {}}
     };
 
+    std::uint32_t advancedFrameCount = 0;
     std::uint32_t frameCount = 0;
     const int result = application.Run(
         [&](const platform::FrameTime&)
         {
+            if (advancedFrameCount < 2)
+            {
+                runtime.Execute(advancedModule);
+                ++advancedFrameCount;
+                return;
+            }
             runtime.Execute(module);
             ++frameCount;
             if (frameCount == 12)
@@ -473,10 +619,10 @@ void RunD3D12IntegrationTests()
             }
         });
 
-    if (result != 0 || frameCount != 12)
+    if (result != 0 || advancedFrameCount != 2 || frameCount != 12)
     {
         throw std::runtime_error(
-            "D3D12 WARP integration test did not complete 12 frames.");
+            "D3D12 WARP integration test did not complete the native-package and 12-frame paths.");
     }
     runtime.WaitIdle();
 }

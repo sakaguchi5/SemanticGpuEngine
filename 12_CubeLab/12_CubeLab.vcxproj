@@ -78,9 +78,11 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="CubeExperiment.cpp" />
+    <ClCompile Include="ExperimentHarness.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="CubeExperiment.h" />
+    <ClInclude Include="ExperimentHarness.h" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\00_Foundation\00_Foundation.vcxproj">
@@ -92,15 +94,15 @@
     <ProjectReference Include="..\03_RenderIR\03_RenderIR.vcxproj">
       <Project>{0EF02B28-A855-4676-80BF-0B2C6E7468C3}</Project>
     </ProjectReference>
+    <ProjectReference Include="..\04_RenderCompiler\04_RenderCompiler.vcxproj">
+      <Project>{2697C7F4-8454-4510-9BCF-59604FE23F5E}</Project>
+    </ProjectReference>
     <ProjectReference Include="..\08_ClassicalRasterFrontend\08_ClassicalRasterFrontend.vcxproj">
       <Project>{337679C1-DE3C-4AF0-A194-040A1AD824FA}</Project>
     </ProjectReference>
     <ProjectReference Include="..\09_ExperimentalGeometry\09_ExperimentalGeometry.vcxproj">
       <Project>{8AC70923-C1DE-472C-A26A-00F5B7B20762}</Project>
     </ProjectReference>
-  </ItemGroup>
-  <ItemGroup>
-
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets" />

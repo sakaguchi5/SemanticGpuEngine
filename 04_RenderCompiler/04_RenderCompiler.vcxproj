@@ -78,9 +78,11 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="RenderCompiler.cpp" />
+    <ClCompile Include="CompiledRenderPackage.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="RenderCompiler.h" />
+    <ClInclude Include="CompiledRenderPackage.h" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\00_Foundation\00_Foundation.vcxproj">
@@ -92,9 +94,6 @@
     <ProjectReference Include="..\03_RenderIR\03_RenderIR.vcxproj">
       <Project>{0EF02B28-A855-4676-80BF-0B2C6E7468C3}</Project>
     </ProjectReference>
-  </ItemGroup>
-  <ItemGroup>
-
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets" />

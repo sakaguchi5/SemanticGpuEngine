@@ -2,87 +2,42 @@
 
 #include "00_Foundation/Hash.h"
 
-#include <optional>
+#include <bit>
 #include <stdexcept>
 #include <type_traits>
-#include <unordered_map>
 
 namespace
 {
-    struct ResourceInstanceStateSummary
+    void HashTextureRange(
+        std::size_t& seed,
+        const sge::ir::TextureSubresourceRange& range)
     {
-        std::optional<sge::gpu::AbstractState> readState;
-        std::size_t readAccessCount = 0;
-        std::size_t writeAccessCount = 0;
-    };
-
-    std::uint64_t ResourceInstanceKey(
-        sge::gpu::ResourceId resource,
-        std::uint32_t frameLag) noexcept
-    {
-        return (static_cast<std::uint64_t>(resource.Value()) << 32u)
-            | static_cast<std::uint64_t>(frameLag);
+        using namespace sge::foundation;
+        HashCombine(seed, range.baseMip);
+        HashCombine(seed, range.mipCount);
+        HashCombine(seed, range.baseArrayLayer);
+        HashCombine(seed, range.arrayLayerCount);
+        HashCombine(seed, range.basePlane);
+        HashCombine(seed, range.planeCount);
+        HashCombine(seed, range.baseDepthSlice);
+        HashCombine(seed, range.depthSliceCount);
     }
 
-    void ValidateWorkResourceInstanceStates(
-        const sge::ir::SemanticModule& module,
-        const sge::ir::WorkDeclaration& work)
+    void HashView(std::size_t& seed, const sge::ir::ResourceView& view)
     {
-        std::unordered_map<std::uint64_t, ResourceInstanceStateSummary>
-            summaries;
+        using namespace sge::foundation;
+        HashCombine(seed, view.resource.Value());
+        HashCombine(seed, static_cast<std::size_t>(view.offsetBytes));
+        HashCombine(seed, static_cast<std::size_t>(view.sizeBytes));
+        HashCombine(seed, view.strideBytes);
+        HashTextureRange(seed, view.textureRange);
+        HashEnum(seed, view.formatOverride);
+    }
 
-        for (const auto& access : work.accesses)
-        {
-            auto& summary = summaries[ResourceInstanceKey(
-                access.resource, access.frameLag)];
-            const auto state = sge::gpu::RequiredState(access);
-            const bool writeCapable =
-                access.access != sge::gpu::AccessMode::Read;
-
-            if (writeCapable)
-            {
-                if (summary.readAccessCount != 0)
-                {
-                    throw std::runtime_error(
-                        "Semantic validation failed: work '" + work.name
-                        + "' mixes read and write states for the same "
-                          "resource instance.");
-                }
-                if (summary.writeAccessCount != 0)
-                {
-                    throw std::runtime_error(
-                        "Semantic validation failed: work '" + work.name
-                        + "' declares multiple write-capable accesses for "
-                          "the same resource instance.");
-                }
-                summary.writeAccessCount = 1;
-                continue;
-            }
-
-            if (summary.writeAccessCount != 0)
-            {
-                throw std::runtime_error(
-                    "Semantic validation failed: work '" + work.name
-                    + "' mixes read and write states for the same "
-                      "resource instance.");
-            }
-
-            if (summary.readState && *summary.readState != state
-                && module.Resource(access.resource).lifetime
-                    != sge::gpu::ResourceLifetimeClass::Persistent)
-            {
-                throw std::runtime_error(
-                    "Semantic validation failed: work '" + work.name
-                    + "' requires multiple read states for a non-persistent "
-                      "resource instance.");
-            }
-
-            if (!summary.readState)
-            {
-                summary.readState = state;
-            }
-            ++summary.readAccessCount;
-        }
+    void HashFloat(std::size_t& seed, float value)
+    {
+        sge::foundation::HashCombine(
+            seed, std::bit_cast<std::uint32_t>(value));
     }
 }
 
@@ -159,7 +114,6 @@ namespace sge::ir
                 return resource;
             }
         }
-
         throw std::runtime_error("SemanticModule: resource ID not found.");
     }
 
@@ -173,12 +127,10 @@ namespace sge::ir
                 return program;
             }
         }
-
         throw std::runtime_error("SemanticModule: program ID not found.");
     }
 
-    const WorkDeclaration& SemanticModule::Work(
-        gpu::WorkId id) const
+    const WorkDeclaration& SemanticModule::Work(gpu::WorkId id) const
     {
         for (const auto& work : works)
         {
@@ -187,14 +139,12 @@ namespace sge::ir
                 return work;
             }
         }
-
         throw std::runtime_error("SemanticModule: work ID not found.");
     }
 
     std::size_t SemanticModule::StructureHash() const
     {
         using namespace foundation;
-
         std::size_t seed = 0;
 
         for (const auto& resource : resources)
@@ -225,6 +175,8 @@ namespace sge::ir
                     HashCombine(seed, description.height);
                     HashCombine(seed, description.depth);
                     HashCombine(seed, description.mipLevels);
+                    HashCombine(seed, description.arrayLayers);
+                    HashCombine(seed, description.sampleCount);
                     HashEnum(seed, description.usage);
                 }
                 else
@@ -275,11 +227,6 @@ namespace sge::ir
 
         for (const auto& work : works)
         {
-            // Invalid work declarations do not have a stable compiler/cache
-            // identity. Validate the physical-instance state contract before
-            // incorporating the work into the structural key.
-            ValidateWorkResourceInstanceStates(*this, work);
-
             HashCombine(seed, work.id.Value());
             HashCombine(seed, HashString(work.name));
             HashEnum(seed, work.Domain());
@@ -290,63 +237,69 @@ namespace sge::ir
                 if constexpr (std::is_same_v<T, RasterWork>)
                 {
                     HashCombine(seed, payload.program.Value());
-                    HashCombine(seed, payload.vertexResource.resource.Value());
-                    HashCombine(
-                        seed,
-                        static_cast<std::size_t>(
-                            payload.vertexResource.offsetBytes));
-                    HashCombine(
-                        seed,
-                        static_cast<std::size_t>(
-                            payload.vertexResource.sizeBytes));
-                    HashCombine(seed, payload.vertexResource.strideBytes);
+                    HashView(seed, payload.vertexResource);
                     HashCombine(seed, payload.vertexCount);
                     HashCombine(seed, payload.firstVertex);
                     HashEnum(seed, payload.rasterState.topology);
                     HashEnum(seed, payload.rasterState.composition);
                     HashEnum(seed, payload.rasterState.depth);
+                    HashEnum(seed, payload.rasterState.cull);
+                    HashEnum(seed, payload.rasterState.fill);
+                    HashEnum(seed, payload.rasterState.frontFace);
+                    HashCombine(seed, payload.rasterState.sampleCount);
+                    HashCombine(seed, payload.clear.clearColor);
+                    for (const auto component : payload.clear.color)
+                    {
+                        HashFloat(seed, component);
+                    }
+                    HashCombine(seed, payload.clear.clearDepth);
+                    HashFloat(seed, payload.clear.depth);
+                    HashEnum(seed, payload.clear.colorLoad);
+                    HashEnum(seed, payload.clear.colorStore);
+                    HashEnum(seed, payload.clear.depthLoad);
+                    HashEnum(seed, payload.clear.depthStore);
+
                     for (const auto& binding : payload.bindings)
                     {
                         HashCombine(seed, binding.parameterIndex);
-                        HashCombine(
-                            seed,
-                            binding.resource.resource.Value());
-                        HashCombine(
-                            seed,
-                            static_cast<std::size_t>(
-                                binding.resource.offsetBytes));
-                        HashCombine(
-                            seed,
-                            static_cast<std::size_t>(
-                                binding.resource.sizeBytes));
-                        HashCombine(seed, binding.resource.strideBytes);
+                        HashView(seed, binding.resource);
                         HashCombine(seed, binding.frameLag);
                     }
                     for (const auto& color : payload.attachments.colors)
                     {
-                        HashCombine(seed, color.resource.Value());
-                        HashCombine(
-                            seed,
-                            static_cast<std::size_t>(color.offsetBytes));
-                        HashCombine(
-                            seed,
-                            static_cast<std::size_t>(color.sizeBytes));
-                        HashCombine(seed, color.strideBytes);
+                        HashView(seed, color);
                     }
-                    HashCombine(
-                        seed,
-                        payload.attachments.depth.resource.Value());
-                    HashCombine(
-                        seed,
-                        static_cast<std::size_t>(
-                            payload.attachments.depth.offsetBytes));
-                    HashCombine(
-                        seed,
-                        static_cast<std::size_t>(
-                            payload.attachments.depth.sizeBytes));
-                    HashCombine(
-                        seed,
-                        payload.attachments.depth.strideBytes);
+                    HashView(seed, payload.attachments.depth);
+
+                    for (const auto& stream : payload.vertexStreams)
+                    {
+                        HashCombine(seed, stream.inputSlot);
+                        HashView(seed, stream.resource);
+                    }
+                    HashCombine(seed, payload.indexBinding.has_value());
+                    if (payload.indexBinding)
+                    {
+                        HashView(seed, payload.indexBinding->resource);
+                        HashEnum(seed, payload.indexBinding->format);
+                        HashCombine(seed, payload.indexBinding->firstIndex);
+                        HashCombine(
+                            seed,
+                            static_cast<std::uint32_t>(
+                                payload.indexBinding->baseVertex));
+                    }
+                    HashCombine(seed, payload.indexCount);
+                    HashCombine(seed, payload.instanceCount);
+                    HashCombine(seed, payload.firstInstance);
+                    HashFloat(seed, payload.viewport.x);
+                    HashFloat(seed, payload.viewport.y);
+                    HashFloat(seed, payload.viewport.width);
+                    HashFloat(seed, payload.viewport.height);
+                    HashFloat(seed, payload.viewport.minimumDepth);
+                    HashFloat(seed, payload.viewport.maximumDepth);
+                    HashCombine(seed, static_cast<std::uint32_t>(payload.scissor.left));
+                    HashCombine(seed, static_cast<std::uint32_t>(payload.scissor.top));
+                    HashCombine(seed, static_cast<std::uint32_t>(payload.scissor.right));
+                    HashCombine(seed, static_cast<std::uint32_t>(payload.scissor.bottom));
                 }
                 else if constexpr (std::is_same_v<T, ComputeWork>)
                 {
@@ -357,18 +310,7 @@ namespace sge::ir
                     for (const auto& binding : payload.bindings)
                     {
                         HashCombine(seed, binding.parameterIndex);
-                        HashCombine(
-                            seed,
-                            binding.resource.resource.Value());
-                        HashCombine(
-                            seed,
-                            static_cast<std::size_t>(
-                                binding.resource.offsetBytes));
-                        HashCombine(
-                            seed,
-                            static_cast<std::size_t>(
-                                binding.resource.sizeBytes));
-                        HashCombine(seed, binding.resource.strideBytes);
+                        HashView(seed, binding.resource);
                         HashCombine(seed, binding.frameLag);
                     }
                 }

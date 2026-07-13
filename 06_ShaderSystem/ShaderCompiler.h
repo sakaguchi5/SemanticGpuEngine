@@ -1,6 +1,6 @@
 #pragma once
 
-#include "02_GpuSemantics/Semantics.h"
+#include "03_RenderIR/RenderIR.h"
 
 #include <d3dcompiler.h>
 #include <wrl/client.h>
@@ -41,5 +41,10 @@ namespace sge::shader
         void ValidateInterface(
             const std::vector<gpu::ProgramParameter>& declared,
             const std::vector<ReflectedBinding>& reflected) const;
+
+        void ValidateRasterInterface(
+            const ir::ProgramInterface& declared,
+            const CompiledShader& vertex,
+            const CompiledShader& pixel) const;
     };
 }

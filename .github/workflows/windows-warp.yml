@@ -1,0 +1,23 @@
+name: Windows WARP acceptance
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: microsoft/setup-msbuild@v2
+      - name: Build Debug x64
+        shell: cmd
+        run: msbuild SemanticGpuEngine.sln /m /t:Build /p:Configuration=Debug /p:Platform=x64
+      - name: Run compiler and WARP acceptance tests
+        shell: cmd
+        run: bin\x64\Debug\11_Tests.exe
+      - name: Build Release x64
+        shell: cmd
+        run: msbuild SemanticGpuEngine.sln /m /t:Build /p:Configuration=Release /p:Platform=x64

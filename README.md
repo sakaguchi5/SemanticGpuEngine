@@ -1,158 +1,128 @@
 # Semantic GPU Engine
 
-Visual Studio 2026（version 18）と MSVC Platform Toolset v145 を対象にした、
-DirectX 12のコンパイラ型レンダリング基盤です。
+Semantic GPU Engine is a compiler-style DirectX 12 rendering foundation for
+Visual Studio 2026 and MSVC Platform Toolset v145.
 
-これは単純なCubeサンプルではありません。
+Application and mathematical frontends produce an API-independent
+`SemanticModule`. `RenderPackageCompiler` validates and canonicalizes that
+source, then compiles dependencies, scheduling, lifetime, physical instances,
+allocation, resource-view ranges, state requirements, queue handoffs, program
+layouts, and executable specializations into one immutable
+`CompiledRenderPackage`.
 
-アプリケーション固有の理論をAPI非依存の意味IRへ変換し、
-依存関係、Resource寿命、抽象状態遷移、実行構成をコンパイルした後、
-D3D12のRoot Signature、PSO、Resource Barrier、Command List、Fenceへ
-変換する端から端までの参照実装です。
+```text
+Classical / SDF / future mathematical frontend
+    -> SemanticModule
+    -> RenderPackageCompiler
+    -> CompiledRenderPackage
+    -> RenderRuntime + FrameInvocation
+    -> D3D12 backend
+```
 
-## 必要環境
+D3D12 resources, descriptors, command lists, barriers, PSOs, and fences remain
+below the backend boundary. The backend consumes the package-native compiled
+works; the old module-plus-plan entry remains only as a transitional
+compatibility hook for the already proven core materialization path.
 
-- Visual Studio 2026
-- Desktop development with C++
-- MSVC Platform Toolset v145
-- Windows 10またはWindows 11 SDK
-- DirectX 12対応GPU
-  - 対応GPUが見つからない場合はWARPへフォールバックします
+## Build and run
 
-## 実行方法
+1. Open `SemanticGpuEngine.sln` in Visual Studio 2026.
+2. Select `Debug | x64`.
+3. Set `13_Launcher` as the startup project.
+4. Press F5.
 
-1. `SemanticGpuEngine.sln` を開く
-2. 構成を `Debug | x64` にする
-3. `13_Launcher` がスタートアッププロジェクトであることを確認する
-4. F5を押す
+Controls:
 
-表示内容:
+- `1`: Classical Mesh frontend
+- `2`: SDF frontend
+- `Esc`: quit
+- command line `--sdf`: start in SDF mode
+- command line `--experiment-report`: write `experiment_report.csv`
 
-- `1`キー: Classical Mesh Frontendへ切り替え
-- `2`キー: SDF Frontendへ切り替え
-- 回転する色付き立方体
-- XY / YZ / ZXの半透明平面
-- 三平面のグリッド
-- X軸: 赤、Y軸: 緑、Z軸: 青
-- 深度テスト
-- アルファ合成
-- ウィンドウリサイズ
-- 3 frames in flight
-
-コマンドラインへ `--sdf` を渡すと、SDF Frontendから起動します。
-
-Escキーで終了します。
-
-## 実行時に生成される診断ファイル
-
-実行フォルダーに次が生成されます。
+Runtime diagnostics:
 
 - `execution_plan.txt`
-  - Workの実行順
-  - Resource依存関係
-  - Resource寿命
-  - 物理Resource instance数とselector
-  - Temporal dependency
-  - 抽象状態遷移
-  - 正規化されたExecutable
 - `work_graph.dot`
-  - Graphviz形式のWork依存グラフ
+- `compiled_package.json`
+- optionally `experiment_report.csv`
 
-## ソリューション構成
+## V1 compiler package
 
-- `00_Foundation`
-  - 型付きID、Hash、契約
-- `01_Platform`
-  - Win32ウィンドウ、イベントループ、時刻
-- `02_GpuSemantics`
-  - Work、Resource、Access、Program、AbstractState
-- `03_RenderIR`
-  - API非依存のSemanticModule
-- `04_RenderCompiler`
-  - 検証、hazard解析、DAG、schedule、寿命、allocation slot、状態計画
-- `05_RenderRuntime`
-  - ExecutionPlanキャッシュ、Backend境界
-- `06_ShaderSystem`
-  - HLSLコンパイル、Shader Reflection、ProgramInterface検証
-- `07_D3D12Backend`
-  - Device、Swap Chain、Resource、Root Signature、PSO、Barrier、Fence
-- `08_ClassicalRasterFrontend`
-  - 古典的なScene、頂点・三角形表現、Logical GPU IRへのLowering
-- `09_ExperimentalGeometry`
-  - PGA境界平面によるBox、SDF Scene、独立したRay March Lowering
-- `10_Diagnostics`
-  - ExecutionPlanと依存グラフの出力
-- `11_Tests`
-  - Compiler・Frontendテストと、12フレームのD3D12/WARP統合テスト
-- `12_CubeLab`
-  - 複数の幾何表現を比較する受け入れ実験
-- `13_Launcher`
-  - Platform、Backend、Runtime、Experimentの組み立てだけを行うmain
+A package owns a canonical immutable module snapshot, compiled Raster/Compute/
+Copy/Present commands, normalized Buffer and Texture views, range state
+requirements, queue handoffs, resource and program blueprints, executable
+specializations, physical-instance and allocation plans, statistics, and
+structured diagnostics.
 
-## 実装された垂直経路
+`FrameInvocation` is separate from the static package. It supplies only
+frame-dependent CPU resource data and the frame number, so changing constants
+does not change the compiled package identity.
 
-1. ClassicalまたはSDF FrontendがSemanticModuleを生成
-2. SemanticValidatorがID、参照、Resourceデータ、Device能力を検証
-3. DependencyAnalyzerがRAW / WAR / WAW hazardから依存DAGを作成
-4. 安定トポロジカルソートがWork順序を決定
-5. LifetimeAnalyzerがResourceの最初と最後の使用位置を計算
-6. Transient Resourceへ物理allocation slotを計画
-7. StatePlannerがAbstractState遷移を生成
-8. ProgramとRasterStateからExecutableを正規化
-9. Shader ReflectionでHLSL BindingとProgramDeclarationを照合
-10. ProgramInterfaceからD3D12 Root Signatureを生成
-11. ExecutableからD3D12 PSOを生成・キャッシュ
-12. Static BufferをDefault HeapへUpload
-13. Dynamic ConstantsをFrame Upload Arenaへ配置
-14. AbstractStateからD3D12 Resource Barrierを生成
-15. Logical ResourceをPersistent / FrameLocal / Temporal / Externalへ分類
-16. FrameLocal ResourceとTransient Heapをframe slotごとに実体化
-17. Direct / Compute / Copy Queueを論理依存からFence Timelineへ変換
-18. Queue別FrameContextと3つのframe slotでCPU/GPUを並行化
-19. Temporal Resourceを過去frameの物理instanceへ解決
-20. Swap ChainへPresent
+### Resource views and states
 
-## 境界規則
+Buffer views use byte offset, byte size, and stride. Texture views use mip,
+array-layer, plane, and Texture3D depth-slice ranges, with optional typeless-compatible format
+reinterpretation. The compiler rejects invalid or overlapping read/write and
+multiple-write ranges on the same physical instance, while allowing independent
+non-overlapping texture subresources.
 
-`07_D3D12Backend` より上の層には、次のD3D12型を公開しません。
+The D3D12 backend creates range-specific SRV/UAV/RTV/DSV descriptors and emits
+subresource barriers. Cross-queue ownership changes become explicit package
+handoffs, including Copy-queue crossings. Persistent immutable read-only
+resources continue to use a compiled compatible read-state envelope.
 
-- `ID3D12Resource`
-- `ID3D12PipelineState`
-- `D3D12_RESOURCE_STATES`
-- `D3D12_RESOURCE_BARRIER`
-- Descriptor Handle
-- Command List
-- Fence
-- DXGI Format
+### Raster executable
 
-一方で、メモリ予算や実行能力など、本物のハードウェア制約は
-`DeviceCapabilities`として意味的に公開します。
+Package-native Raster commands support:
 
-## 現在の完成範囲
+- multiple vertex streams and per-instance streams;
+- Uint16 and Uint32 index buffers;
+- indexed and non-indexed instanced draw;
+- viewport and scissor;
+- cull mode, fill mode, front-face convention, depth, blending, and sample
+  count;
+- multiple color attachments and expanded typed color/depth formats;
+- shader reflection checks for resource bindings, vertex inputs, color outputs,
+  and depth output compatibility.
 
-Classical MeshとSDFという独立した二つのFrontendから、共通Compiler、
-Runtime、D3D12 Backendへ至る垂直経路が実装されています。通常frameでは
-全GPUの`WaitIdle`を行わず、再利用するframe slotのQueue完了だけを待ちます。
+The WARP acceptance test executes a two-stream, Uint16-indexed, instanced Raster
+package before running the original 12-frame multi-queue integration path.
 
-実装済み:
+### Scalable physical backend
 
-- Compute / Copy / Raster / Present WorkのD3D12実行
-- Direct / Compute / Copy Queue間同期
-- FrameLocal Resourceの3重化
-- frame slot内のPlaced Resource Aliasing
-- 明示的なTemporal Resourceとframe-lag read
-- Temporal physical instance単位のwriter／reader完了追跡
-- 最大frame lagから導出するTemporal ring容量
-- frame slot循環境界を含むAliasing Barrier
-- SDF Pixel Shader Ray Marching Frontend
-- Classical / SDF Loweringの明示切り替え
+Descriptor heaps and per-frame upload arenas are sized from package demand and
+can grow across package recompilation. The compiler estimates committed memory
+from resource dimensions and physical-instance counts and rejects a known local
+memory-budget overflow before execution.
 
-将来追加できるが、現在の完成条件には含めない機能:
+The implementation remains a finite V1 reference, not a bindless allocator or
+full production residency manager. Texture arrays, multisampling, and expanded
+format paths are represented and lowered, while the acceptance scene exercises
+the most important generalized Buffer/Raster path and CPU tests cover texture
+subresource compilation.
 
-- Ray Work
-- Descriptor Table / Bindless
-- Shader Model 6 / DXC
-- PGA / CGAをGPU上で直接評価するFrontend
-- Raster / Compute / Ray実装方式の自動選択
+## Diagnostics and reproducible experiments
 
-これらはSemanticModuleとExecutionPlanの国境を壊さずに追加できます。
+Structured diagnostics carry stable code, severity, Work/Program/Resource/View
+location, and notes. Package JSON exposes hashes, requirements, statistics,
+handoffs, and diagnostics.
+
+`ExperimentScene` is shared by Classical and SDF frontends. The experiment
+harness records frontend lowering time, package compilation time, resource and
+instance counts, executable/descriptor/barrier/wait counts, and estimated
+memory to CSV. GPU timestamp and image-error metrics remain explicit backend
+measurement extensions rather than fabricated CPU estimates.
+
+## Acceptance and CI
+
+`11_Tests` includes deterministic package compilation, canonicalization,
+texture-range conflict, generalized Raster, capability rejection, Copy
+handoff, memory-budget, common-scene experiment, and D3D12/WARP tests.
+
+`.github/workflows/windows-warp.yml` builds Debug x64, runs the acceptance test
+binary with WARP, and builds Release x64 using `cmd` and MSBuild.
+
+See `V1_ACCEPTANCE.md` for the finite V1 completion contract and its mapping to
+the fifteen implementation stages. Ray Work, bindless descriptors, DXC/Shader
+Model 6, direct PGA/CGA GPU evaluation, and automatic Raster/Compute/Ray choice
+remain later research rather than hidden V1 requirements.

@@ -55,7 +55,20 @@ namespace sge::gpu
     {
         Unknown,
         Rgba8Unorm,
-        Depth32Float
+        Depth32Float,
+        R8Unorm,
+        Rg8Unorm,
+        Bgra8Unorm,
+        R16Float,
+        Rg16Float,
+        Rgba16Float,
+        R32Float,
+        Rg32Float,
+        Rgba32Float,
+        R32Uint,
+        Rg32Uint,
+        Rgba32Uint,
+        Depth24Stencil8
     };
 
     enum class AccessMode
@@ -68,6 +81,8 @@ namespace sge::gpu
     enum class ResourceRole
     {
         VertexInput,
+        IndexInput,
+        IndirectInput,
         ConstantInput,
         ProgramInput,
         ProgramOutput,
@@ -109,6 +124,8 @@ namespace sge::gpu
     {
         Undefined,
         VertexRead,
+        IndexRead,
+        IndirectRead,
         ConstantRead,
         ProgramRead,
         ProgramWrite,
@@ -171,11 +188,30 @@ namespace sge::gpu
         bool dedicatedCopyQueue = false;
         bool resourceAliasing = false;
         bool rayExecution = false;
+
+        // V1 package-level semantic capabilities. The reference D3D12 backend
+        // implements these features natively; constrained backends explicitly
+        // disable the features they cannot materialize.
+        bool textureSubresourceViews = true;
+        bool multipleVertexStreams = true;
+        bool indexedDraw = true;
+        bool instancedDraw = true;
+        bool explicitCopyQueueHandoffs = true;
+        bool dynamicDescriptorGrowth = true;
+        bool advancedRasterState = true;
+        bool customViewportScissor = true;
+        bool expandedResourceFormats = true;
+
         std::uint32_t constantDataAlignment = 256;
         std::uint64_t localMemoryBudget = 0;
         std::uint32_t maxFramesInFlight = 3;
+        std::uint32_t maximumColorAttachments = 8;
+        std::uint32_t maximumVertexStreams = 16;
     };
 
     [[nodiscard]] AbstractState RequiredState(const ResourceAccess& access);
     [[nodiscard]] const char* ToString(AbstractState state) noexcept;
+    [[nodiscard]] const char* ToString(ResourceFormat format) noexcept;
+    [[nodiscard]] bool IsDepthFormat(ResourceFormat format) noexcept;
+    [[nodiscard]] std::uint32_t BytesPerTexel(ResourceFormat format) noexcept;
 }
