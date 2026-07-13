@@ -1,6 +1,9 @@
 name: ChatGPT Program Interface Resource View Artifact
 
 on:
+  push:
+    branches:
+      - chatgpt-artifact-program-interface-view-f001aa-v2
   workflow_dispatch:
 
 permissions:
