@@ -34,6 +34,22 @@ jobs:
                 try { $gzip.CopyTo($output) } finally { $output.Dispose() }
               } finally { $gzip.Dispose() }
             } finally { $input.Dispose() }
+            $script = [IO.File]::ReadAllText($scriptPath)
+            $sectionStart = $script.IndexOf("# 07_D3D12Backend/D3D12Backend.cpp")
+            $sectionEnd = $script.IndexOf("# 08_ClassicalRasterFrontend/ClassicalLowering.cpp", $sectionStart)
+            if ($sectionStart -lt 0 -or $sectionEnd -lt 0) {
+              throw "Could not locate D3D12 backend patch section."
+            }
+            $prefix = $script.Substring(0, $sectionStart)
+            $section = $script.Substring($sectionStart, $sectionEnd - $sectionStart)
+            $suffix = $script.Substring($sectionEnd)
+            $section = $section.Replace(
+              'Replace-Exact "07_D3D12Backend/D3D12Backend.cpp"',
+              'Replace-Exact "07_D3D12Backend/D3D12Compilation.cpp"')
+            $section = $section.Replace(
+              'Replace-RegexSingle "07_D3D12Backend/D3D12Backend.cpp"',
+              'Replace-RegexSingle "07_D3D12Backend/D3D12Compilation.cpp"')
+            [IO.File]::WriteAllText($scriptPath, $prefix + $section + $suffix)
             "script_sha256=$((Get-FileHash -Algorithm SHA256 $scriptPath).Hash)" | Out-File $diagnostic -Append
             & $scriptPath -RepoRoot $env:GITHUB_WORKSPACE *>> $diagnostic
             if ($LASTEXITCODE -ne 0) { throw "apply.ps1 exited with code $LASTEXITCODE" }
